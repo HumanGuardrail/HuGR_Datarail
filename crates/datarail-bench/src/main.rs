@@ -10,9 +10,10 @@
 use std::hint::black_box;
 use std::time::Instant;
 
-use datarail_core::AeadAlg;
+use datarail_core::{AeadAlg, Cofre, Substrate};
 use datarail_cofre::{decode, encode};
 use datarail_crypto::{aead_open, aead_seal, blake3_256, open_key, seal_key, verifying_key, x25519_public};
+use datarail_rail::{LoopbackSubstrate, TcpSubstrate};
 use datarail_terminal::{ContentContract, DestTerminal, SourceTerminal, TerminalConfig};
 
 /// Time `f` over `iters` iterations (after a warm-up) and print nanoseconds per op.
@@ -40,6 +41,25 @@ fn tput(name: &str, iters: u32, bytes: usize, mut f: impl FnMut()) {
     let total = u64::try_from(bytes).unwrap_or(u64::MAX).saturating_mul(u64::from(iters));
     let micros = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX).max(1);
     println!("  {name:38} {:>6} MB/s   ({iters} iters x {bytes} B)", total / micros);
+}
+
+/// Round-trip `n` cofres through a substrate (send → drain, **interleaved** so a real socket's bounded buffer
+/// cannot deadlock) and print ns/cofre + cofres/s. DIRECTIONAL: loopback is in-process; tcp is a real kernel
+/// hop on `127.0.0.1` (not a WAN — a WAN link adds `WanLink`'s latency per hop).
+fn roundtrip<S: Substrate>(name: &str, mut sub: S, cofre: &Cofre, n: u32) {
+    for _ in 0..(n / 10).max(1) {
+        sub.send(cofre).ok();
+        while sub.recv().ok().flatten().is_none() {}
+    }
+    let t = Instant::now();
+    for _ in 0..n {
+        sub.send(cofre).ok();
+        while sub.recv().ok().flatten().is_none() {}
+    }
+    let elapsed = t.elapsed();
+    let per = elapsed.as_nanos() / u128::from(n.max(1));
+    let cps = f64::from(n) / elapsed.as_secs_f64().max(1e-9);
+    println!("  {name:38} {per:>9} ns/cofre  (~{cps:.0} cofres/s, {n} cofres)");
 }
 
 fn main() {
@@ -106,4 +126,12 @@ fn main() {
         let mut d = DestTerminal::new(cfg.clone(), contract.clone(), src_vk, [22; 32], dest_secret);
         black_box(d.offload(black_box(&cofre)).unwrap());
     });
+
+    // ---- substrate round-trip (real transports; DIRECTIONAL, loopback only — NOT a WAN measurement) ----
+    println!("\nsubstrate round-trip (send+drain interleaved; DIRECTIONAL on loopback):");
+    roundtrip("in-process LoopbackSubstrate", LoopbackSubstrate::new(), &cofre, 20_000);
+    if let Ok(tcp) = TcpSubstrate::loopback_pair() {
+        roundtrip("TCP loopback (real kernel hop)", tcp, &cofre, 5_000);
+    }
+    println!("  (a real WAN adds WanLink latency x hop + loss; AC-8 resume + dedup recover drops — see tests.)");
 }

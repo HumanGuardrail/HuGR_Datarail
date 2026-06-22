@@ -285,6 +285,7 @@ dependencies = [
  "datarail-cofre",
  "datarail-core",
  "datarail-crypto",
+ "datarail-rail",
  "datarail-terminal",
 ]
 

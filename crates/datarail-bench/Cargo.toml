@@ -17,3 +17,4 @@ datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
 datarail-cofre = { path = "../datarail-cofre" }
 datarail-terminal = { path = "../datarail-terminal" }
+datarail-rail = { path = "../datarail-rail" }

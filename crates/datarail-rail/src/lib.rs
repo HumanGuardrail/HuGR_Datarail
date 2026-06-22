@@ -426,6 +426,96 @@ impl StreamSubstrate<std::net::TcpStream> {
     }
 }
 
+/// A WAN-condition profile for [`WanLink`] — the SPEC-11 AC-8 "lossy / high-RTT link" knobs.
+///
+/// Deterministic (no RNG) so tests and benchmarks reproduce exactly: `latency` is added before each `recv`
+/// returns (models per-hop RTT), and every `drop_every`-th `send` is silently lost (models packet loss —
+/// `0` disables drops). Reordering is intentionally omitted: datarail's substrates are ordered byte streams
+/// (TCP / QUIC), and AC-8 specifies *lossy / high-RTT*, not reordering.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WanProfile {
+    /// Latency added before each `recv` returns a cofre (zero = none).
+    pub latency: std::time::Duration,
+    /// Drop every Nth `send` (lost in transit); `0` disables drops.
+    pub drop_every: u32,
+}
+
+/// A WAN-condition decorator over any inner [`Substrate`] (AC-8 harness): injects extra latency and packet
+/// loss to exercise resume + dedup and to bound throughput on a lossy / high-RTT link, **without changing the
+/// inner substrate**. Std-only, deterministic. A dropped `send` never reaches the inner substrate, so the
+/// effectively-once gate + source re-drive (resume) must recover it — exactly what AC-8 tests.
+///
+/// With the default ([`WanProfile::default`]) profile it is a transparent pass-through and satisfies
+/// [`substrate_conformance`] unchanged.
+#[derive(Debug)]
+pub struct WanLink<S> {
+    inner: S,
+    profile: WanProfile,
+    sent: u64,
+    dropped: u64,
+}
+
+impl<S> WanLink<S> {
+    /// Wrap `inner` with the given WAN `profile`.
+    #[must_use]
+    pub fn new(inner: S, profile: WanProfile) -> Self {
+        Self {
+            inner,
+            profile,
+            sent: 0,
+            dropped: 0,
+        }
+    }
+
+    /// How many `send`s this link has dropped so far (lost in the simulated WAN).
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Borrow the inner substrate.
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: Substrate> Substrate for WanLink<S> {
+    type Error = S::Error;
+
+    /// Forward the cofre to the inner substrate, unless this is a `drop_every`-th send (then it is silently
+    /// lost in transit — the source must re-drive it on resume).
+    ///
+    /// # Errors
+    /// Propagates the inner substrate's error.
+    fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
+        self.sent += 1;
+        if self.profile.drop_every != 0 && self.sent.is_multiple_of(u64::from(self.profile.drop_every)) {
+            self.dropped += 1;
+            return Ok(());
+        }
+        self.inner.send(cofre)
+    }
+
+    /// Sleep for the profile's latency (modelling RTT), then delegate to the inner substrate.
+    ///
+    /// # Errors
+    /// Propagates the inner substrate's error.
+    fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
+        if !self.profile.latency.is_zero() {
+            std::thread::sleep(self.profile.latency);
+        }
+        self.inner.recv()
+    }
+
+    /// Delegate the acknowledgement to the inner substrate (header-only).
+    ///
+    /// # Errors
+    /// Propagates the inner substrate's error.
+    fn ack(&mut self, cofre_id: [u8; 32]) -> Result<(), Self::Error> {
+        self.inner.ack(cofre_id)
+    }
+}
+
 /// Shared cofre fixtures — `pub` so downstream substrate crates can reuse them in the same harness.
 pub mod testsupport {
     use datarail_cofre::seal;
@@ -522,6 +612,50 @@ mod tests {
         assert_eq!(
             got, expected,
             "cofre survived a real cross-endpoint TCP transport byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn ac6_wanlink_default_profile_is_transparent() {
+        // A benign (default) WAN profile is a pure pass-through, so the decorator satisfies the SAME AC-6
+        // conformance flow — proving it neither corrupts nor reorders the stream.
+        substrate_conformance(|| {
+            super::WanLink::new(LoopbackSubstrate::new(), super::WanProfile::default())
+        });
+    }
+
+    #[test]
+    fn wanlink_drops_every_nth_send() {
+        // drop_every=2 over a lossless loopback: sends #2 and #4 are lost in transit, so only #1 and #3 arrive.
+        let profile = super::WanProfile {
+            drop_every: 2,
+            ..super::WanProfile::default()
+        };
+        let mut link = super::WanLink::new(LoopbackSubstrate::new(), profile);
+        for seq in 0..4 {
+            link.send(&super::testsupport::cofre_seq(seq)).unwrap();
+        }
+        assert_eq!(link.dropped(), 2, "every 2nd send was dropped");
+        let a = link.recv().unwrap().expect("first survivor");
+        let b = link.recv().unwrap().expect("second survivor");
+        assert_eq!(link.recv().unwrap(), None, "only the un-dropped cofres arrive");
+        assert_eq!(a.etiqueta.seq, 0, "send #1 (seq 0) survived");
+        assert_eq!(b.etiqueta.seq, 2, "send #3 (seq 2) survived; #2 and #4 were dropped");
+    }
+
+    #[test]
+    fn wanlink_adds_recv_latency() {
+        let profile = super::WanProfile {
+            latency: std::time::Duration::from_millis(20),
+            ..super::WanProfile::default()
+        };
+        let mut link = super::WanLink::new(LoopbackSubstrate::new(), profile);
+        link.send(&super::testsupport::cofre_seq(0)).unwrap();
+        let t = std::time::Instant::now();
+        let _ = link.recv().unwrap();
+        assert!(
+            t.elapsed() >= std::time::Duration::from_millis(20),
+            "recv waited out the simulated WAN latency"
         );
     }
 
