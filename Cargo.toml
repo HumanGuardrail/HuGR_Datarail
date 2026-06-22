@@ -8,6 +8,7 @@ members = [
     "crates/datarail-manifest",
     "crates/datarail-once",
     "crates/datarail-rail",
+    "crates/datarail-substrate-objectstore",
     "crates/datarail-terminal",
     "crates/datarail-spec",
     "crates/datarail-cli",

@@ -1,0 +1,17 @@
+[package]
+name = "datarail-substrate-objectstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail object-store (S3) substrate — dumb, provider-blind durable holding pen (SPEC 10/07)."
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-cofre = { path = "../datarail-cofre" }
+
+[dev-dependencies]
+# The shared AC-6 conformance harness + cofre fixtures live in datarail-rail (both always-public).
+datarail-rail = { path = "../datarail-rail" }

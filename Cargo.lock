@@ -316,6 +316,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-substrate-objectstore"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-rail",
+]
+
+[[package]]
 name = "datarail-terminal"
 version = "0.0.0"
 dependencies = [
