@@ -1,7 +1,7 @@
 # HuGR_Datarail — cargo workspace. Crate DAG per docs/design/00-CONSTITUTION.md.
 [workspace]
 resolver = "2"
-members = ["crates/datarail-core"]
+members = ["crates/datarail-core", "crates/datarail-crypto"]
 
 [workspace.package]
 edition = "2021"
