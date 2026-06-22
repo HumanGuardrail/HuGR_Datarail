@@ -16,6 +16,8 @@ use datarail_crypto::{aead_open, aead_seal, blake3_256, open_key, seal_key, veri
 use datarail_rail::{LoopbackSubstrate, TcpSubstrate};
 use datarail_terminal::{ContentContract, DestTerminal, SourceTerminal, TerminalConfig};
 
+mod fairness;
+
 /// Time `f` over `iters` iterations (after a warm-up) and print nanoseconds per op.
 fn lat(name: &str, iters: u32, mut f: impl FnMut()) {
     for _ in 0..(iters / 10).max(1) {
@@ -134,4 +136,6 @@ fn main() {
         roundtrip("TCP loopback (real kernel hop)", tcp, &cofre, 5_000);
     }
     println!("  (a real WAN adds WanLink latency x hop + loss; AC-8 resume + dedup recover drops — see tests.)");
+
+    fairness::report();
 }

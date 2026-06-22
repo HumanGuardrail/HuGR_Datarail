@@ -333,6 +333,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   PROVEN.** **14 crates · 104 tests** green · clippy deny(all+pedantic) · `forbid(unsafe)` workspace-wide except
   the one shmem waiver. **Every buildable rung is now done, PROVEN, AUDITED.**
 
+- 2026-06-22 — **Tech-lead decisions (owner-delegated): MF-0 trio ratified + GATE-WARP X set + AC-10 rig built.**
+  (1) **MF-0** RATIFIED into DECOMPOSITION.md (A3 GCM-SIV default / AC-1 metamorphic / C1 idempotency=record_key
+  — audit-reconciled, implementation matches). (2) **GATE-WARP** X = **1 GiB/s/core** sealed-payload (batched)
+  set as a design target (SPEC-11 + DOD-01); the binding pass needs VAES HW (#13), CI guard stays red — no
+  faked pass. (3) **AC-10 fairness RIG** built (`datarail-bench::fairness`): `MoverEngine` trait + datarail
+  engine + pass-through baseline + the **byte-equal-before-timing** anti-cheat gate (tested: correct engines
+  pass; a record-dropping cheater is disqualified before timing). The only things still genuinely external are
+  **physical resources, not decisions**: representative VAES hardware (#13 measurement) and real competitor
+  binaries (#20 bake-off). **14 crates · 106 tests** green · clippy deny(all+pedantic). **The autonomous build
+  is complete to its buildable terminus — every decision the tech lead owns is made, every rung built, PROVEN,
+  and AUDITED.**
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
