@@ -12,6 +12,7 @@ members = [
     "crates/datarail-substrate-quic",
     "crates/datarail-substrate-shmem",
     "crates/datarail-terminal",
+    "crates/datarail-connectors",
     "crates/datarail-spec",
     "crates/datarail-cli",
     "crates/datarail-acceptance",

@@ -314,6 +314,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-connectors"
+version = "0.0.0"
+
+[[package]]
 name = "datarail-core"
 version = "0.0.0"
 

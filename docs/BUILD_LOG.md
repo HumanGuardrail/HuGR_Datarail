@@ -345,6 +345,26 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   is complete to its buildable terminus — every decision the tech lead owns is made, every rung built, PROVEN,
   and AUDITED.**
 
+- 2026-06-22 — **⚠️ CORRECTION (owner: "o que falta pra 100%?"): the "buildable terminus" was again too narrow.**
+  I'd measured vs the ACs + substrate layer, not the FULL capability decomposition (A–H) + white paper + CLI
+  spec. Cold-verified against PRODUCT / WORKING_BACKWARDS / DECOMPOSITION (A–H) / SPEC 02·08·09: the
+  cryptographic rail **engine** is done/proven/audited, but the **product surface + identity layer are NOT**.
+  **(1) Connectors** — no connectors crate; `datarail run` moves CLI-arg records to an in-memory sink, not a
+  real source→sink (PRODUCT "terminals + connectors"; SPEC-09 `postgres-cdc`/`s3-parquet`). **(2) CLI ignores
+  the `substrate` field** — hard-wired to `LoopbackSubstrate` (main.rs:212), never selects shmem/quic/s3.
+  **(3) A4 sealed-sender** — `sender_present` + `SENDER_CERT`-inside-CARGA unbuilt (sender auth = clear
+  `signer_key_id` + Ed25519). **(4) Identity** — F2 Noise_KK session + F3 PAKE bootstrap unbuilt (keygen/ticket
+  exist for F4 + pre-provisioned). **(5) CLI `replay` + G3 `--watch` speedometer.** **(6) B3 RFC-3161 TSA**
+  (documented out-of-v1). Opened as #31–#35 — **tech-lead-buildable, not owner/physical**. Physical-only
+  remains: #13 VAES measurement, #20 real engines.
+
+- 2026-06-22 — **#31 connectors crate built (`datarail-connectors`, std-only).** `Source` (yield record batches
+  until drained) + `Sink` (commit delivered records); `SliceSource`/`LineFileSource` + `VecSink`/`LineFileSink`
+  — real file→file movement today, datarail-agnostic (the terminal enforces the contract + seals between them).
+  Real backends (postgres-cdc/s3-parquet) are adapters behind these traits + their driver + live infra
+  (external). Foundation for wiring `datarail run` to a real source→sink over a real substrate (#32).
+  **15 crates** · tests green · clippy deny(all+pedantic) · forbid(unsafe).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

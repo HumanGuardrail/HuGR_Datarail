@@ -1,0 +1,14 @@
+[package]
+name = "datarail-connectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail connectors — the source/sink adapters at the terminal edge (PRODUCT 'terminals + connectors', SPEC 09)."
+
+[lints]
+workspace = true
+
+# std-only by design: a connector yields/accepts raw byte-records; the terminal enforces the content contract
+# and seals in between, so connectors stay datarail-agnostic and dependency-light (leveza). Real backends
+# (postgres-cdc, s3-parquet, …) are adapters behind these traits that pull their own driver + need live infra.
+[dependencies]
