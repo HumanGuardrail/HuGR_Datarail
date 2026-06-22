@@ -45,6 +45,10 @@ cargo run -p datarail-cli -- run examples/rail.toml \
     --source-file /tmp/in.txt --sink-file /tmp/out.txt --watch    # board → sealed rail → offload, live
 cargo run -p datarail-cli -- replay examples/rail.toml 1..3 --source-file /tmp/in.txt
 cargo run -p datarail-cli -- pair                                 # F2/F3 identity layer, local rehearsal
+
+# genuine TWO-PROCESS transfer over a real TCP socket (run in two terminals / hosts):
+datarail recv examples/rail.toml --listen 127.0.0.1:9000 --sink-file /tmp/out.txt --count 1   # destination
+datarail send examples/rail.toml --connect 127.0.0.1:9000 evt:hello evt:world                 # source
 ```
 
 A route is one declarative `rail.toml` (source + onboarding rules + destination + offloading rules +

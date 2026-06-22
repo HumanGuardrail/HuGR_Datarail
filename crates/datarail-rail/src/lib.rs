@@ -438,6 +438,16 @@ impl StreamSubstrate<std::net::TcpStream> {
     /// [`std::io::Error`] on accept / clone / socket-configuration failure.
     pub fn accept(listener: &std::net::TcpListener) -> std::io::Result<Self> {
         let (tx, _peer) = listener.accept()?;
+        Self::from_stream(tx)
+    }
+
+    /// Build a destination-side substrate from an **already-accepted** [`TcpStream`](std::net::TcpStream).
+    /// Same single-duplex, short-read-timeout shape as [`accept`](Self::accept) — use this when the caller does
+    /// its own bounded/non-blocking accept (e.g. a `recv` daemon that must not block forever).
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on clone / socket-configuration failure.
+    pub fn from_stream(tx: std::net::TcpStream) -> std::io::Result<Self> {
         tx.set_nodelay(true)?;
         let rx = tx.try_clone()?;
         rx.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;

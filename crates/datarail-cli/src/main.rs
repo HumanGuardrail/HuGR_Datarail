@@ -9,6 +9,8 @@
 //! - `verify <rail.toml> <hex>` — verify a wire-encoded cofre's seal against the route's source key.
 //! - `ticket <rail.toml>` — emit a signed route-capability ticket (hex).
 //! - `pair` — local rehearsal of the SPEC-08 identity layer (F3 SPAKE2 pairing + F2 `Noise_KK` session).
+//! - `recv` / `send` — a genuine **two-process** transfer over a real TCP socket (separate OS processes):
+//!   `recv` binds + offloads a shipment; `send` connects + boards + ships it. Cross-host at the product level.
 //!
 //! Lean by design (Charter *leveza*): hand-rolled argument handling (no `clap`) and `/dev/urandom` for keygen
 //! (no `rand`). The CLI holds no logic of its own beyond wiring the crates together.
@@ -37,6 +39,8 @@ USAGE:
     datarail verify <rail.toml> <cofre-hex>
     datarail ticket <rail.toml>
     datarail pair                                     (local F2/F3 identity rehearsal — see note)
+    datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]   (cross-process dest)
+    datarail send <rail.toml> --connect ADDR [--source-file F | record ...] (cross-process source)
 
     --watch        on `run`: print a live one-line speedometer per batch (no TUI; raw stdout).
     replay reads from the configured source (--source-file > inline args > stdin) and re-ships only the
@@ -68,6 +72,8 @@ fn dispatch(args: &[String]) -> Result<String, CliError> {
         "verify" => cmd_verify(rest),
         "ticket" => cmd_ticket(rest),
         "pair" => cmd_pair(),
+        "send" => cmd_send(rest),
+        "recv" => cmd_recv(rest),
         "help" | "-h" | "--help" => Ok(USAGE.to_owned()),
         other => Err(CliError::UnknownCommand(other.to_owned())),
     }
@@ -685,6 +691,167 @@ fn cmd_pair() -> Result<String, CliError> {
         "pair (local rehearsal — not a remote pairing)\n  endpoint A static = 0x{}\n  endpoint B static = 0x{}\n  F3 PAKE     = ok (shared secret agreed, identities bound)\n  F2 Noise_KK = ok (mutual-static handshake + sealed round-trip)\n",
         to_hex(&a.public()),
         to_hex(&b.public()),
+    ))
+}
+
+/// Pull an optional `--flag <value>` from `rest`, returning the (owned) value and the remaining positionals.
+/// Owned returns so successive calls can chain (`let (v, rest) = take_flag(&rest, …)`) without lifetime knots.
+fn take_flag(rest: &[String], flag: &str) -> (Option<String>, Vec<String>) {
+    let mut value = None;
+    let mut positionals = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == flag {
+            value = rest.get(i + 1).cloned();
+            i += 2;
+        } else {
+            positionals.push(rest[i].clone());
+            i += 1;
+        }
+    }
+    (value, positionals)
+}
+
+/// `datarail send <rail.toml> --connect ADDR [--source-file F | record ...]` — the cross-process **source**.
+///
+/// Boards the resolved source records into one sealed cofre and ships it over a **real TCP socket** to a
+/// `datarail recv` listening at `ADDR`. A separate OS process from the destination — this is the genuine
+/// cross-host source side (loopback `ADDR` for a same-host demo; any reachable address otherwise). The cofre is
+/// sealed end-to-end, so the TCP hop is a dumb pipe (`INV-OPAQUE-CARGO`).
+fn cmd_send(rest: &[String]) -> Result<String, CliError> {
+    let spec = load_spec(require(rest, 0, "rail.toml")?)?;
+    let body: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
+    let (connect, rest_after_connect) = take_flag(&body, "--connect");
+    let addr = connect.ok_or(CliError::MissingArg("--connect ADDR"))?;
+    let (source_file, positionals) = take_flag(&rest_after_connect, "--source-file");
+
+    let records: Vec<Vec<u8>> = if let Some(path) = source_file {
+        let raw = std::fs::read(&path).map_err(|e| CliError::Io(format!("{path}: {e}")))?;
+        raw.split(|&b| b == b'\n').filter(|l| !l.is_empty()).map(<[u8]>::to_vec).collect()
+    } else {
+        resolve_inline_or_stdin(positionals.iter().map(|s| s.as_bytes().to_vec()).collect())?
+    };
+    if records.is_empty() {
+        return Err(CliError::Rail("nothing to send (empty source)".to_owned()));
+    }
+
+    let mut src = SourceTerminal::new(spec.terminal_config(), spec.onboarding_contract(), spec.keys.source_seed);
+    let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
+    let cofre = src.board(&refs, b"datarail-send").map_err(CliError::Terminal)?;
+
+    // Connect with a short retry window so `send` can be launched ~concurrently with `recv`.
+    let mut rail = connect_with_retry(&addr)?;
+    rail.send(&cofre).map_err(|e| CliError::Rail(e.to_string()))?;
+    // Hold the connection briefly so the kernel flushes the framed cofre before the socket closes.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    Ok(format!(
+        "sent {} record(s) in 1 sealed cofre to {addr} over tcp\n  cofre_id = 0x{}\n",
+        records.len(),
+        to_hex(&cofre.etiqueta.cofre_id),
+    ))
+}
+
+/// Connect a [`TcpSubstrate`] to `addr`, retrying briefly (the peer `recv` may still be binding).
+fn connect_with_retry(addr: &str) -> Result<TcpSubstrate, CliError> {
+    let mut last = String::new();
+    for _ in 0..50 {
+        match TcpSubstrate::connect(addr) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    Err(CliError::Rail(format!("could not connect to {addr}: {last}")))
+}
+
+/// `datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]` — the cross-process **destination**.
+///
+/// Binds a TCP listener (default `127.0.0.1:0`, an OS-assigned port), prints its bound address as
+/// `DATARAIL-LISTENING <addr>` (so a peer/orchestrator can discover it), accepts one `datarail send`
+/// connection, then verifies → opens → offloads `N` cofres (default 1) and commits the delivered records to the
+/// sink. A separate OS process from the source — the genuine cross-host destination side.
+fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
+    use std::io::Write as _;
+
+    let spec = load_spec(require(rest, 0, "rail.toml")?)?;
+    let body: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
+    let (listen, r1) = take_flag(&body, "--listen");
+    let listen = listen.unwrap_or_else(|| "127.0.0.1:0".to_owned());
+    let (sink_file, r2) = take_flag(&r1, "--sink-file");
+    let (count, _r3) = take_flag(&r2, "--count");
+    let count: usize = match count {
+        Some(c) => c.parse().map_err(|_| CliError::BadRange(c.clone()))?,
+        None => 1,
+    };
+
+    let source_vk = verifying_key(&spec.keys.source_seed);
+    let mut dst = DestTerminal::new(
+        spec.terminal_config(),
+        spec.offloading_contract(),
+        source_vk,
+        spec.keys.dest_seed,
+        spec.keys.dest_x25519_secret,
+    );
+    let mut sink: Box<dyn Sink> = match sink_file {
+        Some(path) => Box::new(LineFileSink::create(path).map_err(|e| CliError::Io(e.to_string()))?),
+        None => Box::new(VecSink::new()),
+    };
+
+    let listener =
+        std::net::TcpListener::bind(&listen).map_err(|e| CliError::Rail(format!("{listen}: {e}")))?;
+    let bound = listener.local_addr().map_err(|e| CliError::Rail(e.to_string()))?;
+    // Announce the bound address (flushed) so a peer/test can discover the OS-assigned port before connecting.
+    println!("DATARAIL-LISTENING {bound}");
+    std::io::stdout().flush().map_err(|e| CliError::Io(e.to_string()))?;
+
+    // Bounded accept: poll non-blocking with a deadline so `recv` never hangs forever if no peer arrives.
+    listener.set_nonblocking(true).map_err(|e| CliError::Rail(e.to_string()))?;
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let stream = loop {
+        match listener.accept() {
+            Ok((s, _peer)) => break s,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(CliError::Rail("timed out waiting for a sender".to_owned()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(CliError::Rail(e.to_string())),
+        }
+    };
+    let mut rail = TcpSubstrate::from_stream(stream).map_err(|e| CliError::Rail(e.to_string()))?;
+
+    let mut committed_to_sink = 0usize;
+    let mut received = 0usize;
+    let recv_deadline = Instant::now() + std::time::Duration::from_secs(30);
+    while received < count {
+        match rail.recv().map_err(|e| CliError::Rail(e.to_string()))? {
+            Some(cofre) => {
+                let _ = dst.offload(&cofre).map_err(CliError::Terminal)?;
+                rail.ack(cofre.etiqueta.cofre_id).map_err(|e| CliError::Rail(e.to_string()))?;
+                received += 1;
+                let total = dst.sink().committed().len();
+                if total > committed_to_sink {
+                    let fresh: Vec<Vec<u8>> = dst.sink().committed()[committed_to_sink..].to_vec();
+                    sink.commit(&fresh).map_err(|e| CliError::Rail(e.to_string()))?;
+                    committed_to_sink = total;
+                }
+            }
+            None => {
+                if Instant::now() >= recv_deadline {
+                    return Err(CliError::Rail("timed out waiting for cofres".to_owned()));
+                }
+            }
+        }
+    }
+
+    Ok(format!(
+        "recv on {bound} over tcp\n  received    = {received} cofre(s)\n  committed   = {}\n  dead-letter = {}\n",
+        dst.sink().len(),
+        dst.dead_letters().len(),
     ))
 }
 

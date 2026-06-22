@@ -450,6 +450,21 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   crates · 134 tests** green · clippy deny(all+pedantic) · forbid(unsafe) (one shmem waiver). Open items
   unchanged: only the two external physical resources (#13 VAES HW, #20 real engines).
 
+- 2026-06-22 — **#36 two-process `datarail send`/`recv` — cross-host real at the PRODUCT level.** Closed the
+  last "everything is in-process/loopback" gap: `datarail recv <spec> [--listen ADDR] [--sink-file F]
+  [--count N]` binds a TCP listener, announces `DATARAIL-LISTENING <addr>`, bounded-accepts (non-blocking poll
+  + 30s deadline, never hangs), then verify→open→offload→commit N cofres; `datarail send <spec> --connect ADDR
+  [--source-file F | records]` boards the source into one sealed cofre and ships it over a real TCP socket
+  (retry-connect window). Additive `TcpSubstrate::from_stream` in rail (for the bounded accept). **Proven by a
+  genuine two-process integration test** (`tests/two_process.rs` spawns the built binary TWICE — separate OS
+  processes — via `CARGO_BIN_EXE_datarail`; records land in the dest process's sink file) **+ a live demo**
+  (recv on an OS-assigned port, send connects, 2 records cross the socket sealed). The cofre is sealed
+  end-to-end so the TCP hop stays a dumb pipe (`INV-OPAQUE-CARGO`). Cross-HOST = the same two commands on two
+  machines. README + DOD-01 updated. **16 crates · 135 tests** green · clippy deny(all+pedantic) ·
+  forbid(unsafe) (one shmem waiver). Still open: only the two external physical resources (#13 VAES HW, #20
+  real engines). (Remaining v2-class: Noise-protected substrate hop wiring + cross-process PAKE — primitives
+  built; the live two-process transport now exists to carry them.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
