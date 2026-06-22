@@ -1,0 +1,13 @@
+[package]
+name = "datarail-spec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-spec — parse a declarative rail.toml into typed route/contract/key config (SPEC 09)."
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-terminal = { path = "../datarail-terminal" }
