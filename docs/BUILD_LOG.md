@@ -46,10 +46,10 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
 - 2026-06-21 — **MF-1 closed (passed-with-notes).** **H1 (ZK-completeness): CONFIRMED** — every rail function
   computes from the authenticated header + seal alone; none reassigned to the terminal (see
   `design/01-rail-surface.md`); conditioned on `INV-SEAL-COMPLETE` + the accepted metadata residual
-  (size/timing/idem-token). **AEAD decision:** AEAD is pluggable; **default = single-pass AES-256-GCM with the
-  nonce DERIVED from the idempotency key** — distinct plaintext → distinct nonce (no catastrophic GCM reuse);
-  identical plaintext → identical ciphertext (the intended per-tenant dedup); fast on VAES. **GCM-SIV retained
-  as a hardened option.** **batch-many-records-per-cofre LOCKED** (one Ed25519 sig amortized per lote).
+  (size/timing/idem-token). **AEAD decision (refined in design/03):** pluggable; **default = single-pass AES-256-GCM**, 256-bit, with a
+  **per-cofre fresh data key** → a random nonce is reuse-safe (no derived-nonce gymnastics). Dedup is the
+  **header HMAC `idempotency_key`**, so **no convergent encryption / no equality leak**. ChaCha20-Poly1305 for
+  non-AES-NI; GCM-SIV as a hardened option. **batch-many-records-per-cofre LOCKED** (one Ed25519 sig amortized per lote).
   **`GATE-WARP` target = PENDING** a re-bench on representative VAES hardware (no representative box now;
   labeled, NOT blocking).
 

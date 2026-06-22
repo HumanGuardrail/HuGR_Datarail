@@ -29,15 +29,16 @@ Fixed order, length-prefixed. *Authenticated, not secret* — the rail reads eve
 | `idempotency_key` | 32 B | `HMAC(tenant_secret, record_key)` — effectively-once key | dedup |
 | `contract_fp` | 32 B | `BLAKE3` of the content-contract/schema this cofre claims | (passes to dest) |
 | `aead_alg` | u8 | `01`=AES-256-GCM (default) · `02`=ChaCha20-Poly1305 · `03`=AES-256-GCM-SIV | — |
-| `nonce` | 12/24 B | **derived** from `idempotency_key`+`data_key` (KDF) | — |
+| `nonce` | 12/24 B | **random per cofre** — reuse-safe because the data key is fresh per cofre (see 03) | — |
 | `wrapped_data_key` | len-pref | per-cofre data key, wrapped under the route key (envelope enc.) | — |
 | `signer_key_id` | 32 B | hash of the Ed25519 pubkey that produced `LACRE` (pinned per route, F2) | verify seal |
 | `sender_present` | u8 | sealed-sender flag; sender identity lives **inside** `CARGA` | — |
 | `ts` | u64 ms | informational only — **never** trusted for ordering (`seq` is) | — |
 
-> **Stolen patterns embodied:** content-address identity (`cofre_id`), HMAC-per-tenant dedup key (the
-> convergent-encryption fix), derived nonce (GCM-safe — distinct plaintext ⇒ distinct nonce), envelope
-> encryption (`wrapped_data_key`, rotation without re-encrypt), sealed-sender (`sender_present`).
+> **Stolen patterns embodied:** content-address identity (`cofre_id`), HMAC-per-tenant dedup key in the header
+> (so dedup needs **no** convergent encryption), per-cofre fresh data key (GCM-safe with a random nonce — no
+> equality leak; see 03), envelope encryption (`wrapped_data_key`, rotation without re-encrypt), sealed-sender
+> (`sender_present`).
 
 ## CARGA — the AEAD payload (opaque to the rail)
 
