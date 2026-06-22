@@ -3,7 +3,7 @@
 > The cross-crate **contract** is frozen. Dependent crates (`manifest`, `once`, `rail`, `terminal`, …)
 > **transcribe** this interface; they do not redesign it. Drift is detectable by re-running one `shasum`.
 
-- **Git HEAD at freeze:** `856502f4d789cd6f7ee823205afab3703c691006` (re-frozen 2026-06-22)
+- **Git HEAD at freeze:** `b1ed8372c62f` (re-frozen 2026-06-22 — sealed-sender; full sha in git log)
 - **Content hash (sha256 of the 3 contract crates' `lib.rs`, sorted, concatenated):**
   `3851940485f2a1fd137c9feec4d4c07047ab0f0db7c576948ad103493cd38179`
 - **Size:** 3 crates · 720 lines.
