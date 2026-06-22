@@ -46,6 +46,27 @@
 
 The P3 re-open code is **sound**; the three findings (one MED memory-DoS, two LOW/LOW-MED hardening) are
 **FIXED at the root** with a shared cap constant + a redacted secret. Every buildable P3/P5 rung is now
-**PROVEN + AUDITED**. Remaining open items are **owner/external only**: shmem (#24, frozen-conflict
-STOP-THE-LINE), GATE-WARP bound + representative VAES HW (#13), AC-10 competitor engines (#20), MF-0 trio
-ratification.
+**PROVEN + AUDITED**. Remaining open items are external **physical resources**: representative VAES HW for
+GATE-WARP (#13) and real competitor engines for AC-10 (#20); the MF-0 trio is a tech-lead call to apply.
+
+## Addendum (2026-06-22) — shmem `ShmemRing` `unsafe` audit (#24)
+
+The owner delegated the frozen `forbid(unsafe)` vs SPEC "lock-free shmem" conflict to the tech lead, who took
+**option (A)**: one contained, audited `unsafe` in the quarantined `datarail-substrate-shmem` crate (`deny`,
+not `forbid`, + a single `#[allow(unsafe_code, clippy::cast_ptr_alignment)]` — logged WAIVER). Two unsafe
+operations, both audited **sound**:
+
+- **`cell()` — `&*(map.as_ptr().add(off).cast::<AtomicUsize>())`** forms the shared-memory atomic cursors.
+  The mmap base is page-aligned (4 KiB) ⇒ offsets 0/8 are 8-aligned (AtomicUsize alignment); they sit inside
+  the reserved 64-byte header (in-bounds); the cells are accessed **only** via atomic ops (never aliased as
+  plain memory) and the data region (`≥ HEADER_LEN`) never overlaps them. Producer Release-stores `write`
+  after writing bytes; consumer Acquire-loads `write` before reading — textbook SPSC happens-before, correct
+  on any arch; `MAP_SHARED` gives cross-process visibility. `cast_ptr_alignment` is a clippy false-positive the
+  page-aligned base resolves.
+- **`map_file()` — `MmapMut::map_mut(file)`**: memmap2 marks file mapping `unsafe` (the file could change under
+  a `&[u8]`). Here it is our own ring file, sized once; all data access is synchronized by the atomic cursors,
+  so concurrent access via the shared mapping is the intended SPSC protocol, not UB.
+
+The ring **data** bytes are copied via **safe** slices (no unsafe). Tests: conformance, cross-mapping transfer
+(two independent mappings of one file), ring-full back-pressure, wraparound. The rest of the workspace stays
+`forbid(unsafe)`. **Verdict: the single waiver is minimal, contained, and sound; AC-6 is now 3/3 named.**

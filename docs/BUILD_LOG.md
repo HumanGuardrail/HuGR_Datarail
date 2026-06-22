@@ -315,6 +315,24 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   are owner/external (shmem #24, GATE-WARP HW #13, AC-10 engines #20, MF-0 trio) — the autonomous build has
   reached its buildable terminus; those four need the owner.
 
+- 2026-06-22 — **Owner correction: the four "remaining" items are TECH-LEAD decisions, not owner-reserved.** I
+  had over-escalated. Recalibrated: design / dependency / scope / ratification are the tech lead's calls; only
+  absent **physical** resources (representative VAES hardware, real competitor binaries) are truly external.
+  Acting on all four as tech lead — starting with shmem.
+
+- 2026-06-22 — **#24 shmem: `ShmemRing` — lock-free SPSC shared-memory ring (AC-6 named 3/3).** Decision **(A)**
+  taken (owner-delegated WAIVER, §6 below): one contained, audited `unsafe` in the quarantined
+  `datarail-substrate-shmem` crate (`deny(unsafe)` + a single `#[allow(unsafe_code, clippy::cast_ptr_alignment)]`
+  for the shared-memory atomic cursors; memmap2 encapsulates the mmap; data copies use safe slices). SPSC byte
+  ring over a `MAP_SHARED` mapping: monotonic `AtomicUsize` cursors in the header, acquire/release
+  happens-before, wraparound, back-pressure when full, frame cap (`MAX_COFRE_WIRE_LEN`). `pair()`/`anon()`
+  (anonymous, single-object — conformance) + `create()`/`open()` (file-backed, real cross-process). Tests:
+  conformance, **cross-mapping transfer** (two independent mappings of one file share the ring), ring-full
+  back-pressure, wraparound. `unsafe` audited sound (AUDIT-03 addendum). Added the **shmem-hop** to
+  `real_hop_slice.rs` — P5 now traverses all three named hops (shmem + QUIC + object-store). **AC-6 = 3/3 named
+  PROVEN.** **14 crates · 104 tests** green · clippy deny(all+pedantic) · `forbid(unsafe)` workspace-wide except
+  the one shmem waiver. **Every buildable rung is now done, PROVEN, AUDITED.**
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
@@ -326,6 +344,12 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
      ciphertext of equal length, re-signed, routing fixed → identical rail behavior); was "zero payload →
      byte-identical", which contradicts `cofre_id=BLAKE3(CARGA)`. [BLK-3]
   3. **C1** → `idempotency_key` preimage = `record_key`, not `content`. [BLK-2]
+
+- 2026-06-22 — **✅ RESOLVED (owner delegated → tech lead took option A; `ShmemRing` built + audited; see §4).**
+  The owner clarified this is a tech-lead decision, not owner-reserved. Decision: **(A)** — one contained,
+  audited `unsafe` (WAIVER: authorized-by owner-delegation 2026-06-22; scope = the shared-memory atomic cursors
+  in the `datarail-substrate-shmem` crate only; remediation = none needed, it is the sound minimal technique;
+  audited in AUDIT-03 addendum). Original escalation kept below for the record:
 
 - 2026-06-22 — **STOP-THE-LINE #24 (shmem): a frozen SPEC requirement collides with the frozen Charter.**
   SPEC `07` specifies the same-host substrate as a **"lock-free ring in shared memory."** A *lock-free*

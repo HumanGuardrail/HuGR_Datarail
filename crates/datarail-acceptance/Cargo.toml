@@ -17,3 +17,4 @@ datarail-rail = { path = "../datarail-rail" }
 datarail-terminal = { path = "../datarail-terminal" }
 datarail-substrate-quic = { path = "../datarail-substrate-quic" }
 datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }
+datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }

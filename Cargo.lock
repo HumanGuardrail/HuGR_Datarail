@@ -277,6 +277,7 @@ dependencies = [
  "datarail-rail",
  "datarail-substrate-objectstore",
  "datarail-substrate-quic",
+ "datarail-substrate-shmem",
  "datarail-terminal",
 ]
 
@@ -382,6 +383,16 @@ dependencies = [
  "quinn",
  "rustls",
  "tokio",
+]
+
+[[package]]
+name = "datarail-substrate-shmem"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-rail",
+ "memmap2",
 ]
 
 [[package]]
@@ -593,6 +604,15 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "mio"

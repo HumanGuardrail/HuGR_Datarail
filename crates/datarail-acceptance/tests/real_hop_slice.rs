@@ -9,6 +9,7 @@ use datarail_core::{AeadAlg, Disposition, Substrate};
 use datarail_crypto::{verifying_key, x25519_public};
 use datarail_substrate_objectstore::ObjectStoreSubstrate;
 use datarail_substrate_quic::QuicSubstrate;
+use datarail_substrate_shmem::ShmemRing;
 use datarail_terminal::{ContentContract, DestTerminal, SourceTerminal, TerminalConfig};
 
 const SOURCE_SEED: [u8; 32] = [11; 32];
@@ -62,6 +63,32 @@ fn vertical_slice_over_quic_hop_delivers() {
         dst.sink().committed().to_vec(),
         vec![b"evt:over-quic".to_vec(), b"evt:cross-host".to_vec()],
         "both records committed once, intact, across a real QUIC hop"
+    );
+    assert!(dst.dead_letters().is_empty());
+}
+
+#[test]
+fn vertical_slice_over_shmem_hop_delivers() {
+    let mut src = source();
+    let mut dst = dest();
+    let mut rail = ShmemRing::pair().expect("shmem ring");
+
+    let recs: [&[u8]; 2] = [b"evt:over-shmem", b"evt:same-host"];
+    let cofre = src.board(&recs, b"shmem-1").expect("board");
+    rail.send(&cofre).expect("send over shmem");
+
+    let received = loop {
+        if let Some(c) = rail.recv().expect("recv") {
+            break c;
+        }
+    };
+    assert_eq!(received, cofre, "the cofre survived the shared-memory ring byte-for-byte");
+    assert_eq!(dst.offload(&received).expect("offload"), Disposition::Delivered);
+    rail.ack(received.etiqueta.cofre_id).expect("ack");
+    assert_eq!(
+        dst.sink().committed().to_vec(),
+        vec![b"evt:over-shmem".to_vec(), b"evt:same-host".to_vec()],
+        "both records committed once, intact, across a real shared-memory hop"
     );
     assert!(dst.dead_letters().is_empty());
 }

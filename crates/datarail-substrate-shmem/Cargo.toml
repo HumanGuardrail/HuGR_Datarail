@@ -1,0 +1,25 @@
+[package]
+name = "datarail-substrate-shmem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail shmem substrate — lock-free SPSC ring over shared memory, µs same-host hops (SPEC 07)."
+
+# WAIVER (owner-delegated to the tech lead, 2026-06-22; logged BUILD_LOG §6) — this crate alone may use ONE
+# contained, audited `unsafe` block to form the shared-memory atomic cursors. The rest of the workspace stays
+# `forbid(unsafe)`; here unsafe is `deny`-ed so the single audited site can be `#[allow(unsafe_code)]`-ed.
+# memmap2 encapsulates the mmap unsafe; the mapped data bytes are accessed only through safe slices.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-cofre = { path = "../datarail-cofre" }
+memmap2 = "0.9"
+
+[dev-dependencies]
+datarail-rail = { path = "../datarail-rail" }
