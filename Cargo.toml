@@ -9,6 +9,7 @@ members = [
     "crates/datarail-once",
     "crates/datarail-rail",
     "crates/datarail-terminal",
+    "crates/datarail-acceptance",
 ]
 
 [workspace.package]
