@@ -9,7 +9,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use datarail_core::{Cofre, Substrate};
 
@@ -140,6 +140,97 @@ where
     );
 }
 
+/// A substrate that models a **resumable** link across a network partition (AC-8).
+///
+/// Every cofre handed to [`send`](Substrate::send) is retained in a source-side outbox until it is acked;
+/// [`recv`](Substrate::recv) delivers forward from a cursor. [`partition`](Self::partition) severs the link
+/// (delivery yields `None`); [`resume`](Self::resume) reconnects and rewinds the cursor to the **first
+/// un-acked** cofre, so the source re-drives the stream from the last durable position. Redeliveries are
+/// deduped downstream by the `datarail-once` gate, so the net effect across a partition is **0-loss /
+/// 0-duplicate** at the sink (proven end-to-end in `datarail-acceptance`'s AC-8 test).
+///
+/// Like [`LoopbackSubstrate`] it holds no keys and reads only the header (`INV-DUMB-PIPE` / `INV-OPAQUE-CARGO`)
+/// and cannot fail (its `Error` is the uninhabited [`LoopbackError`]).
+#[derive(Debug, Default, Clone)]
+pub struct ResumableSubstrate {
+    /// Every cofre sent, retained until acked (the resend buffer).
+    outbox: Vec<Cofre>,
+    /// `cofre_id`s the destination has acknowledged.
+    acked: HashSet<[u8; 32]>,
+    /// Index of the next cofre `recv` will deliver.
+    cursor: usize,
+    /// While `true`, `recv` delivers nothing (the link is severed).
+    partitioned: bool,
+}
+
+impl ResumableSubstrate {
+    /// A fresh, connected, empty resumable substrate.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sever the link: until [`resume`](Self::resume), `recv` yields `None` (in-flight cofres are "lost").
+    pub fn partition(&mut self) {
+        self.partitioned = true;
+    }
+
+    /// Reconnect and resume from the last durable (acked) position: rewind the delivery cursor to the first
+    /// un-acked cofre, so every sent-but-unacked cofre is re-driven.
+    pub fn resume(&mut self) {
+        self.partitioned = false;
+        self.cursor = self
+            .outbox
+            .iter()
+            .position(|c| !self.acked.contains(&c.etiqueta.cofre_id))
+            .unwrap_or(self.outbox.len());
+    }
+
+    /// Number of cofres sent but not yet acked.
+    #[must_use]
+    pub fn inflight(&self) -> usize {
+        self.outbox.len() - self.acked.len().min(self.outbox.len())
+    }
+}
+
+impl Substrate for ResumableSubstrate {
+    type Error = LoopbackError;
+
+    /// Retain a clone of the cofre in the resend buffer.
+    ///
+    /// # Errors
+    /// Never returns an error — [`LoopbackError`] is uninhabited.
+    fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
+        self.outbox.push(cofre.clone());
+        Ok(())
+    }
+
+    /// Deliver the next cofre from the cursor, or `None` while partitioned / drained.
+    ///
+    /// # Errors
+    /// Never returns an error — see [`LoopbackError`].
+    fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
+        if self.partitioned {
+            return Ok(None);
+        }
+        if let Some(cofre) = self.outbox.get(self.cursor) {
+            self.cursor += 1;
+            Ok(Some(cofre.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Record an acknowledgement (header-only); acked cofres are not re-driven on [`resume`](Self::resume).
+    ///
+    /// # Errors
+    /// Never returns an error — see [`LoopbackError`].
+    fn ack(&mut self, cofre_id: [u8; 32]) -> Result<(), Self::Error> {
+        self.acked.insert(cofre_id);
+        Ok(())
+    }
+}
+
 /// Shared cofre fixtures — `pub` so downstream substrate crates can reuse them in the same harness.
 pub mod testsupport {
     use datarail_cofre::seal;
@@ -177,7 +268,7 @@ pub mod testsupport {
 
 #[cfg(test)]
 mod tests {
-    use super::{substrate_conformance, LoopbackSubstrate};
+    use super::{substrate_conformance, LoopbackSubstrate, ResumableSubstrate};
     use super::testsupport::{etiqueta_seq, FIXTURE_SEED};
     use datarail_cofre::{seal, verify};
     use datarail_core::{Cofre, Substrate};
@@ -187,6 +278,39 @@ mod tests {
     fn ac6_loopback_passes_substrate_conformance() {
         // The reference substrate satisfies the polymorphic acceptance flow (AC-6).
         substrate_conformance(LoopbackSubstrate::new);
+    }
+
+    #[test]
+    fn ac6_resumable_passes_substrate_conformance() {
+        // The resumable substrate (with no partition) satisfies the same polymorphic flow.
+        substrate_conformance(ResumableSubstrate::new);
+    }
+
+    #[test]
+    fn resumable_partition_then_resume_redelivers_unacked() {
+        let mut sub = ResumableSubstrate::new();
+        let a = super::testsupport::cofre_seq(0);
+        let b = super::testsupport::cofre_seq(1);
+        let c = super::testsupport::cofre_seq(2);
+        sub.send(&a).unwrap();
+        sub.send(&b).unwrap();
+        sub.send(&c).unwrap();
+
+        // Deliver + ack `a`; deliver `b` but do NOT ack it (its ack is "lost").
+        assert_eq!(sub.recv().unwrap().as_ref(), Some(&a));
+        sub.ack(a.etiqueta.cofre_id).unwrap();
+        assert_eq!(sub.recv().unwrap().as_ref(), Some(&b));
+        assert_eq!(sub.inflight(), 2, "b and c are unacked");
+
+        // Partition: nothing is delivered.
+        sub.partition();
+        assert_eq!(sub.recv().unwrap(), None);
+
+        // Resume: re-drive from the first un-acked (`b`), then the never-delivered `c`, then drain.
+        sub.resume();
+        assert_eq!(sub.recv().unwrap().as_ref(), Some(&b), "unacked b is redelivered");
+        assert_eq!(sub.recv().unwrap().as_ref(), Some(&c));
+        assert_eq!(sub.recv().unwrap(), None);
     }
 
     #[test]
