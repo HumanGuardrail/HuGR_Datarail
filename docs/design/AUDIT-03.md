@@ -40,7 +40,9 @@
    the cookie endpoint-secret are *not* cofre keys — transport/admission only). `INV-SUBSTRATE-POLYMORPHIC`:
    one `substrate_conformance` harness passes over all six transports. Hold.
 6. **Completeness / claims** — DOD-01 was rewritten to the true state (no overclaim); BENCH-01 numbers are the
-   honest Rosetta-x86_64 figures with the arch divergence flagged. No fabricated greens.
+   honest figures for this machine, flagged DIRECTIONAL. (The machine was later verified as a native Intel
+   i7-9750H Coffee Lake — earlier "arm64" and "Rosetta" labels were both wrong; corrected 2026-06-22.) No
+   fabricated greens.
 
 ## Verdict
 

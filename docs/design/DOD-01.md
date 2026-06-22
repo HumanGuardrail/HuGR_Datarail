@@ -42,8 +42,8 @@
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `GATE-WARP` (throughput ≥ X) | **PENDING** (measurement) — **X now set** | **X = 1 GiB/s/core** sealed-payload (batched) — a tech-lead **design target** (SPEC-11, set 2026-06-22). The binding *pass* needs representative VAES HW (this box is Rosetta-x86_64, no VAES — #13); the CI guard stays **red until a real VAES run records it**. BENCH-01 directional figures are **not** a GATE-WARP pass. |
-| `GATE-LATENCY` (p50/p99 per hop) | **DIRECTIONAL** | BENCH-01 (Rosetta-x86_64): board ~**1.45 ms** / offload ~**0.94 ms**, dominated by **emulated** X25519 (~0.5–0.7 ms/side) — **NOT sub-ms on this box**; native arm64 was ~190 µs / ~136 µs (sub-ms). Amortizes per batch (wrap once per cofre). Formal p50/p99 on representative native/VAES HW pending (#13) |
+| `GATE-WARP` (throughput ≥ X) | **PENDING** (measurement) — **X now set** | **X = 1 GiB/s/core** sealed-payload (batched) — a tech-lead **design target** (SPEC-11, set 2026-06-22). The binding *pass* needs representative VAES server HW; this box is a **native Intel i7-9750H (Coffee Lake, 2019) — AES-NI but pre-VAES** (#13), so it can't be the target measurement. The CI guard stays **red until a real VAES run records it**. BENCH-01 figures are noisy/directional, **not** a GATE-WARP pass. |
+| `GATE-LATENCY` (p50/p99 per hop) | **DIRECTIONAL** | BENCH-01 on the i7-9750H laptop is **noisy** (two runs disagreed 2–3×: `board` ~1.45–3.6 ms, dominated by X25519) — **not a sub-ms pass and not benchmark-grade**. The reliable finding is the *shape* (asymmetric-crypto-bound, batch-amortizing). Formal p50/p99 needs a quiet representative server + a criterion harness (#13). |
 | `GATE-FEATHER` (idle ≈ 0) | **DIRECTIONAL** (architectural half PROVEN) | `gate_feather_*` test: idle in-flight returns to 0 every cycle (no standing data); the in-process substrate is a passive struct (no thread/fd). Real-substrate idle-RSS measurement still PENDING |
 
 ## Invariants (verified in code — AUDIT-02)
@@ -62,7 +62,7 @@
 
 ## Remaining open items (external **physical resources** — not tech-lead decisions)
 
-1. **GATE-WARP — representative VAES hardware** (#13): the pass measurement needs real x86 VAES HW (this box is Rosetta-x86_64, no VAES). Setting the design-target `X` + the CI-gate policy is a tech-lead call; the representative *measurement* is hardware-gated. The guard fails until X is set on the target (MAJ-7).
+1. **GATE-WARP — representative VAES hardware** (#13): the pass measurement needs real x86 **VAES** server HW; this box is a native Intel **i7-9750H (Coffee Lake, pre-VAES)** laptop, so it is not the target. Setting the design-target `X` + the CI-gate policy is a tech-lead call (done); the representative *measurement* is hardware-gated. The guard fails until X is recorded on the target (MAJ-7).
 2. **AC-10 — real competitor engines** (#20): the fairness bake-off needs the actual competitor binaries + infra. Building the **rig + methodology** is a tech-lead call; the real engines are external software.
 3. **MF-0 trio ratification** (DECOMPOSITION.md §6: A3 AEAD→GCM-SIV default · AC-1 metamorphic redefinition · C1 idempotency = record_key) — a tech-lead call (owner-delegated), to be applied to the DRAFT.
 
@@ -80,4 +80,4 @@ hops** (shmem + QUIC + decoupled object-store), and **`ShmemRing`** completing t
 Audited (AUDIT-03: F1/F2/F3 fixed + the shmem `unsafe` sound). **Everything buildable here is done, PROVEN, and
 AUDITED.** What remains needs **physical resources, not decisions**: representative VAES HW for GATE-WARP (#13)
 and real competitor engines for AC-10 (#20); plus the MF-0 trio ratification (a tech-lead call, to apply).
-Performance is **DIRECTIONAL** (this box is Rosetta-x86_64, not the VAES target). Nothing is faked.
+Performance is **DIRECTIONAL** (this box is a native Intel i7-9750H Coffee Lake laptop — AES-NI, pre-VAES — not the VAES server target, and its numbers are noisy run-to-run). Nothing is faked.

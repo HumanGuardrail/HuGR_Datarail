@@ -225,10 +225,11 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   over both terminals — **boards-iff-all-records-conform** (source never boards a violating batch; seq stays 0),
   **conforming batch round-trips & commits exactly**, and **any single carga byte-flip is dead-lettered** (via
   `proptest::sample::Index`, no cast lints). AC-2 stays exhaustive byte-flip (≥ sampled proptest). Also
-  **corrected a factual error** in BENCH-01/DOD-01: this box is **`x86_64-apple-darwin`** (`uname -m`=x86_64 —
-  real Intel or Rosetta), **not** "Apple Silicon arm64 / ARMv8 / NEON" as previously written; numbers stay
-  DIRECTIONAL pending a re-confirm run; GATE-WARP still PENDING representative VAES HW (#13). **12 crates · 78
-  tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
+  **corrected a factual error** in BENCH-01/DOD-01: this box is **`x86_64-apple-darwin`**, **not** "Apple Silicon
+  arm64 / NEON" as previously written. *[FURTHER CORRECTED 2026-06-22: it is a **native Intel i7-9750H (Coffee
+  Lake, pre-VAES)** — I then briefly mislabeled it "Rosetta", also wrong; verified native via `sysctl`. See the
+  "hardware mislabel" entry below.]* numbers DIRECTIONAL; GATE-WARP PENDING representative VAES HW (#13).
+  **12 crates · 78 tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
 
 - 2026-06-22 — **P3 #25: `QuicSubstrate` — real cross-host QUIC (quinn) = AC-6 named substrate 2/3.** New
   quarantined crate `datarail-substrate-quic` (keeps the heavy quinn/tokio/rustls tree out of the std-only rail
@@ -254,10 +255,12 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   datarail-acceptance — the honest AC-8 upgrade: partition a **real TCP** connection mid-stream, reconnect on a
   fresh socket, re-drive the outbox; the effectively-once gate dedups redeliveries → **0-loss/0-dup** in order
   over a genuine kernel transport (the in-memory `ac8_resume.rs` only proved the cursor logic). (3) round-trip
-  **bench** (loopback ~1.2 µs/cofre vs TCP-loopback ~124 µs/cofre, DIRECTIONAL). **Honesty: a fresh `--release`
-  run is ~4–7× slower than BENCH-01's prior figures → this box is Rosetta-x86_64 (no VAES), the old numbers were
-  native arm64; `board` is now ~1.45 ms (>1 ms) so GATE-LATENCY is NOT a sub-ms pass here.** BENCH-01 + DOD-01
-  rewritten with the real numbers + the divergence. The FASP-beats-loss-based-TCP differentiator (real WAN, not
+  **bench** (loopback ~1.2 µs/cofre vs TCP-loopback ~124 µs/cofre, DIRECTIONAL). **Honesty: the fresh `--release`
+  numbers diverged from prior figures.** *[CORRECTED 2026-06-22 — see the later "hardware mislabel" entry: this
+  box is a **native Intel i7-9750H (Coffee Lake, pre-VAES)**, NOT Rosetta and NOT arm64; I twice mislabeled it by
+  inferring from noisy numbers instead of checking `sysctl`. The bench is noisy (2–3× run-to-run), so the
+  absolutes aren't trustworthy; `board` ~1.45–3.6 ms ⇒ GATE-LATENCY is not a sub-ms pass here.]* BENCH-01 + DOD-01
+  rewritten with honest numbers. The FASP-beats-loss-based-TCP differentiator (real WAN, not
   loopback) is #28; bao chunk-resume is #27. **13 crates · 84 tests** green · clippy deny(all+pedantic) ·
   forbid(unsafe) · no `#[allow]`.
 
