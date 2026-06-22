@@ -22,7 +22,7 @@ pub enum AeadAlg {
 /// The authenticated header (*etiqueta*): clear to the rail, but wholly covered by the seal.
 ///
 /// `INV-SEAL-COMPLETE` — every field here is signed by the `lacre`, so the rail can read but never forge.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Etiqueta {
     /// Fixed A→B route id.
     pub route_id: [u8; 16],
@@ -45,7 +45,7 @@ pub struct Etiqueta {
 }
 
 /// A sealed cofre on the wire: `etiqueta` (authenticated) + `carga` (opaque ciphertext) + `lacre` (Ed25519).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cofre {
     /// The authenticated, rail-readable header.
     pub etiqueta: Etiqueta,

@@ -222,6 +222,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-cofre"
+version = "0.0.0"
+dependencies = [
+ "datarail-core",
+ "datarail-crypto",
+]
+
+[[package]]
 name = "datarail-core"
 version = "0.0.0"
 
