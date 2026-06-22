@@ -95,3 +95,98 @@ fn two_process_tcp_transfer_delivers_to_a_separate_recv() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Mint a Noise static keypair via the real `datarail keygen --noise`, returning `(secret_hex, public_hex)`.
+fn keygen_noise() -> (String, String) {
+    let out = Command::new(BIN).arg("keygen").arg("--noise").output().expect("keygen --noise");
+    assert!(out.status.success(), "keygen failed: {}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut secret = None;
+    let mut public = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("noise_secret = \"") {
+            secret = rest.split('"').next().map(str::to_owned);
+        }
+        if let Some(rest) = line.strip_prefix("noise_public = \"") {
+            public = rest.split('"').next().map(str::to_owned);
+        }
+    }
+    (secret.expect("noise_secret"), public.expect("noise_public"))
+}
+
+#[test]
+fn two_process_noise_protected_transfer_delivers() {
+    let dir = std::env::temp_dir().join(format!("dr-2proc-noise-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let spec = write_spec(&dir);
+    let sink = dir.join("out.txt");
+
+    // Two stable endpoint identities, minted through the real CLI.
+    let (a_secret, a_public) = keygen_noise();
+    let (b_secret, b_public) = keygen_noise();
+
+    // Destination = Noise responder: holds B's secret, pins A's public.
+    let mut recv = Command::new(BIN)
+        .arg("recv")
+        .arg(&spec)
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--noise-secret")
+        .arg(&b_secret)
+        .arg("--peer-public")
+        .arg(&a_public)
+        .arg("--sink-file")
+        .arg(&sink)
+        .arg("--count")
+        .arg("1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn recv");
+
+    let stdout = recv.stdout.take().expect("recv stdout");
+    let mut reader = BufReader::new(stdout);
+    let addr = loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read recv stdout");
+        assert!(n > 0, "recv closed stdout before announcing its address");
+        if let Some(rest) = line.strip_prefix("DATARAIL-LISTENING ") {
+            break rest.trim().to_owned();
+        }
+    };
+
+    // Source = Noise initiator: holds A's secret, pins B's public. Separate OS process.
+    let send = Command::new(BIN)
+        .arg("send")
+        .arg(&spec)
+        .arg("--connect")
+        .arg(&addr)
+        .arg("--noise-secret")
+        .arg(&a_secret)
+        .arg("--peer-public")
+        .arg(&b_public)
+        .arg("evt:noise-1")
+        .arg("evt:noise-2")
+        .output()
+        .expect("run send");
+    assert!(
+        send.status.success(),
+        "send failed: {}",
+        String::from_utf8_lossy(&send.stderr)
+    );
+    // The source reports the hop was the Noise channel, not bare TCP.
+    assert!(
+        String::from_utf8_lossy(&send.stdout).contains("over noise"),
+        "send did not report a noise hop: {}",
+        String::from_utf8_lossy(&send.stdout)
+    );
+
+    let status = recv.wait().expect("wait recv");
+    assert!(status.success(), "recv exited non-zero");
+
+    // Records crossed the Noise_KK-protected channel between two processes, intact.
+    let out = std::fs::read_to_string(&sink).expect("read sink");
+    assert!(out.contains("evt:noise-1"), "sink missing record 1: {out:?}");
+    assert!(out.contains("evt:noise-2"), "sink missing record 2: {out:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

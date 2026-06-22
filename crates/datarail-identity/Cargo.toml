@@ -9,6 +9,9 @@ description = "datarail-identity — Noise_KK channel session (SPEC-08 F2) + SPA
 workspace = true
 
 [dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-cofre = { path = "../datarail-cofre" }
+datarail-crypto = { path = "../datarail-crypto" }
 snow = "0.9"
 spake2 = "0.4"
 # Key-confirmation MAC for the PAKE bootstrap. Bare SPAKE2 derives a key but performs NO key confirmation:

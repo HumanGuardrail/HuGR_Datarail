@@ -49,6 +49,11 @@ cargo run -p datarail-cli -- pair                                 # F2/F3 identi
 # genuine TWO-PROCESS transfer over a real TCP socket (run in two terminals / hosts):
 datarail recv examples/rail.toml --listen 127.0.0.1:9000 --sink-file /tmp/out.txt --count 1   # destination
 datarail send examples/rail.toml --connect 127.0.0.1:9000 evt:hello evt:world                 # source
+
+# ...and optionally wrap that hop in a Noise_KK channel (mutual auth + on-wire metadata encryption, F2):
+datarail keygen --noise                                                # mint each endpoint's static keypair
+datarail recv examples/rail.toml --noise-secret 0x<B-sec> --peer-public 0x<A-pub> --sink-file /tmp/out.txt
+datarail send examples/rail.toml --connect <addr> --noise-secret 0x<A-sec> --peer-public 0x<B-pub> evt:hi
 ```
 
 A route is one declarative `rail.toml` (source + onboarding rules + destination + offloading rules +

@@ -465,6 +465,23 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   real engines). (Remaining v2-class: Noise-protected substrate hop wiring + cross-process PAKE — primitives
   built; the live two-process transport now exists to carry them.)
 
+- 2026-06-22 — **#37 Noise-protected substrate hop WIRED — F2 is now product-integrated (no longer just a
+  primitive).** `NoiseSubstrate` (datarail-identity): runs the `Noise_KK` handshake on a TCP connection at
+  construction, then tunnels each already-sealed cofre through the forward-secret transport (`u32`-framed,
+  bounded recv, one cofre per Noise message). `StaticKeypair::from_secret`/`secret()` give endpoints a **stable**
+  identity (public derived via `datarail_crypto::x25519_public` — proven snow-compatible by
+  `from_secret_keypairs_complete_a_handshake`). CLI: `keygen --noise` mints a static keypair; `send`/`recv
+  --noise-secret <hex> --peer-public <hex>` wrap the hop in Noise via a `build_hop` → `Box<dyn Substrate>`
+  (plain TCP when the flags are absent). **What it buys (beyond the seal):** mutual endpoint auth at the
+  transport (impostor static ⇒ handshake fails) **+ on-wire encryption of the cleartext etiqueta** —
+  `signer_key_id`/`contract_fp`/`idempotency_key`, the SPEC-03 metadata residual, are now hidden from a network
+  observer. Proven by `tests/two_process.rs::two_process_noise_protected_transfer_delivers` (two OS processes,
+  keypairs minted via the real `keygen --noise`) + a live demo (records crossed the Noise channel, `recv`
+  reports `over noise`). The cofre stays sealed end-to-end regardless (`INV-OPAQUE-CARGO`). **16 crates · 139
+  tests** green · clippy deny(all+pedantic) · forbid(unsafe) (one shmem waiver). Still open: only the two
+  external physical resources (#13 VAES HW, #20 real engines); remaining v2-class is now just *remote* PAKE
+  pairing across two hosts (primitives + the encrypted transport both exist).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

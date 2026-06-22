@@ -353,6 +353,9 @@ dependencies = [
 name = "datarail-identity"
 version = "0.0.0"
 dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-crypto",
  "sha2",
  "snow",
  "spake2",

@@ -18,12 +18,14 @@
 #![forbid(unsafe_code)]
 
 use std::io::Read;
+use std::net::TcpStream;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use datarail_connectors::{LineFileSink, LineFileSource, Sink, SliceSource, Source, VecSink};
 use datarail_core::{Cofre, Disposition, Substrate};
 use datarail_crypto::{ctx, sign_domain, verifying_key};
+use datarail_identity::{NoiseSubstrate, StaticKeypair};
 use datarail_rail::{LoopbackSubstrate, TcpSubstrate};
 use datarail_spec::{RailSpec, SpecError};
 use datarail_terminal::{DestTerminal, SourceTerminal, TerminalError};
@@ -41,6 +43,10 @@ USAGE:
     datarail pair                                     (local F2/F3 identity rehearsal — see note)
     datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]   (cross-process dest)
     datarail send <rail.toml> --connect ADDR [--source-file F | record ...] (cross-process source)
+
+    keygen --noise   mint a Noise_KK static keypair (X25519) for the encrypted hop.
+    send/recv --noise-secret <hex> --peer-public <hex>   wrap the TCP hop in a Noise_KK channel (F2):
+                     mutual-static auth + on-wire encryption of the etiqueta metadata. Both flags or neither.
 
     --watch        on `run`: print a live one-line speedometer per batch (no TUI; raw stdout).
     replay reads from the configured source (--source-file > inline args > stdin) and re-ships only the
@@ -66,7 +72,7 @@ fn dispatch(args: &[String]) -> Result<String, CliError> {
     let (cmd, rest) = args.split_first().ok_or(CliError::Usage)?;
     match cmd.as_str() {
         "validate" => cmd_validate(rest),
-        "keygen" => cmd_keygen(),
+        "keygen" => cmd_keygen(rest),
         "run" => cmd_run(rest),
         "replay" => cmd_replay(rest),
         "verify" => cmd_verify(rest),
@@ -176,7 +182,17 @@ fn cmd_validate(rest: &[String]) -> Result<String, CliError> {
     ))
 }
 
-fn cmd_keygen() -> Result<String, CliError> {
+fn cmd_keygen(rest: &[String]) -> Result<String, CliError> {
+    // `--noise` mints a Noise_KK static keypair (the SPEC-08 X25519 KEM key) for the encrypted-hop send/recv;
+    // otherwise the Ed25519 signing identity.
+    if rest.iter().any(|a| a == "--noise") {
+        let kp = StaticKeypair::generate().map_err(|e| CliError::Identity(e.to_string()))?;
+        return Ok(format!(
+            "noise_secret = \"0x{}\"   # keep secret; pass to your endpoint as --noise-secret\nnoise_public = \"0x{}\"   # share; the peer pins it as --peer-public\n",
+            to_hex(&kp.secret()),
+            to_hex(&kp.public()),
+        ));
+    }
     let seed = random_seed()?;
     let vk = verifying_key(&seed);
     Ok(format!(
@@ -721,9 +737,12 @@ fn take_flag(rest: &[String], flag: &str) -> (Option<String>, Vec<String>) {
 fn cmd_send(rest: &[String]) -> Result<String, CliError> {
     let spec = load_spec(require(rest, 0, "rail.toml")?)?;
     let body: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
-    let (connect, rest_after_connect) = take_flag(&body, "--connect");
+    let (connect, r1) = take_flag(&body, "--connect");
     let addr = connect.ok_or(CliError::MissingArg("--connect ADDR"))?;
-    let (source_file, positionals) = take_flag(&rest_after_connect, "--source-file");
+    let (noise_secret, r2) = take_flag(&r1, "--noise-secret");
+    let (peer_public, r3) = take_flag(&r2, "--peer-public");
+    let (source_file, positionals) = take_flag(&r3, "--source-file");
+    let noise = parse_noise(noise_secret, peer_public)?;
 
     let records: Vec<Vec<u8>> = if let Some(path) = source_file {
         let raw = std::fs::read(&path).map_err(|e| CliError::Io(format!("{path}: {e}")))?;
@@ -739,24 +758,70 @@ fn cmd_send(rest: &[String]) -> Result<String, CliError> {
     let refs: Vec<&[u8]> = records.iter().map(Vec::as_slice).collect();
     let cofre = src.board(&refs, b"datarail-send").map_err(CliError::Terminal)?;
 
-    // Connect with a short retry window so `send` can be launched ~concurrently with `recv`.
-    let mut rail = connect_with_retry(&addr)?;
+    // Connect with a short retry window so `send` can be launched ~concurrently with `recv`; then build the hop
+    // (a Noise_KK-protected channel when --noise-secret/--peer-public are given, else plain TCP).
+    let stream = connect_with_retry(&addr)?;
+    let hop = if noise.is_some() { "noise" } else { "tcp" };
+    let mut rail = build_hop(stream, noise, true)?;
     rail.send(&cofre).map_err(|e| CliError::Rail(e.to_string()))?;
     // Hold the connection briefly so the kernel flushes the framed cofre before the socket closes.
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     Ok(format!(
-        "sent {} record(s) in 1 sealed cofre to {addr} over tcp\n  cofre_id = 0x{}\n",
+        "sent {} record(s) in 1 sealed cofre to {addr} over {hop}\n  cofre_id = 0x{}\n",
         records.len(),
         to_hex(&cofre.etiqueta.cofre_id),
     ))
 }
 
-/// Connect a [`TcpSubstrate`] to `addr`, retrying briefly (the peer `recv` may still be binding).
-fn connect_with_retry(addr: &str) -> Result<TcpSubstrate, CliError> {
+/// Parse the optional `--noise-secret`/`--peer-public` pair into a local static keypair + the pinned peer
+/// public. Both flags must be present together (a Noise hop needs both), or neither (plain TCP).
+fn parse_noise(
+    secret: Option<String>,
+    peer: Option<String>,
+) -> Result<Option<(StaticKeypair, [u8; 32])>, CliError> {
+    match (secret, peer) {
+        (None, None) => Ok(None),
+        (Some(s), Some(p)) => {
+            let sk: [u8; 32] = from_hex(&s).and_then(|v| v.try_into().ok()).ok_or(CliError::BadHex)?;
+            let pk: [u8; 32] = from_hex(&p).and_then(|v| v.try_into().ok()).ok_or(CliError::BadHex)?;
+            Ok(Some((StaticKeypair::from_secret(sk), pk)))
+        }
+        _ => Err(CliError::Rail(
+            "--noise-secret and --peer-public must be given together".to_owned(),
+        )),
+    }
+}
+
+/// Build the transport hop over `stream`: a `Noise_KK`-protected channel when `noise` is `Some`, else plain
+/// TCP. `initiator` picks the handshake role (send = initiator, recv = responder). Boxed behind the
+/// [`Substrate`] trait so the caller drives either uniformly.
+fn build_hop(
+    stream: TcpStream,
+    noise: Option<(StaticKeypair, [u8; 32])>,
+    initiator: bool,
+) -> Result<Box<dyn Substrate<Error = std::io::Error>>, CliError> {
+    match noise {
+        Some((local, peer)) => {
+            let sub = if initiator {
+                NoiseSubstrate::initiator(stream, &local, peer)
+            } else {
+                NoiseSubstrate::responder(stream, &local, peer)
+            };
+            Ok(Box::new(sub.map_err(|e| CliError::Rail(e.to_string()))?))
+        }
+        None => Ok(Box::new(
+            TcpSubstrate::from_stream(stream).map_err(|e| CliError::Rail(e.to_string()))?,
+        )),
+    }
+}
+
+/// Connect to `addr`, retrying briefly (the peer `recv` may still be binding). Returns the raw stream so the
+/// caller can wrap it in the chosen hop.
+fn connect_with_retry(addr: &str) -> Result<TcpStream, CliError> {
     let mut last = String::new();
     for _ in 0..50 {
-        match TcpSubstrate::connect(addr) {
+        match TcpStream::connect(addr) {
             Ok(s) => return Ok(s),
             Err(e) => {
                 last = e.to_string();
@@ -780,8 +845,11 @@ fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
     let body: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
     let (listen, r1) = take_flag(&body, "--listen");
     let listen = listen.unwrap_or_else(|| "127.0.0.1:0".to_owned());
-    let (sink_file, r2) = take_flag(&r1, "--sink-file");
-    let (count, _r3) = take_flag(&r2, "--count");
+    let (noise_secret, r2) = take_flag(&r1, "--noise-secret");
+    let (peer_public, r3) = take_flag(&r2, "--peer-public");
+    let (sink_file, r4) = take_flag(&r3, "--sink-file");
+    let (count, _r5) = take_flag(&r4, "--count");
+    let noise = parse_noise(noise_secret, peer_public)?;
     let count: usize = match count {
         Some(c) => c.parse().map_err(|_| CliError::BadRange(c.clone()))?,
         None => 1,
@@ -822,7 +890,8 @@ fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
             Err(e) => return Err(CliError::Rail(e.to_string())),
         }
     };
-    let mut rail = TcpSubstrate::from_stream(stream).map_err(|e| CliError::Rail(e.to_string()))?;
+    let hop = if noise.is_some() { "noise" } else { "tcp" };
+    let mut rail = build_hop(stream, noise, false)?;
 
     let mut committed_to_sink = 0usize;
     let mut received = 0usize;
@@ -849,7 +918,7 @@ fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
     }
 
     Ok(format!(
-        "recv on {bound} over tcp\n  received    = {received} cofre(s)\n  committed   = {}\n  dead-letter = {}\n",
+        "recv on {bound} over {hop}\n  received    = {received} cofre(s)\n  committed   = {}\n  dead-letter = {}\n",
         dst.sink().len(),
         dst.dead_letters().len(),
     ))

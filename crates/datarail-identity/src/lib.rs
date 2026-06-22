@@ -24,7 +24,9 @@
 #![forbid(unsafe_code)]
 
 pub mod noise;
+pub mod noise_substrate;
 pub mod pairing;
 
 pub use noise::{KkSession, NoiseError, StaticKeypair, Transport};
+pub use noise_substrate::NoiseSubstrate;
 pub use pairing::{Pairing, PairingError, PairingOutcome, ShortCode};

@@ -128,6 +128,29 @@ impl StaticKeypair {
         })
     }
 
+    /// Reconstruct a static keypair from a persisted 32-byte X25519 **secret** — so an endpoint keeps a
+    /// **stable** identity across runs (a peer pins the matching [`public`](Self::public)). The public is
+    /// derived with standard X25519 ([`datarail_crypto::x25519_public`]), which agrees with what `snow` derives
+    /// for the same secret during the handshake (proven by `from_secret_keypairs_complete_a_handshake`).
+    #[must_use]
+    pub fn from_secret(secret: [u8; STATIC_PUBLIC_LEN]) -> Self {
+        let public = datarail_crypto::x25519_public(&secret);
+        Self {
+            private: secret.to_vec(),
+            public,
+        }
+    }
+
+    /// This endpoint's static **secret** key (32 bytes) — persist it to keep a stable identity; treat as
+    /// secret. (`StaticKeypair` has no `Debug`, so it cannot be printed accidentally.)
+    #[must_use]
+    pub fn secret(&self) -> [u8; STATIC_PUBLIC_LEN] {
+        let mut s = [0u8; STATIC_PUBLIC_LEN];
+        let n = self.private.len().min(STATIC_PUBLIC_LEN);
+        s[..n].copy_from_slice(&self.private[..n]);
+        s
+    }
+
     /// This endpoint's static **public** key — the value a peer must pin to authenticate this endpoint.
     #[must_use]
     pub fn public(&self) -> [u8; STATIC_PUBLIC_LEN] {
@@ -332,6 +355,19 @@ mod tests {
         assert!(responder.is_handshake_finished());
 
         Ok((initiator.into_transport()?, responder.into_transport()?))
+    }
+
+    // from_secret derives the SAME public snow uses for that secret: two stable keypairs handshake + a
+    // message round-trips. This proves datarail_crypto's X25519 public derivation is snow-compatible.
+    #[test]
+    fn from_secret_keypairs_complete_a_handshake() {
+        let a = StaticKeypair::from_secret([0x11; 32]);
+        let b = StaticKeypair::from_secret([0x22; 32]);
+        assert_eq!(a.secret(), [0x11; 32], "secret round-trips");
+        let (mut at, mut bt) =
+            complete_handshake(&a, b.public(), &b, a.public()).expect("from_secret handshake");
+        let ct = at.encrypt(b"stable-identity").unwrap();
+        assert_eq!(bt.decrypt(&ct).unwrap(), b"stable-identity");
     }
 
     // Test (1): a correct KK handshake completes and a message round-trips equal.
