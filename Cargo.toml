@@ -15,6 +15,7 @@ members = [
     "crates/datarail-connectors",
     "crates/datarail-spec",
     "crates/datarail-cli",
+    "crates/datarail-identity",
     "crates/datarail-acceptance",
     "crates/datarail-bench",
 ]

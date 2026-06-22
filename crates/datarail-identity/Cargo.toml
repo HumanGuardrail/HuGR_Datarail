@@ -1,0 +1,19 @@
+[package]
+name = "datarail-identity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-identity — Noise_KK channel session (SPEC-08 F2) + SPAKE2 short-code pairing bootstrap (F3)."
+
+[lints]
+workspace = true
+
+[dependencies]
+snow = "0.9"
+spake2 = "0.4"
+# Key-confirmation MAC for the PAKE bootstrap. Bare SPAKE2 derives a key but performs NO key confirmation:
+# a wrong code / mismatched bound identity yields a *different* key, never an error. The MAJ-5 hardenings
+# (detectable failure -> attempt-cap -> burn) therefore require an explicit confirmation exchange, which we
+# build from a domain-separated SHA-256 over the transcript + shared key. (sha2 is already in the tree.)
+sha2 = "0.10"
+subtle = "2"
