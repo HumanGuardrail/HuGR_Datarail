@@ -145,6 +145,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   network substrate beyond loopback), AC-10 fairness benchmark, final 6-lens audit over the CODE. Standing
   PENDING/STOP-THE-LINE unchanged (X25519 key-wrap, GATE-WARP on VAES HW, AC-10 engines, trio §6 ratification).
 
+- 2026-06-22 — **P5 SURFACE COMPLETE: datarail-spec (`4214837`) + datarail-cli (`a22e3ec`).** spec: a
+  **zero-dep** (Charter *leveza*) minimal-TOML-subset `rail.toml` parser → typed `RouteSpec/ContractSpec/
+  KeysSpec` + builders, validate-on-parse, 11 tests. cli: the **`datarail` binary** — `validate / keygen / run
+  / verify / ticket`, hand-rolled arg dispatch (no clap), `/dev/urandom` keygen (no rand), 5 tests. **Live e2e
+  demo (`examples/rail.toml`): `run` boards 2 records → rail → offloads `Delivered` (committed=2); `verify`
+  accepts the good cofre ✓ and rejects a tampered one (exit nonzero).** Full workspace: **10 crates, 64 tests
+  green, clippy deny(all+pedantic) clean, no `#[allow]`, `forbid(unsafe)`.** The product is usable end-to-end:
+  a config + a binary that moves data exactly-once, provably, tamper-rejected. **NEXT: P6** — close the X25519
+  per-cofre key-wrap (the main v1 simplification), GATE-FEATHER/GATE-LATENCY micro-bench (criterion; honest HW
+  labels), AC-8 (WAN/resume — needs a network substrate; likely PENDING), AC-10 fairness (PENDING engines),
+  final 6-lens audit over the CODE + DoD. Standing PENDING/STOP-THE-LINE unchanged (GATE-WARP VAES HW, AC-10
+  engines, trio §6 ratification).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
