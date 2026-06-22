@@ -12,6 +12,7 @@ members = [
     "crates/datarail-spec",
     "crates/datarail-cli",
     "crates/datarail-acceptance",
+    "crates/datarail-bench",
 ]
 
 [workspace.package]

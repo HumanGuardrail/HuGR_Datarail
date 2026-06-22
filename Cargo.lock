@@ -234,6 +234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-bench"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-crypto",
+ "datarail-terminal",
+]
+
+[[package]]
 name = "datarail-cli"
 version = "0.0.0"
 dependencies = [
