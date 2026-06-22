@@ -207,6 +207,7 @@ fn run_pipe(spec: &RailSpec, records: &[Vec<u8>], record_key: &[u8]) -> Result<S
         spec.offloading_contract(),
         source_vk,
         spec.keys.dest_seed,
+        spec.keys.dest_x25519_secret,
     );
     let mut rail = LoopbackSubstrate::new();
 
@@ -284,7 +285,7 @@ mod tests {
              [keys]\n\
              source_seed = \"{K32}\"\n\
              dest_seed = \"{K32}\"\n\
-             route_data_key = \"{K32}\"\n\
+             dest_x25519_secret = \"{K32}\"\n\
              tenant_secret = \"{K32}\"\n"
         )
     }

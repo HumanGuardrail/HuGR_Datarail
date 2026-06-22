@@ -5,7 +5,7 @@
 //! This is the end-to-end proof that the whole pipe moves data — exactly once, tamper-rejected, provable.
 
 use datarail_core::{AeadAlg, Disposition, Substrate};
-use datarail_crypto::verifying_key;
+use datarail_crypto::{verifying_key, x25519_public};
 use datarail_manifest::{sign_ack, verify_delivery, DeliveryProof, ManifestLog};
 use datarail_rail::LoopbackSubstrate;
 use datarail_terminal::{ContentContract, DestTerminal, SourceTerminal, TerminalConfig};
@@ -14,7 +14,7 @@ const SOURCE_SEED: [u8; 32] = [11; 32];
 const DEST_SEED: [u8; 32] = [22; 32];
 const ROUTE: [u8; 16] = [1; 16];
 const STREAM: [u8; 16] = [2; 16];
-const DATA_KEY: [u8; 32] = [5; 32];
+const DEST_X_SECRET: [u8; 32] = [5; 32];
 const TENANT: [u8; 32] = [6; 32];
 const EPOCH: u64 = 1;
 const TS: u64 = 1_700_000_000;
@@ -24,7 +24,7 @@ fn config() -> TerminalConfig {
         route_id: ROUTE,
         stream_id: STREAM,
         aead_alg: AeadAlg::Gcmsiv256,
-        route_data_key: DATA_KEY,
+        dest_x25519_pk: x25519_public(&DEST_X_SECRET),
         tenant_secret: TENANT,
     }
 }
@@ -39,7 +39,7 @@ fn mf4_board_rail_offload_exactly_once_and_dead_letter() {
     let source_vk = verifying_key(&SOURCE_SEED);
     let dest_vk = verifying_key(&DEST_SEED);
     let mut source = SourceTerminal::new(config(), contract(), SOURCE_SEED);
-    let mut dest = DestTerminal::new(config(), contract(), source_vk, DEST_SEED);
+    let mut dest = DestTerminal::new(config(), contract(), source_vk, DEST_SEED, DEST_X_SECRET);
     let mut rail = LoopbackSubstrate::new();
 
     // ---- Board a conforming batch → sealed cofre. ----

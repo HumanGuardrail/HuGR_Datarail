@@ -12,7 +12,7 @@ use datarail_crypto::{blake3_256, ctx, sign_domain, verify_domain, verifying_key
 const MAGIC: [u8; 4] = *b"DRLC";
 const VERSION: u8 = 1;
 /// Canonical encoded size of an `Etiqueta` (v1 — all fixed-width fields).
-const ETIQUETA_LEN: usize = 16 + 16 + 8 + 32 + 32 + 32 + 1 + 12 + 32;
+const ETIQUETA_LEN: usize = 16 + 16 + 8 + 32 + 32 + 32 + 1 + 12 + 32 + 32;
 const LACRE_LEN: usize = 64;
 
 const fn aead_to_u8(a: AeadAlg) -> u8 {
@@ -117,6 +117,7 @@ fn encode_etiqueta(e: &Etiqueta) -> Vec<u8> {
     v.push(aead_to_u8(e.aead_alg));
     v.extend_from_slice(&e.nonce);
     v.extend_from_slice(&e.signer_key_id);
+    v.extend_from_slice(&e.eph_pk);
     v
 }
 
@@ -131,6 +132,7 @@ fn parse_etiqueta(bytes: &[u8]) -> Result<Etiqueta, CofreError> {
     let aead_alg = aead_from_u8(r.take(1)?[0]).ok_or(CofreError::BadAead)?;
     let nonce = r.take_arr()?;
     let signer_key_id = r.take_arr()?;
+    let eph_pk = r.take_arr()?;
     Ok(Etiqueta {
         route_id,
         stream_id,
@@ -141,12 +143,13 @@ fn parse_etiqueta(bytes: &[u8]) -> Result<Etiqueta, CofreError> {
         aead_alg,
         nonce,
         signer_key_id,
+        eph_pk,
     })
 }
 
 fn signed_region(e: &Etiqueta, carga: &[u8]) -> Vec<u8> {
     let et = encode_etiqueta(e);
-    let et_len = u32::try_from(et.len()).expect("etiqueta is a fixed 181 bytes");
+    let et_len = u32::try_from(et.len()).expect("etiqueta is a fixed-width header");
     let carga_len = u64::try_from(carga.len()).expect("carga length fits u64");
     let mut v = Vec::with_capacity(4 + 1 + 4 + et.len() + 8 + carga.len());
     v.extend_from_slice(&MAGIC);
@@ -253,6 +256,7 @@ mod tests {
             aead_alg: AeadAlg::Gcmsiv256,
             nonce: [6; 12],
             signer_key_id: [0; 32],
+            eph_pk: [8; 32],
         }
     }
 

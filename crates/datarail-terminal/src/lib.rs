@@ -15,12 +15,12 @@
 //!   take the [`datarail_once`] admission decision and commit exactly once to the sink. Any seal/contract
 //!   failure is routed to a reason-coded **dead-letter** siding (AC-9 offload side), never delivered.
 //!
-//! ## v1 simplifications (flagged for the lead; all are documented P-later items)
+//! ## Key-wrap & v1 notes
 //!
-//! - **Shared route data key.** The SPEC (A5 / `03`) calls for a *fresh per-cofre data key* wrapped to the
-//!   destination via X25519. v1 uses a single **shared symmetric** [`route_data_key`](TerminalConfig) held by
-//!   both terminals. The per-cofre fresh key + X25519 wrap is a **P-later** — it needs an X25519 primitive
-//!   added to `datarail-crypto` (a post-freeze, additive change), so it is out of scope for transcription.
+//! - **Per-cofre X25519 key-wrap (SPEC A5 / `03`).** `board` generates a fresh ephemeral X25519 key and seals
+//!   a fresh per-cofre data key to the route's destination public key ([`datarail_crypto::seal_key`]); the
+//!   `eph_pk` rides in the etiqueta and only the holder of the destination secret re-derives the key
+//!   ([`datarail_crypto::open_key`]). Forward-secure (the ephemeral is discarded) and provider-blind.
 //! - **`aad = &[]`.** The SPEC names `aad = etiqueta` for the AEAD. v1 passes an **empty AAD**: the outer
 //!   Ed25519 `lacre` already binds `etiqueta ⊗ carga` (`INV-SEAL-COMPLETE`), so integrity of the header is
 //!   not lost. Binding `aad = etiqueta` is a **hardening TODO** with a real ordering cycle to resolve first:
@@ -31,7 +31,7 @@
 
 use datarail_core::{AeadAlg, Cofre, Disposition, Etiqueta};
 use datarail_cofre::CofreError;
-use datarail_crypto::{aead_open, aead_seal, blake3_256, hmac_blake3, AeadError};
+use datarail_crypto::{aead_open, aead_seal, blake3_256, hmac_blake3, open_key, seal_key, AeadError};
 use datarail_once::Once;
 
 /// The AEAD associated data used in v1: **empty**.
@@ -40,6 +40,16 @@ use datarail_once::Once;
 /// not weaken integrity. Binding `aad = etiqueta` is a documented hardening TODO (it has a `cofre_id` ordering
 /// cycle, since `cofre_id = BLAKE3(carga)` is only set inside [`datarail_cofre::seal`]).
 pub const AAD_V1: &[u8] = &[];
+
+/// Read 32 bytes of OS entropy for a fresh per-cofre ephemeral key. Zero-dep (`/dev/urandom`); the source
+/// terminal calls this once per [`SourceTerminal::board`].
+fn random_32() -> Result<[u8; 32], TerminalError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open("/dev/urandom").map_err(|_| TerminalError::Entropy)?;
+    let mut buf = [0u8; 32];
+    file.read_exact(&mut buf).map_err(|_| TerminalError::Entropy)?;
+    Ok(buf)
+}
 
 // ----------------------------------------------------------------------------------------------------------
 // Content contract — a real, simple stand-in for schema / required-fields (D4: declarative policy).
@@ -160,6 +170,8 @@ pub enum TerminalError {
     BatchTooLarge,
     /// A decoded `RECORD_BATCH` was internally inconsistent (truncated / trailing bytes).
     MalformedBatch,
+    /// OS entropy for the per-cofre ephemeral key could not be read.
+    Entropy,
 }
 
 impl core::fmt::Display for TerminalError {
@@ -169,6 +181,7 @@ impl core::fmt::Display for TerminalError {
             Self::Seal => "AEAD seal failed",
             Self::BatchTooLarge => "record batch exceeds framing limits",
             Self::MalformedBatch => "record batch is malformed",
+            Self::Entropy => "could not read OS entropy for the per-cofre key",
         };
         f.write_str(s)
     }
@@ -192,6 +205,8 @@ impl From<AeadError> for TerminalError {
 pub enum DeadLetterReason {
     /// The seal failed parse-before-verify against the pinned source key (`INV-TAMPER-REJECT`, AC-2/3).
     SealFailed(CofreError),
+    /// The cofre is addressed to a different route/stream than this terminal serves.
+    RouteMismatch,
     /// The cofre's `contract_fp` did not match the destination's expected schema (AC-9 — managed drift).
     ContractFingerprintMismatch,
     /// The AEAD-open failed (tamper / wrong key / nonce), so the payload could not be read.
@@ -206,6 +221,7 @@ impl core::fmt::Display for DeadLetterReason {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::SealFailed(e) => write!(f, "seal verification failed: {e}"),
+            Self::RouteMismatch => f.write_str("cofre addressed to a different route/stream"),
             Self::ContractFingerprintMismatch => f.write_str("contract fingerprint mismatch (schema drift)"),
             Self::OpenFailed => f.write_str("AEAD open failed (tamper/wrong key)"),
             Self::MalformedBatch => f.write_str("decrypted record batch is malformed"),
@@ -303,10 +319,8 @@ impl Sink {
 
 /// The static, shared parameters for one A→B route, held by **both** terminals.
 ///
-/// `route_data_key` is the **v1 simplification** (see the crate docs): a single shared symmetric AEAD key
-/// instead of a fresh per-cofre key wrapped over X25519. Bundling the route parameters in one struct (rather
-/// than passing five loose `[u8; _]` arguments) keeps the terminal constructors within the Craft Charter
-/// without an `#[allow]`.
+/// Bundling the route parameters in one struct (rather than passing loose `[u8; _]` arguments) keeps the
+/// terminal constructors within the Craft Charter without an `#[allow]`.
 #[derive(Debug, Clone)]
 pub struct TerminalConfig {
     /// Fixed A→B route id (copied into every etiqueta).
@@ -315,8 +329,9 @@ pub struct TerminalConfig {
     pub stream_id: [u8; 16],
     /// AEAD algorithm for the carga (default [`AeadAlg::Gcmsiv256`]).
     pub aead_alg: AeadAlg,
-    /// **v1 shared symmetric data key** for the route's AEAD (P-later: per-cofre fresh key + X25519 wrap).
-    pub route_data_key: [u8; 32],
+    /// The route **destination's X25519 public key**. `board` seals a fresh per-cofre data key to it; only the
+    /// destination terminal (holding the matching secret) can open it — provider-blind and forward-secure.
+    pub dest_x25519_pk: [u8; 32],
     /// Per-tenant secret keying the idempotency MAC `HMAC(tenant_secret, record_key)`.
     pub tenant_secret: [u8; 32],
 }
@@ -363,7 +378,7 @@ impl SourceTerminal {
     ///
     /// Steps: validate **every** record against the onboarding contract (any failure ⇒
     /// [`TerminalError::ContractViolation`], and the batch never boards — AC-9); frame the records into a
-    /// `RECORD_BATCH`; AEAD-seal the batch under the shared route data key with a per-cofre random nonce;
+    /// `RECORD_BATCH`; seal a fresh per-cofre data key to the dest's X25519 key, then AEAD-seal the batch;
     /// stamp the etiqueta (including `idempotency_key = HMAC(tenant_secret, record_key)` and the contract
     /// fingerprint); [`datarail_cofre::seal`] it under the source seed; bump `seq`; return the cofre.
     ///
@@ -383,17 +398,16 @@ impl SourceTerminal {
         // (3) Idempotency key: HMAC(tenant_secret, record_key) — the sole effectively-once dedup key.
         let idempotency_key = hmac_blake3(&self.config.tenant_secret, record_key);
 
-        // (4) AEAD-seal under the v1 shared route data key with a per-cofre random nonce. aad = &[] (v1).
-        let nonce = self.next_nonce();
-        let carga = aead_seal(
-            self.config.aead_alg,
-            &self.config.route_data_key,
-            &nonce,
-            AAD_V1,
-            &batch,
-        )?;
+        // (4) Per-cofre key-wrap (SPEC A5/03): a fresh ephemeral X25519 key seals a fresh data key to the
+        // route's destination public key — only the dest can re-derive it (provider-blind, forward-secure).
+        let eph_secret = random_32()?;
+        let (eph_pk, data_key) = seal_key(&self.config.dest_x25519_pk, &eph_secret);
 
-        // (5) Build the etiqueta; cofre_id/signer_key_id are stamped by `seal`.
+        // (5) AEAD-seal the batch under the per-cofre data key with a per-cofre nonce. aad = &[] (v1).
+        let nonce = self.next_nonce();
+        let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, AAD_V1, &batch)?;
+
+        // (6) Build the etiqueta; cofre_id/signer_key_id are stamped by `seal`.
         let etiqueta = Etiqueta {
             route_id: self.config.route_id,
             stream_id: self.config.stream_id,
@@ -404,6 +418,7 @@ impl SourceTerminal {
             aead_alg: self.config.aead_alg,
             nonce,
             signer_key_id: [0u8; 32],
+            eph_pk,
         };
 
         // (6) Seal (Ed25519 over etiqueta ⊗ carga) and advance the per-stream sequence.
@@ -437,6 +452,8 @@ pub struct DestTerminal {
     contract: ContentContract,
     /// The route-pinned source Ed25519 verifying key (BLK-4).
     pinned_source_vk: [u8; 32],
+    /// This destination's X25519 secret — unwraps the per-cofre data key from the cofre's `eph_pk`.
+    dest_x25519_secret: [u8; 32],
     once: Once,
     sink: Sink,
     dead_letters: DeadLetterSiding,
@@ -451,11 +468,13 @@ impl DestTerminal {
         contract: ContentContract,
         pinned_source_vk: [u8; 32],
         dest_seed: [u8; 32],
+        dest_x25519_secret: [u8; 32],
     ) -> Self {
         Self {
             config,
             contract,
             pinned_source_vk,
+            dest_x25519_secret,
             once: Once::new(dest_seed),
             sink: Sink::new(),
             dead_letters: DeadLetterSiding::new(),
@@ -496,17 +515,28 @@ impl DestTerminal {
             return Ok(Disposition::DeadLettered);
         }
 
-        // (2) Schema check: the cofre's claimed contract_fp must match this destination's expected contract.
+        // (2) Route binding: the cofre must be addressed to THIS terminal's route + stream.
+        if cofre.etiqueta.route_id != self.config.route_id
+            || cofre.etiqueta.stream_id != self.config.stream_id
+        {
+            self.dead_letters
+                .push(cofre.clone(), DeadLetterReason::RouteMismatch);
+            return Ok(Disposition::DeadLettered);
+        }
+
+        // (3) Schema check: the cofre's claimed contract_fp must match this destination's expected contract.
         if cofre.etiqueta.contract_fp != self.contract.fingerprint {
             self.dead_letters
                 .push(cofre.clone(), DeadLetterReason::ContractFingerprintMismatch);
             return Ok(Disposition::DeadLettered);
         }
 
-        // (3) AEAD-open under the v1 shared route data key (aad = &[]); a tamper/wrong-key failure dead-letters.
+        // (3) Re-derive the per-cofre data key from the authenticated eph_pk, then AEAD-open (aad = &[]); a
+        // tamper / wrong-key failure dead-letters.
+        let data_key = open_key(&self.dest_x25519_secret, &cofre.etiqueta.eph_pk);
         let Ok(batch) = aead_open(
             cofre.etiqueta.aead_alg,
-            &self.config.route_data_key,
+            &data_key,
             &cofre.etiqueta.nonce,
             AAD_V1,
             &cofre.carga,

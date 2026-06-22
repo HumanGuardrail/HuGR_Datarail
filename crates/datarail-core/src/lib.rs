@@ -42,6 +42,10 @@ pub struct Etiqueta {
     pub nonce: [u8; 12],
     /// Selector among the route's pre-authorized signing-key pins (verified against the pinned key only).
     pub signer_key_id: [u8; 32],
+    /// Ephemeral X25519 public key for the per-cofre key-wrap: the destination derives the carga's data key via
+    /// `open_key(dest_x25519_secret, eph_pk)`. Authenticated by the `lacre` like every other header field;
+    /// `INV-OPAQUE-CARGO` still holds (the rail can read it but cannot derive the key without the dest secret).
+    pub eph_pk: [u8; 32],
 }
 
 /// A sealed cofre on the wire: `etiqueta` (authenticated) + `carga` (opaque ciphertext) + `lacre` (Ed25519).

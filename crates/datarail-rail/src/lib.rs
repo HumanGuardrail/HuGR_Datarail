@@ -163,6 +163,7 @@ pub mod testsupport {
             aead_alg: AeadAlg::Gcmsiv256,
             nonce: [6; 12],
             signer_key_id: [0; 32],
+            eph_pk: [7; 32],
         }
     }
 

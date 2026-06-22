@@ -301,6 +301,7 @@ name = "datarail-spec"
 version = "0.0.0"
 dependencies = [
  "datarail-core",
+ "datarail-crypto",
  "datarail-terminal",
 ]
 

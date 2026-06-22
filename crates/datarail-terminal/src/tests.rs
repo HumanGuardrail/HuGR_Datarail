@@ -5,14 +5,14 @@ use super::{
 };
 use datarail_core::{AeadAlg, Disposition};
 use datarail_cofre::CofreError;
-use datarail_crypto::verifying_key;
+use datarail_crypto::{verifying_key, x25519_public};
 
 const SOURCE_SEED: [u8; 32] = [11u8; 32];
 const DEST_SEED: [u8; 32] = [22u8; 32];
 const EVIL_SEED: [u8; 32] = [99u8; 32];
 const ROUTE: [u8; 16] = [1u8; 16];
 const STREAM: [u8; 16] = [2u8; 16];
-const DATA_KEY: [u8; 32] = [7u8; 32];
+const DEST_X_SECRET: [u8; 32] = [33u8; 32];
 const TENANT: [u8; 32] = [5u8; 32];
 
 const PREFIX: &[u8] = b"OK:";
@@ -23,7 +23,7 @@ fn config() -> TerminalConfig {
         route_id: ROUTE,
         stream_id: STREAM,
         aead_alg: AeadAlg::Gcmsiv256,
-        route_data_key: DATA_KEY,
+        dest_x25519_pk: x25519_public(&DEST_X_SECRET),
         tenant_secret: TENANT,
     }
 }
@@ -37,7 +37,7 @@ fn source() -> SourceTerminal {
 }
 
 fn dest() -> DestTerminal {
-    DestTerminal::new(config(), contract(), verifying_key(&SOURCE_SEED), DEST_SEED)
+    DestTerminal::new(config(), contract(), verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET)
 }
 
 // ---- ContentContract unit behaviour ----------------------------------------------------------------------
@@ -133,7 +133,8 @@ fn ac9_offload_dead_letters_post_decrypt_record_violation() {
     let mut src = source(); // boards b"OK:..." records
     let mut dst_strict = ContentContract::new(MAX_LEN, b"OK:STRICT:".to_vec());
     dst_strict.fingerprint = contract().fingerprint; // align fp so step (4) passes, step (5) is reached
-    let mut dst = DestTerminal::new(config(), dst_strict, verifying_key(&SOURCE_SEED), DEST_SEED);
+    let mut dst =
+        DestTerminal::new(config(), dst_strict, verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET);
 
     let recs: [&[u8]; 1] = [b"OK:loose"]; // valid at source, fails the dest's stricter prefix
     let cofre = src.board(&recs, b"rk").expect("board");
@@ -154,7 +155,8 @@ fn ac9_wrong_contract_fingerprint_dead_lettered() {
     let src_contract = ContentContract::new(MAX_LEN, PREFIX.to_vec());
     let dst_contract = ContentContract::new(MAX_LEN, b"V2:".to_vec()); // different fingerprint
     let mut src = SourceTerminal::new(config(), src_contract, SOURCE_SEED);
-    let mut dst = DestTerminal::new(config(), dst_contract, verifying_key(&SOURCE_SEED), DEST_SEED);
+    let mut dst =
+        DestTerminal::new(config(), dst_contract, verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET);
 
     let recs: [&[u8]; 1] = [b"OK:payload"];
     let cofre = src.board(&recs, b"rk").expect("board");

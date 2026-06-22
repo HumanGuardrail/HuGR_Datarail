@@ -10,4 +10,5 @@ workspace = true
 
 [dependencies]
 datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
 datarail-terminal = { path = "../datarail-terminal" }

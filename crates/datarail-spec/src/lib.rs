@@ -39,6 +39,7 @@
 use std::collections::BTreeMap;
 
 use datarail_core::AeadAlg;
+use datarail_crypto::x25519_public;
 use datarail_terminal::{ContentContract, TerminalConfig};
 
 /// A scalar value in the `rail.toml` dialect.
@@ -311,8 +312,10 @@ pub struct KeysSpec {
     pub source_seed: [u8; 32],
     /// Ed25519 destination signing seed (watermarks / acks).
     pub dest_seed: [u8; 32],
-    /// v1 shared symmetric route data key (P-later: per-cofre X25519-wrapped key).
-    pub route_data_key: [u8; 32],
+    /// The route destination's X25519 **secret**. (v1 demo carries it inline so one `rail.toml` builds both
+    /// terminals; production would carry only the *public* key on the source side.) `terminal_config` derives
+    /// the public key the source seals each per-cofre data key to.
+    pub dest_x25519_secret: [u8; 32],
     /// Per-tenant secret keying the idempotency MAC.
     pub tenant_secret: [u8; 32],
 }
@@ -370,7 +373,7 @@ impl RailSpec {
         let keys = KeysSpec {
             source_seed: get_bytes::<32>(&map, "keys", "source_seed")?,
             dest_seed: get_bytes::<32>(&map, "keys", "dest_seed")?,
-            route_data_key: get_bytes::<32>(&map, "keys", "route_data_key")?,
+            dest_x25519_secret: get_bytes::<32>(&map, "keys", "dest_x25519_secret")?,
             tenant_secret: get_bytes::<32>(&map, "keys", "tenant_secret")?,
         };
 
@@ -389,7 +392,7 @@ impl RailSpec {
             route_id: self.route.route_id,
             stream_id: self.route.stream_id,
             aead_alg: self.route.aead,
-            route_data_key: self.keys.route_data_key,
+            dest_x25519_pk: x25519_public(&self.keys.dest_x25519_secret),
             tenant_secret: self.keys.tenant_secret,
         }
     }
@@ -440,7 +443,7 @@ mod tests {
              [keys]\n\
              source_seed = \"{SEED32}\"\n\
              dest_seed = \"{SEED32}\"\n\
-             route_data_key = \"{SEED32}\"\n\
+             dest_x25519_secret = \"{SEED32}\"\n\
              tenant_secret = \"{SEED32}\"\n"
         )
     }
