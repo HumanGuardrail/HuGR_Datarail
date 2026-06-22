@@ -42,7 +42,16 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   the wall**, and GCM-SIV (two-pass) is the slowest AEAD → SPEC must weigh single-pass AES-GCM (VAES) vs
   GCM-SIV given we derive the nonce; (2) **per-cofre Ed25519 dominates small payloads** → **batch-many-records-
   per-cofre is mandatory** (validates "seal per vagão"). `GATE-WARP` target = PENDING a re-run on representative
-  HW. Reusable best-of-N harness on branch `spike/h3-sealed-warp-speed`. H1 (ZK-completeness) reasoning: pending (head).
+  HW. Reusable best-of-N harness on branch `spike/h3-sealed-warp-speed`.
+- 2026-06-21 — **MF-1 closed (passed-with-notes).** **H1 (ZK-completeness): CONFIRMED** — every rail function
+  computes from the authenticated header + seal alone; none reassigned to the terminal (see
+  `design/01-rail-surface.md`); conditioned on `INV-SEAL-COMPLETE` + the accepted metadata residual
+  (size/timing/idem-token). **AEAD decision:** AEAD is pluggable; **default = single-pass AES-256-GCM with the
+  nonce DERIVED from the idempotency key** — distinct plaintext → distinct nonce (no catastrophic GCM reuse);
+  identical plaintext → identical ciphertext (the intended per-tenant dedup); fast on VAES. **GCM-SIV retained
+  as a hardened option.** **batch-many-records-per-cofre LOCKED** (one Ed25519 sig amortized per lote).
+  **`GATE-WARP` target = PENDING** a re-bench on representative VAES hardware (no representative box now;
+  labeled, NOT blocking).
 
 ## §4 — Running log (one line per meaningful step)
 
@@ -54,3 +63,7 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   background + hard timeout + liveness diagnosed by the *work* (commits/mtime), never by silence. **Next:**
   re-run H3 on representative HW (sets `GATE-WARP`) + H1 reasoning → then MF-2 (SPEC). MF-1 not blocking: no
   architectural dealbreaker found.
+- 2026-06-21 — H1 reasoned + recorded (`design/01-rail-surface.md`); **MF-1 CLOSED**. **Autonomous mode (Owner
+  directive): TechLead decides + executes, no per-step approval; escalate only STOP-THE-LINE.** Standing PENDING:
+  `GATE-WARP` re-bench on a representative VAES box when one is available. **Now proceeding to MF-2 (SPEC);**
+  next doc: the Cofre wire format (`design/02-cofre-format.md`).
