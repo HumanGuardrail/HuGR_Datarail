@@ -310,6 +310,7 @@ dependencies = [
  "datarail-connectors",
  "datarail-core",
  "datarail-crypto",
+ "datarail-identity",
  "datarail-manifest",
  "datarail-rail",
  "datarail-spec",

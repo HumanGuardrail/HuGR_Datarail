@@ -435,6 +435,21 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   133 tests · clippy deny(all+pedantic) · forbid(unsafe) (one audited shmem waiver). Built per THE HUGR METHOD;
   the final two product-surface WPs (#34/#35) were delegated to agents and cold-verified by the lead.
 
+- 2026-06-22 — **Owner challenge "nada mais pra fazer?" → hunted for real gaps, found two, fixed them.** Did
+  NOT answer from memory (burned 3× this session by premature "done"). Cold-verified the tree and found: (1)
+  **`datarail-identity` was an ORPHAN** — built + tested but **no crate depended on it** (F2/F3 were a library
+  on a shelf, not a delivered capability); (2) the **README was stale from day one** ("Part I — pre-spike,
+  nothing frozen, no product code"). Fixes: wired identity into the CLI via a real **`datarail pair`** command
+  — a local end-to-end rehearsal of F3 SPAKE2 pairing + F2 `Noise_KK` handshake + sealed round-trip (honestly
+  scoped: true two-process pairing needs the network transport; the primitives + a runnable rehearsal are done)
+  — `datarail-identity` is now a genuine CLI dependency, not an orphan; test `pair_local_rehearsal_succeeds`.
+  **README rewritten** to the real product (16 crates, doctrine, CLI surface, honest status). DOD-01 AC-3 note
+  updated. **Deliberately did NOT flip the 12 "Status: DRAFT" component-doc headers** — they are inside the
+  content-hashed SPEC freeze, so editing them would invalidate the SPEC-FREEZE hash; the header is vestigial,
+  SPEC-FREEZE.md is operative (verified the FOOTER-FREEZE seam hash `3851940485f2…` is still intact). **16
+  crates · 134 tests** green · clippy deny(all+pedantic) · forbid(unsafe) (one shmem waiver). Open items
+  unchanged: only the two external physical resources (#13 VAES HW, #20 real engines).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

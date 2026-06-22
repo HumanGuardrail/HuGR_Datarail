@@ -8,6 +8,7 @@
 //! - `replay <rail.toml> <range>` — re-ship a 0-based index range of the source's records through the full pipe.
 //! - `verify <rail.toml> <hex>` — verify a wire-encoded cofre's seal against the route's source key.
 //! - `ticket <rail.toml>` — emit a signed route-capability ticket (hex).
+//! - `pair` — local rehearsal of the SPEC-08 identity layer (F3 SPAKE2 pairing + F2 `Noise_KK` session).
 //!
 //! Lean by design (Charter *leveza*): hand-rolled argument handling (no `clap`) and `/dev/urandom` for keygen
 //! (no `rand`). The CLI holds no logic of its own beyond wiring the crates together.
@@ -35,6 +36,7 @@ USAGE:
     datarail replay <rail.toml> <range>               (range: start..end | start..=end | all; 0-based)
     datarail verify <rail.toml> <cofre-hex>
     datarail ticket <rail.toml>
+    datarail pair                                     (local F2/F3 identity rehearsal — see note)
 
     --watch        on `run`: print a live one-line speedometer per batch (no TUI; raw stdout).
     replay reads from the configured source (--source-file > inline args > stdin) and re-ships only the
@@ -65,6 +67,7 @@ fn dispatch(args: &[String]) -> Result<String, CliError> {
         "replay" => cmd_replay(rest),
         "verify" => cmd_verify(rest),
         "ticket" => cmd_ticket(rest),
+        "pair" => cmd_pair(),
         "help" | "-h" | "--help" => Ok(USAGE.to_owned()),
         other => Err(CliError::UnknownCommand(other.to_owned())),
     }
@@ -88,6 +91,7 @@ enum CliError {
     Rail(String),
     NoCofre,
     BadRange(String),
+    Identity(String),
 }
 
 impl core::fmt::Display for CliError {
@@ -105,6 +109,7 @@ impl core::fmt::Display for CliError {
             Self::Rail(e) => write!(f, "rail: {e}"),
             Self::NoCofre => write!(f, "no cofre came off the rail"),
             Self::BadRange(r) => write!(f, "bad range `{r}` (expected start..end, start..=end, or all)"),
+            Self::Identity(e) => write!(f, "identity: {e}"),
         }
     }
 }
@@ -629,10 +634,65 @@ fn cmd_ticket(rest: &[String]) -> Result<String, CliError> {
     ))
 }
 
+/// `datarail pair` — exercise the endpoint-identity layer (SPEC-08 F2/F3) end-to-end through the real binary.
+///
+/// HONEST SCOPE: F2 `Noise_KK` and F3 SPAKE2 pairing are inherently **two-party** protocols. A genuine pairing
+/// runs across two endpoints exchanging messages over a transport; that needs the cross-host network plumbing
+/// (the same class as the network substrate). This command is a **local rehearsal** — it drives *both* sides
+/// in one process — so the `datarail-identity` primitives are reachable and self-tested from the CLI, and you
+/// can see them work. It is not a remote pairing.
+///
+/// It runs: (F3) mint a single-use short code → both sides run the PAKE bound to their static identities →
+/// confirm they agree on a shared secret; then (F2) a `Noise_KK` handshake between the two pinned statics →
+/// a sealed message round-trips over the established forward-secret session.
+fn cmd_pair() -> Result<String, CliError> {
+    use datarail_identity::{KkSession, Pairing, ShortCode, StaticKeypair};
+
+    // Two endpoints, each with a long-term Noise static keypair (the SPEC-08 X25519 KEM key).
+    let a = StaticKeypair::generate().map_err(|e| CliError::Identity(e.to_string()))?;
+    let b = StaticKeypair::generate().map_err(|e| CliError::Identity(e.to_string()))?;
+
+    // --- F3: SPAKE2 short-code pairing, identities bound, with confirmation. ---
+    let code = ShortCode::generate().map_err(|e| CliError::Identity(e.to_string()))?;
+    let (mut pa, msg_a) = Pairing::start_initiator(&code, a.public(), b.public())
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let (mut pb, msg_b) = Pairing::start_responder(&code, a.public(), b.public())
+        .map_err(|e| CliError::Identity(e.to_string()))?;
+    let tag_a = pa.derive(&msg_b).map_err(|e| CliError::Identity(e.to_string()))?;
+    let tag_b = pb.derive(&msg_a).map_err(|e| CliError::Identity(e.to_string()))?;
+    let secret_a = pa.confirm(&tag_b).map_err(|e| CliError::Identity(e.to_string()))?;
+    let secret_b = pb.confirm(&tag_a).map_err(|e| CliError::Identity(e.to_string()))?;
+    if secret_a != secret_b {
+        return Err(CliError::Identity("pairing secrets disagreed".to_owned()));
+    }
+
+    // --- F2: Noise_KK handshake between the two pinned statics + a sealed round-trip. ---
+    let mut init = KkSession::initiator(&a, b.public()).map_err(|e| CliError::Identity(e.to_string()))?;
+    let mut resp = KkSession::responder(&b, a.public()).map_err(|e| CliError::Identity(e.to_string()))?;
+    let h1 = init.write_handshake(&[]).map_err(|e| CliError::Identity(e.to_string()))?;
+    resp.read_handshake(&h1).map_err(|e| CliError::Identity(e.to_string()))?;
+    let h2 = resp.write_handshake(&[]).map_err(|e| CliError::Identity(e.to_string()))?;
+    init.read_handshake(&h2).map_err(|e| CliError::Identity(e.to_string()))?;
+    let mut at = init.into_transport().map_err(|e| CliError::Identity(e.to_string()))?;
+    let mut bt = resp.into_transport().map_err(|e| CliError::Identity(e.to_string()))?;
+    let ct = at.encrypt(b"datarail-noise-roundtrip").map_err(|e| CliError::Identity(e.to_string()))?;
+    let pt = bt.decrypt(&ct).map_err(|e| CliError::Identity(e.to_string()))?;
+    if pt != b"datarail-noise-roundtrip" {
+        return Err(CliError::Identity("noise round-trip mismatch".to_owned()));
+    }
+
+    Ok(format!(
+        "pair (local rehearsal — not a remote pairing)\n  endpoint A static = 0x{}\n  endpoint B static = 0x{}\n  F3 PAKE     = ok (shared secret agreed, identities bound)\n  F2 Noise_KK = ok (mutual-static handshake + sealed round-trip)\n",
+        to_hex(&a.public()),
+        to_hex(&b.public()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        dispatch, from_hex, parse_range, run_pipe, to_hex, AnyRail, Pipeline, SliceSource, VecSink,
+        cmd_pair, dispatch, from_hex, parse_range, run_pipe, to_hex, AnyRail, Pipeline, SliceSource,
+        VecSink,
     };
     use datarail_connectors::Source;
     use datarail_core::Disposition;
@@ -661,6 +721,16 @@ mod tests {
              dest_x25519_secret = \"{K32}\"\n\
              tenant_secret = \"{K32}\"\n"
         )
+    }
+
+    #[test]
+    fn pair_local_rehearsal_succeeds_end_to_end() {
+        // The identity layer (F2 Noise_KK + F3 PAKE) is reachable from the CLI and works end-to-end: the
+        // command runs both sides locally and reports success for each. (This also keeps datarail-identity a
+        // real, exercised dependency — not an orphan crate.)
+        let out = cmd_pair().expect("local pairing rehearsal should succeed");
+        assert!(out.contains("F3 PAKE     = ok"), "{out}");
+        assert!(out.contains("F2 Noise_KK = ok"), "{out}");
     }
 
     #[test]

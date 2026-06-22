@@ -11,10 +11,55 @@ infrastructure never sees what it carried.**
 
 ## Status
 
-**Part I — architecture (pre-spike). Nothing here is frozen yet.** This repo currently holds the *demand*
-(the trio, drafted for Owner ratification) and the *machine shape* (the Constitution). No product code is
-written until the architecture's cheapest falsifier (the H3 spike) passes. Built per **THE HUGR METHOD**:
-architecture-first → design-before-code → freeze rituals → fleet execution.
+**Engine + product surface built, proven, and audited** (per THE HUGR METHOD: architecture-first →
+design-before-code → freeze rituals → fleet execution). 16 crates · clippy `deny(all+pedantic)` ·
+`forbid(unsafe)` workspace-wide (one audited shared-memory waiver in the shmem substrate). Honest ledger
+of every Acceptance Criterion / gate / invariant: [`docs/design/DOD-01.md`](docs/design/DOD-01.md).
+
+What runs today: sealed cofres with per-cofre X25519 key-wrap + sealed-sender, an offline-verifiable
+Merkle delivery proof, effectively-once delivery, smart terminals (content-contract + dead-letter), the
+three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS) behind one conformance
+harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
+`Noise_KK` + SPAKE2 identity layer, and the `datarail` CLI moving real data source→sink.
+
+**Pending only on external physical resources (not code):** the `GATE-WARP` throughput *measurement*
+needs representative x86-VAES hardware; the AC-10 fairness *bake-off* needs the real competitor engines
+(Kafka/MFT/Fivetran). The rig, the bound, and everything provable on this box are done.
+
+## The doctrine
+
+> **Smart sealed endpoints. Dumb cheap pipes.**
+
+All intelligence and all secrets live in a featherweight terminal at the container's edge. The rail is the
+dumbest, cheapest substrate available. Because every vault is sealed end-to-end, the pipe can be untrusted
+— including ours — and a breach yields useless ciphertext.
+
+## Try it
+
+```sh
+# (toolchain note: run cargo from the stable toolchain on PATH if the rustup proxy is unavailable)
+cargo run -p datarail-cli -- validate examples/rail.toml          # check a route spec
+cargo run -p datarail-cli -- keygen                               # mint an Ed25519 signing identity
+printf 'evt:a\nevt:b\nevt:c\n' > /tmp/in.txt
+cargo run -p datarail-cli -- run examples/rail.toml \
+    --source-file /tmp/in.txt --sink-file /tmp/out.txt --watch    # board → sealed rail → offload, live
+cargo run -p datarail-cli -- replay examples/rail.toml 1..3 --source-file /tmp/in.txt
+cargo run -p datarail-cli -- pair                                 # F2/F3 identity layer, local rehearsal
+```
+
+A route is one declarative `rail.toml` (source + onboarding rules + destination + offloading rules +
+`substrate` + keys-ref). See [`examples/rail.toml`](examples/rail.toml). The `substrate` field selects the
+real transport: `auto`/`loopback` · `tcp` · `shmem` · `s3` · `quic` (the last behind `--features quic`).
+
+## Crates
+
+| Layer | Crates |
+|---|---|
+| Core seam | `datarail-core` (types/traits) · `datarail-crypto` · `datarail-cofre` (wire + seal/verify) |
+| Proof & once | `datarail-manifest` (Merkle proof + `bao` chunk-resume) · `datarail-once` (effectively-once) |
+| Rail | `datarail-rail` (substrate trait + loopback/resumable/UDS/TCP + WAN harness + FASP CC + DoS cookie) · `datarail-substrate-{shmem,quic,objectstore}` |
+| Terminals & identity | `datarail-terminal` (contract/seal/dead-letter/sealed-sender) · `datarail-identity` (Noise_KK + SPAKE2) · `datarail-connectors` |
+| Surface & proof | `datarail-spec` (`rail.toml`) · `datarail-cli` (`datarail`) · `datarail-acceptance` · `datarail-bench` (incl. the AC-10 fairness rig) |
 
 ## Map
 
@@ -24,6 +69,5 @@ architecture-first → design-before-code → freeze rituals → fleet execution
 | [`docs/WORKING_BACKWARDS.md`](docs/WORKING_BACKWARDS.md) | The launch announcement, written first |
 | [`docs/DECOMPOSITION.md`](docs/DECOMPOSITION.md) | Capabilities, acceptance criteria, invariants, milestones |
 | [`docs/design/00-CONSTITUTION.md`](docs/design/00-CONSTITUTION.md) | The machine shape (CAST) + the named invariants + the Craft Charter |
-| [`docs/adr/0001-adopt-cast.md`](docs/adr/0001-adopt-cast.md) | Why CAST: fixed-route, ephemeral, zero-knowledge |
-| [`docs/research/PRE-REGISTRATION.md`](docs/research/PRE-REGISTRATION.md) | The falsifiable hypotheses H1/H2/H3 and the day-zero spike |
+| [`docs/design/DOD-01.md`](docs/design/DOD-01.md) | Definition-of-Done ledger — honest PROVEN/DIRECTIONAL/PENDING per AC/gate/invariant |
 | [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) | Single source of truth — goal lock, decisions, running log |
