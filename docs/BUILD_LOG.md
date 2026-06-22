@@ -67,3 +67,10 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   directive): TechLead decides + executes, no per-step approval; escalate only STOP-THE-LINE.** Standing PENDING:
   `GATE-WARP` re-bench on a representative VAES box when one is available. **Now proceeding to MF-2 (SPEC);**
   next doc: the Cofre wire format (`design/02-cofre-format.md`).
+- 2026-06-21 — **SPEC component docs 01–11 all drafted** (rail-surface/H1, cofre, crypto, manifest,
+  effectively-once, terminal, rail/substrate, routing/identity, CLI/spec, durable-store, gates/proof-methods).
+  **Autonomous build loop ESTABLISHED** (self-paced; goal = §0; do not stop until 100% complete/SOTA/tested/
+  audited; escalate only STOP-THE-LINE). **Next iterations:** `99` coverage matrix (zero unowned) → 6-lens
+  adversarial audit (clone panel) → close blockers → freeze MF-2 (content-hash) → ROADMAP → MF-3 contract
+  freeze → Kage-Bunshin fan-out build → test → AC-10 benchmark → final audit → deliver. Standing PENDING:
+  GATE-WARP re-bench (VAES HW), AC-10 external engines, trio ratification (owner) — labeled, never faked.
