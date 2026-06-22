@@ -1,0 +1,13 @@
+[package]
+name = "datarail-once"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-once — effectively-once: dedup index + signed monotonic watermark (SPEC 05)."
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }

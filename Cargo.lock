@@ -246,6 +246,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-manifest"
+version = "0.0.0"
+dependencies = [
+ "datarail-core",
+ "datarail-crypto",
+]
+
+[[package]]
+name = "datarail-once"
+version = "0.0.0"
+dependencies = [
+ "datarail-core",
+ "datarail-crypto",
+]
+
+[[package]]
+name = "datarail-rail"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"

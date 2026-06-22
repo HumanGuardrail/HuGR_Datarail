@@ -1,0 +1,13 @@
+[package]
+name = "datarail-manifest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-manifest — Merkle log, signed tree head, inclusion-proof delivery receipts (SPEC 04)."
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
