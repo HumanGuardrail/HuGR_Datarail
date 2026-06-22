@@ -294,6 +294,9 @@ pub struct RouteSpec {
     pub aead: AeadAlg,
     /// The declared delivery guarantee (informational in v1; the code path is always effectively-once).
     pub guarantee: String,
+    /// The substrate the rail moves cofres over: `auto`/`loopback` · `tcp` · `shmem` · `s3`/`object-store` ·
+    /// `quic` (SPEC-09). Absent ⇒ `loopback` (so a `rail.toml` without the field stays valid).
+    pub substrate: String,
 }
 
 /// An `[onboarding]` / `[offloading]` content contract section.
@@ -368,6 +371,9 @@ impl RailSpec {
             stream_id: get_bytes::<16>(&map, "route", "stream_id")?,
             aead,
             guarantee: get_str(&map, "route", "guarantee")?.to_owned(),
+            // Optional: absent ⇒ "loopback" (backward-compatible with specs predating the substrate field).
+            substrate: get_str(&map, "route", "substrate")
+                .map_or_else(|_| "loopback".to_owned(), str::to_owned),
         };
 
         let keys = KeysSpec {

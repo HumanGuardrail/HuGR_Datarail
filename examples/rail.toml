@@ -6,6 +6,7 @@ route_id   = "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"   # 16 bytes
 stream_id  = "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"   # 16 bytes
 aead       = "gcm-siv-256"                            # nonce-misuse-resistant default
 guarantee  = "exactly-once"
+substrate  = "shmem"                                  # auto | loopback | tcp | shmem | s3 | quic (feature)
 
 [onboarding]
 max_record_len  = 4096

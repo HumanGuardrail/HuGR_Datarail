@@ -365,6 +365,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   (external). Foundation for wiring `datarail run` to a real source→sink over a real substrate (#32).
   **15 crates** · tests green · clippy deny(all+pedantic) · forbid(unsafe).
 
+- 2026-06-22 — **#32 `datarail run` wired to real connectors + real substrates.** No longer hard-wired to
+  `LoopbackSubstrate` + CLI-arg records. `run` now (a) reads `[route] substrate` and instantiates the real
+  substrate via an `AnyRail` enum (loopback / tcp / shmem / object-store; **quic behind `--features quic`** to
+  keep the default binary featherweight — G2; the QUIC variant is boxed), and (b) moves data through the
+  `datarail-connectors` `Source`/`Sink` (`--source-file`/`--sink-file` for file→file; inline / stdin / demo
+  otherwise). `datarail-spec` gained an optional `substrate` field (absent ⇒ loopback, backward-compatible).
+  **LIVE e2e PROVEN:** `datarail run examples/rail.toml --source-file in --sink-file out` over **shmem** moved 3
+  real records file → board → seal → ring → verify → offload → file (committed=3, dead-letter=0). Unit tests:
+  connector round-trip through `run_pipe` + the substrate-field selection map. **16 crates · 109 tests** green ·
+  clippy deny(all+pedantic) (default **and** `--features quic`) · forbid(unsafe). **This is the press-release UX
+  working for real** — "define a route, `datarail run`, sealed over the cheapest substrate." Remaining product
+  surface: #33 sealed-sender · #34 Noise_KK/PAKE · #35 replay + `--watch`.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

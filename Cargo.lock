@@ -297,11 +297,15 @@ name = "datarail-cli"
 version = "0.0.0"
 dependencies = [
  "datarail-cofre",
+ "datarail-connectors",
  "datarail-core",
  "datarail-crypto",
  "datarail-manifest",
  "datarail-rail",
  "datarail-spec",
+ "datarail-substrate-objectstore",
+ "datarail-substrate-quic",
+ "datarail-substrate-shmem",
  "datarail-terminal",
 ]
 

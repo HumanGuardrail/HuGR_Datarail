@@ -12,6 +12,10 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# QUIC pulls quinn+tokio+ring (heavy); keep the default binary featherweight (G2), QUIC one flag away.
+quic = ["dep:datarail-substrate-quic"]
+
 [dependencies]
 datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
@@ -20,3 +24,7 @@ datarail-manifest = { path = "../datarail-manifest" }
 datarail-rail = { path = "../datarail-rail" }
 datarail-terminal = { path = "../datarail-terminal" }
 datarail-spec = { path = "../datarail-spec" }
+datarail-connectors = { path = "../datarail-connectors" }
+datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
+datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }
+datarail-substrate-quic = { path = "../datarail-substrate-quic", optional = true }
