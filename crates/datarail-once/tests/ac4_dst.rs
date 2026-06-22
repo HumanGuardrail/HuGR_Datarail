@@ -124,7 +124,9 @@ struct Dest {
 impl Dest {
     fn new(seed: [u8; 32]) -> Self {
         Self {
-            once: Once::new(seed),
+            // AUDIT-02: a small gc_lag (< PER_STREAM = 8) so the dedup-GC path actually fires mid-run under
+            // fault injection — proving exactly-once across the GC-vs-replay interleave, not just with GC idle.
+            once: Once::with_gc_lag(seed, 3),
             commits: HashMap::new(),
             out_acks: VecDeque::new(),
         }

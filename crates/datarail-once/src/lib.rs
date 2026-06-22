@@ -61,14 +61,27 @@ struct StreamState {
 ///
 /// Construct with [`Once::new`], drive with [`Once::admit`]. The watermark is signed with the destination's
 /// Ed25519 `seed`; expose it to peers via [`Once::signed_watermark`] (verify with [`verify_watermark`]).
-#[derive(Debug)]
 pub struct Once {
     streams: HashMap<[u8; 16], StreamState>,
     /// Ed25519 secret for signing watermark tokens.
     seed: [u8; 32],
-    /// How far the GC floor lags the dest low-watermark (BLK-6). Must exceed the max in-flight / replay
-    /// horizon so no still-replayable `seq` can fall through a GC'd slot.
+    /// How far the dedup-GC floor trails the dest low-watermark (BLK-6). This is a **dedup-retention /
+    /// re-ack-cost** knob, **not** a correctness knob: GC is keyed off the *contiguous* low-watermark, and
+    /// reject-below (evaluated *before* the dedup lookup) catches any replay of a GC'd `seq` — so exactly-once
+    /// holds for **any** `gc_lag` (including 0). A larger lag just keeps keys longer, so at-least-once
+    /// redeliveries are reported `Duplicate` rather than harmlessly re-admitted. (AUDIT-02 correctness note.)
     gc_lag: u64,
+}
+
+/// Redacting `Debug` (AUDIT-02): never print the Ed25519 watermark-signing `seed`.
+impl core::fmt::Debug for Once {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Once")
+            .field("streams", &self.streams)
+            .field("seed", &"<redacted>")
+            .field("gc_lag", &self.gc_lag)
+            .finish()
+    }
 }
 
 /// Default GC lag — how far the dedup-GC floor trails the dest low-watermark (BLK-6).
@@ -84,7 +97,9 @@ impl Once {
         Self::with_gc_lag(seed, DEFAULT_GC_LAG)
     }
 
-    /// As [`Once::new`], but with an explicit GC lag (BLK-6: must exceed the max in-flight / replay horizon).
+    /// As [`Once::new`], but with an explicit GC lag (a dedup-retention knob — correct for **any** value; see
+    /// the [`gc_lag`](Self#structfield.gc_lag) field doc). A smaller lag bounds the dedup index and exercises
+    /// the GC path; the AC-4 DST uses a small lag deliberately.
     #[must_use]
     pub fn with_gc_lag(seed: [u8; 32], gc_lag: u64) -> Self {
         Self {

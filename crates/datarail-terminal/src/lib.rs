@@ -129,7 +129,10 @@ fn unframe_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, TerminalError> {
         .ok_or(TerminalError::MalformedBatch)?;
     let count = u32::from_le_bytes(count_bytes.try_into().map_err(|_| TerminalError::MalformedBatch)?);
     pos += 4;
-    let mut records = Vec::with_capacity(count as usize);
+    // Cap the speculative pre-allocation: each record needs ≥4 header bytes, so a legitimate `count` cannot
+    // exceed `bytes.len() / 4`. Prevents a malformed-but-authenticated batch (a buggy/compromised source) from
+    // requesting a huge `Vec` allocation before the per-record bound checks run (AUDIT-02 parse-lens finding).
+    let mut records = Vec::with_capacity((count as usize).min(bytes.len() / 4));
     for _ in 0..count {
         let len_bytes = bytes
             .get(pos..pos + 4)
@@ -321,7 +324,7 @@ impl Sink {
 ///
 /// Bundling the route parameters in one struct (rather than passing loose `[u8; _]` arguments) keeps the
 /// terminal constructors within the Craft Charter without an `#[allow]`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TerminalConfig {
     /// Fixed A→B route id (copied into every etiqueta).
     pub route_id: [u8; 16],
@@ -336,6 +339,19 @@ pub struct TerminalConfig {
     pub tenant_secret: [u8; 32],
 }
 
+/// Redacting `Debug` (AUDIT-02): never print the `tenant_secret` MAC key. Public route params are shown.
+impl core::fmt::Debug for TerminalConfig {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TerminalConfig")
+            .field("route_id", &self.route_id)
+            .field("stream_id", &self.stream_id)
+            .field("aead_alg", &self.aead_alg)
+            .field("dest_x25519_pk", &self.dest_x25519_pk)
+            .field("tenant_secret", &"<redacted>")
+            .finish()
+    }
+}
+
 // ----------------------------------------------------------------------------------------------------------
 // Source terminal — onboarding.
 // ----------------------------------------------------------------------------------------------------------
@@ -346,7 +362,7 @@ pub struct TerminalConfig {
 /// Holds the route config, the onboarding [`ContentContract`], the Ed25519 source signing seed, and the
 /// monotonic per-stream `seq`. A contract-violating record makes [`board`](Self::board) return
 /// [`TerminalError::ContractViolation`] — it **never boards** (AC-9).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SourceTerminal {
     config: TerminalConfig,
     contract: ContentContract,
@@ -354,6 +370,18 @@ pub struct SourceTerminal {
     source_seed: [u8; 32],
     /// Monotonic per-stream sequence counter.
     seq: u64,
+}
+
+/// Redacting `Debug` (AUDIT-02): never print the Ed25519 `source_seed`.
+impl core::fmt::Debug for SourceTerminal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SourceTerminal")
+            .field("config", &self.config)
+            .field("contract", &self.contract)
+            .field("source_seed", &"<redacted>")
+            .field("seq", &self.seq)
+            .finish()
+    }
 }
 
 impl SourceTerminal {
@@ -403,8 +431,8 @@ impl SourceTerminal {
         let eph_secret = random_32()?;
         let (eph_pk, data_key) = seal_key(&self.config.dest_x25519_pk, &eph_secret);
 
-        // (5) AEAD-seal the batch under the per-cofre data key with a per-cofre nonce. aad = &[] (v1).
-        let nonce = self.next_nonce();
+        // (5) AEAD-seal the batch under the per-cofre data key with a fresh random per-cofre nonce. aad = &[].
+        let nonce = Self::fresh_nonce()?;
         let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, AAD_V1, &batch)?;
 
         // (6) Build the etiqueta; cofre_id/signer_key_id are stamped by `seal`.
@@ -427,12 +455,14 @@ impl SourceTerminal {
         Ok(cofre)
     }
 
-    /// Derive a per-cofre nonce. Deterministic in v1 (the route's `seq`), which is safe under the GCM-SIV
-    /// default (nonce-misuse-resistant, AUDIT-01 BLK-1). A CSPRNG nonce is the production choice.
-    fn next_nonce(&self) -> [u8; 12] {
+    /// Draw a fresh random 12-byte nonce from OS entropy. **AUDIT-02 fix:** decoupled from `seq` (which resets
+    /// on `SourceTerminal::new`) so a fork/snapshot entropy replay cannot re-pair `(data_key, nonce)`. With a
+    /// fresh per-cofre data key this is defense-in-depth — one message per key already precludes nonce reuse.
+    fn fresh_nonce() -> Result<[u8; 12], TerminalError> {
+        let r = random_32()?;
         let mut nonce = [0u8; 12];
-        nonce[..8].copy_from_slice(&self.seq.to_le_bytes());
-        nonce
+        nonce.copy_from_slice(&r[..12]);
+        Ok(nonce)
     }
 }
 
@@ -446,7 +476,6 @@ impl SourceTerminal {
 /// Owns the route config, the offloading [`ContentContract`], the **pinned** source verifying key, the
 /// [`datarail_once`] admission gate, the [`Sink`], and the [`DeadLetterSiding`]. Any seal/contract failure is
 /// reason-coded onto the siding and reported as [`Disposition::DeadLettered`] — never delivered (AC-9).
-#[derive(Debug)]
 pub struct DestTerminal {
     config: TerminalConfig,
     contract: ContentContract,
@@ -457,6 +486,22 @@ pub struct DestTerminal {
     once: Once,
     sink: Sink,
     dead_letters: DeadLetterSiding,
+}
+
+/// Redacting `Debug` (AUDIT-02): never print the destination X25519 secret (the `Once` gate redacts its own
+/// signing seed).
+impl core::fmt::Debug for DestTerminal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DestTerminal")
+            .field("config", &self.config)
+            .field("contract", &self.contract)
+            .field("pinned_source_vk", &self.pinned_source_vk)
+            .field("dest_x25519_secret", &"<redacted>")
+            .field("once", &self.once)
+            .field("sink", &self.sink)
+            .field("dead_letters", &self.dead_letters)
+            .finish()
+    }
 }
 
 impl DestTerminal {
