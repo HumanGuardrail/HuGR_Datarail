@@ -158,6 +158,17 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   final 6-lens audit over the CODE + DoD. Standing PENDING/STOP-THE-LINE unchanged (GATE-WARP VAES HW, AC-10
   engines, trio §6 ratification).
 
+- 2026-06-22 — **P6: X25519 per-cofre key-wrap WIRED END-TO-END (`856502f` + re-freeze `822ce2b`).** The main
+  v1 simplification is **CLOSED**. `datarail-crypto` gained `seal_key`/`open_key`/`x25519_public` (ECDH-derived
+  fresh data key, KDF `dr:keywrap:v1`); `Etiqueta` grew `eph_pk` (core seam, `ETIQUETA_LEN` 181→213); `board`
+  seals a fresh per-cofre data key to the route dest's X25519 pubkey (random `/dev/urandom` ephemeral),
+  `offload` re-derives it; added a route-binding dead-letter (`RouteMismatch`). **Forward-secure +
+  provider-blind**: the data key never travels and only the dest secret opens it. Seam re-frozen (`22d1f9e`).
+  Full workspace **10 crates, 65 tests green**, clippy deny(all+pedantic) clean, no `#[allow]`,
+  `forbid(unsafe)`; live CLI demo Delivered + verify OK. **NEXT: P6 remainder** — criterion micro-bench
+  (GATE-LATENCY/throughput, honest HW labels), AC-8 (WAN/resume — needs a network substrate; likely PENDING),
+  AC-10 (PENDING engines), AUDIT-02 (6-lens over the CODE) + DoD.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
