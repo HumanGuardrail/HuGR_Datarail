@@ -408,7 +408,7 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   textbook KDF-as-MAC over vetted primitives (`sha2`,`subtle`, already in-tree), **not** a hand-rolled PAKE; the
   tag is one-way over the key so no offline-dictionary oracle. **Optional future hardening (logged, non-blocking):**
   HKDF-split the SPAKE2 output into distinct confirm-key vs session-key instead of reusing the raw key for both
-  (current construction is sound; this is textbook-cleaner). **17 crates · 126 tests** green · clippy
+  (current construction is sound; this is textbook-cleaner). **16 crates · 126 tests** green · clippy
   deny(all+pedantic) · forbid(unsafe) (shmem waiver only). Remaining product surface: #35 replay + `--watch`.
 
 - 2026-06-22 — **#35 CLI `replay` + `--watch` speedometer (G3) — delegated to an agent, COLD-VERIFIED by the
@@ -422,7 +422,7 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   `--workspace` clean + `cargo test --workspace` = **133 green** (126 + 7 new) MYSELF — the agent's card said
   "168", a **miscount** the cold-verify caught; the real number is 133 and the *work* is correct. Read the new
   code in full + **live-smoke-tested the binary**: `replay 1..3` of a 5-record source → 2 committed; `run
-  --watch` → speedometer + final line; `replay 9..2` → clean error, exit 1. **17 crates · 133 tests** green ·
+  --watch` → speedometer + final line; `replay 9..2` → clean error, exit 1. **16 crates · 133 tests** green ·
   clippy deny(all+pedantic) · forbid(unsafe) (shmem waiver only).
 
 - 2026-06-22 — **✅ DELIVERY: the entire buildable white-paper + SPEC + roadmap surface is COMPLETE.** Capability
@@ -431,7 +431,7 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   resume, E5 DoS cookie), F routing+identity (F2 Noise_KK, F3 PAKE, F4 ticket), G spec+CLI (`run`/`validate`/
   `keygen`/`verify`/`ticket`/`replay` + `--watch`, real connectors + real substrate selection), H object-store.
   AC-1..AC-9 PROVEN/met; the **only** open items are external **physical resources, not decisions**:
-  GATE-WARP measurement on VAES HW (#13) and the AC-10 bake-off vs real competitor engines (#20). 17 crates ·
+  GATE-WARP measurement on VAES HW (#13) and the AC-10 bake-off vs real competitor engines (#20). 16 crates ·
   133 tests · clippy deny(all+pedantic) · forbid(unsafe) (one audited shmem waiver). Built per THE HUGR METHOD;
   the final two product-surface WPs (#34/#35) were delegated to agents and cold-verified by the lead.
 

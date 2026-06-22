@@ -2,7 +2,7 @@
 
 > Honest status of every Acceptance Criterion, gate, and invariant, labeled per the SPEC-11 taxonomy:
 > **PROVEN** (self-contained, gated, cold-verified) · **DIRECTIONAL** (measured-but-caveated) · **PENDING**
-> (needs absent resources). **17 crates · 133 tests** · clippy `deny(all+pedantic)` clean. `forbid(unsafe)`
+> (needs absent resources). **16 crates · 133 tests** · clippy `deny(all+pedantic)` clean. `forbid(unsafe)`
 > workspace-wide **except** the quarantined `datarail-substrate-shmem` crate (`deny(unsafe)` + **one** audited
 > `#[allow]` for the shared-memory atomic cursors — owner-delegated WAIVER, `BUILD_LOG` §6 / AUDIT-03).
 > Verified via the toolchain directly (see AUDIT-02 env note). **P3 re-open code audited — AUDIT-03 (F1/F2/F3
@@ -51,7 +51,7 @@
 | INV | Status | Where enforced |
 |---|---|---|
 | INV-OPAQUE-CARGO | **PROVEN** | substrates never read `carga` (audit + AC-1) |
-| INV-SEAL-COMPLETE | **PROVEN** | `signed_region` covers all 10 etiqueta fields incl. `eph_pk` + carga (audit + AC-2) |
+| INV-SEAL-COMPLETE | **PROVEN** | `signed_region` covers all 12 etiqueta fields (incl. `eph_pk` + `sender_present` + `ts`) + carga (audit + AC-2) |
 | INV-TAMPER-REJECT | **PROVEN** | `cofre::verify` (AC-2/3) |
 | INV-EFFECTIVELY-ONCE | **PROVEN** | `Once` reject-below + dedup + GC (AC-4, AC-8) |
 | INV-MANIFEST-RECONCILES | **PROVEN** | `verify_delivery` (AC-5) |
