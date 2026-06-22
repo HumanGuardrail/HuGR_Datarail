@@ -3,15 +3,18 @@
 > The cross-crate **contract** is frozen. Dependent crates (`manifest`, `once`, `rail`, `terminal`, …)
 > **transcribe** this interface; they do not redesign it. Drift is detectable by re-running one `shasum`.
 
-- **Git HEAD at freeze:** `7a0e4bfb825a88adc8d7482f13d32e6ba32b5b75` (re-frozen 2026-06-22)
+- **Git HEAD at freeze:** `856502f4d789cd6f7ee823205afab3703c691006` (re-frozen 2026-06-22)
 - **Content hash (sha256 of the 3 contract crates' `lib.rs`, sorted, concatenated):**
-  `0dedb209717c4e3b12609a4266f45b85bc1e2902ce05463f3d4e54a52b3688f8`
-- **Size:** 3 crates · 689 lines.
+  `22d1f9e442715f922e39bad8d54a5efb3742d9bab8ad5fd219c60477518f54f8`
+- **Size:** 3 crates · 697 lines.
 - **Re-freeze log:**
+  - 2026-06-22 — **STRUCTURAL** (`datarail-core` + `datarail-cofre`): `Etiqueta` grew an `eph_pk: [u8;32]`
+    field (the per-cofre ephemeral X25519 public key); `ETIQUETA_LEN` 181→213 + encode/decode. This wires the
+    X25519 key-wrap end-to-end — the shared-route-key v1 simplification is now **CLOSED** (fresh per-cofre key,
+    forward-secure, provider-blind). All dependents updated; full workspace 65 tests green. Prior stamp
+    `0dedb209…88f8` @ `7a0e4bf`.
   - 2026-06-22 — *additive*: `datarail-crypto::{x25519_public, seal_key, open_key}` (X25519 per-cofre
-    key-wrap) added to close the v1 shared-route-key simplification. Prior stamp `70c8ed8b…f7fd` @ `53fcc65`.
-    Additive only — no existing API changed. NOTE: the *terminal wiring* of this (an `eph_pk` field on
-    `Etiqueta`) is a pending **core-seam** change, to be re-frozen when landed.
+    key-wrap primitive). Prior stamp `70c8ed8b…f7fd` @ `53fcc65`. Additive only.
   - 2026-06-22 — *additive*: `datarail-crypto::hmac_blake3` (keyed BLAKE3 MAC) for the idempotency key
     `HMAC(tenant_secret, record_key)`, needed by the terminal (P4). Prior stamp `4449a7a7…3d50` @ `f1ca841`.
     Additive only — no existing API changed; all dependents still transcribe-compatible.
