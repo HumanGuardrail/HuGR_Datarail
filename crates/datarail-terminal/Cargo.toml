@@ -14,3 +14,7 @@ datarail-crypto = { path = "../datarail-crypto" }
 datarail-cofre = { path = "../datarail-cofre" }
 datarail-once = { path = "../datarail-once" }
 zeroize = "1"
+
+[dev-dependencies]
+# AC-9's SPEC-11 proof method is **proptest** (randomized conforming/violating cases, both terminals).
+proptest = "1"

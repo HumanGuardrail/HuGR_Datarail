@@ -253,3 +253,73 @@ fn distinct_record_keys_are_both_delivered() {
     assert_eq!(dst.offload(&c1).expect("off 1"), Disposition::Delivered);
     assert_eq!(dst.sink().len(), 2);
 }
+
+// ---- AC-9 (proptest): the SPEC-11 *named* proof method — randomized conforming/violating cases, both sides --
+mod prop {
+    use super::{contract, dest, source, Disposition, TerminalError, MAX_LEN, PREFIX};
+    use proptest::prelude::*;
+    use proptest::sample::Index;
+
+    /// A record that always satisfies `contract()`: `PREFIX` followed by an arbitrary tail, total ≤ `MAX_LEN`.
+    fn conforming_record() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(any::<u8>(), 0..=(MAX_LEN - PREFIX.len())).prop_map(|tail| {
+            let mut rec = PREFIX.to_vec();
+            rec.extend_from_slice(&tail);
+            rec
+        })
+    }
+
+    proptest! {
+        /// Source onboarding (AC-9a): the terminal boards a batch **iff every record conforms**; a batch with
+        /// any violating record is refused and the sequence never advances (it never boards).
+        #[test]
+        fn source_boards_iff_all_records_conform(
+            recs in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..80), 1..6)
+        ) {
+            let mut src = source();
+            let all_conform = recs.iter().all(|r| contract().validate(r));
+            let refs: Vec<&[u8]> = recs.iter().map(Vec::as_slice).collect();
+            let res = src.board(&refs, b"rk");
+            if all_conform {
+                prop_assert!(res.is_ok(), "a fully-conforming batch must board");
+                prop_assert_eq!(src.next_seq(), 1);
+            } else {
+                prop_assert_eq!(res, Err(TerminalError::ContractViolation));
+                prop_assert_eq!(src.next_seq(), 0, "a violating batch must never board");
+            }
+        }
+
+        /// Dest offloading happy path (AC-9b): any honestly-boarded conforming batch Delivers and commits
+        /// exactly those records, with no dead-letters.
+        #[test]
+        fn conforming_batch_round_trips_and_commits(
+            recs in proptest::collection::vec(conforming_record(), 1..6)
+        ) {
+            let mut src = source();
+            let mut dst = dest();
+            let refs: Vec<&[u8]> = recs.iter().map(Vec::as_slice).collect();
+            let cofre = src.board(&refs, b"rk").expect("a conforming batch boards");
+            prop_assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
+            prop_assert_eq!(dst.sink().committed(), &recs[..]);
+            prop_assert!(dst.dead_letters().is_empty());
+        }
+
+        /// Dest tamper rejection (AC-9d / AC-2 at the terminal): flipping **any** single ciphertext byte breaks
+        /// the seal, so the cofre is dead-lettered and nothing is committed — for every conforming batch and
+        /// every byte position.
+        #[test]
+        fn any_carga_byte_flip_is_dead_lettered(
+            recs in proptest::collection::vec(conforming_record(), 1..4),
+            at in any::<Index>(),
+        ) {
+            let mut src = source();
+            let mut dst = dest();
+            let refs: Vec<&[u8]> = recs.iter().map(Vec::as_slice).collect();
+            let mut cofre = src.board(&refs, b"rk").expect("board");
+            let i = at.index(cofre.carga.len());
+            cofre.carga[i] ^= 0x01;
+            prop_assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+            prop_assert!(dst.sink().is_empty(), "a tampered cofre commits nothing");
+        }
+    }
+}
