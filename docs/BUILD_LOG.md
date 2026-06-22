@@ -182,6 +182,16 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   blockers + the MF-0 trio ratification. (Env: rustup proxy broke mid-session → verified via the toolchain path;
   see AUDIT-02 env note.)
 
+- 2026-06-22 — **v1.1: `SocketSubstrate` — first REAL cross-process transport (`1ca5c21`).** A `Substrate` over
+  a connected Unix-domain-socket pair: cofres serialized via the wire codec, `u32`-length-framed, non-blocking
+  buffered recv; holds no keys (`INV-DUMB-PIPE`), sees only opaque bytes (`INV-OPAQUE-CARGO`), and passes the
+  **same** `substrate_conformance` harness as the in-memory substrates — **`INV-SUBSTRATE-POLYMORPHIC` now proven
+  over a real kernel pipe, not only RAM.** Plus `datarail-acceptance/tests/socket_pipe.rs`: board → seal →
+  socket → verify → offload → **Delivered**, records intact across the transport. `cfg(unix)`, zero new deps
+  (`std::os::unix::net`). First rung of the **cross-container** ladder; **AC-6 upgraded** to "harness + 3
+  substrates, 1 real transport" (DOD-01). 11 crates, **69 tests** green, clippy deny(all+pedantic) clean.
+  (QUIC/S3 substrates + the WAN bench remain post-v1.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
