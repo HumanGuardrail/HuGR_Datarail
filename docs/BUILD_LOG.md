@@ -22,6 +22,11 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
 
 ## §3 — Decision log
 
+> **Append-only/historical.** Where an early entry conflicts with a later one (the cofre `idempotency_key`
+> preimage; the H3 nonce wording), the **later** entry + AUDIT-01 + §6 are operative. The re-audit confirmed the
+> live SPEC docs are fully consistent: **GCM-SIV default · `idempotency_key = HMAC(tenant, record_key)` · no
+> derived nonce · no convergent encryption.**
+
 - 2026-06-21 — Runtime: **Rust**.
 - 2026-06-21 — Guarantee: **effectively-once** (at-least-once + idempotent/transactional sink); a clause of
   the offloading contract.

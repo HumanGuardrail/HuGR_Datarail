@@ -77,3 +77,6 @@ sender) are owned by `03`/`02`. Items legitimately not yet closed are **labeled 
 `GATE-WARP` bound (representative HW), AC-10 external engines, owner ratification of the trio.
 
 Re-run this matrix immediately before the SPEC freeze; the freeze does not proceed with any unowned row.
+
+**Re-validated 2026-06-21 (post-AUDIT-01, pre-freeze):** the 8 blocker fixes hardened existing leaves; no
+capability was added or removed → **still zero unowned rows**. Re-audit clean. Freeze cleared.
