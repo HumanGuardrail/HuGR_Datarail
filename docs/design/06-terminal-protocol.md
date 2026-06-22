@@ -15,8 +15,11 @@
 
 ## Offloading (destination terminal)
 
-1. Receive cofre. **Verify `LACRE`** (Ed25519, pinned source key). Fail → dead-letter (`INV-TAMPER-REJECT`,
-   AC-2/3).
+1. **Parse-before-verify guard (BLK-7).** Before reading any field or decrypting: **bound-check the declared
+   lengths with checked arithmetic** (total-length sanity; `ETIQUETA_LEN`/`CARGA_LEN` must fit the received
+   frame, no overflow) and **verify the `LACRE`** (Ed25519, pinned source key) over the raw bytes. Any failure →
+   dead-letter (`INV-TAMPER-REJECT`, AC-2/3). No attacker-supplied length is trusted and no field is parsed until
+   the seal verifies.
 2. Unwrap data key (X25519); **AEAD-open** (verifies tag + `aad = etiqueta`).
 3. **Dedup** on `idempotency_key` (05).
 4. **Enforce the offloading content contract** on the now-plaintext records; check `contract_fp` against the

@@ -11,7 +11,7 @@ A cofre on the wire is three parts; the rail touches only the header and the sea
 
 - **etiqueta (header)** — *authenticated, NOT secret*. The rail reads it; the seal covers it, so the rail
   can read but cannot forge. Carries: route id, stream id, sequence no., idempotency key
-  (`HMAC(tenant, content)`), cofre id, byte length, contract fingerprint, wrapped data key, timestamp.
+  (`HMAC(tenant, record_key)`), cofre id, byte length, contract fingerprint, wrapped data key, timestamp.
 - **carga (payload)** — AEAD ciphertext. **Opaque** to the rail. The rail may move or hash its bytes but
   never derives plaintext.
 - **lacre (seal)** — Ed25519 signature over `etiqueta ⊗ ciphertext`. The rail can verify it over opaque bytes.

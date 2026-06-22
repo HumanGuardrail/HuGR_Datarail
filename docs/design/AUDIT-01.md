@@ -22,7 +22,7 @@ Panel: Lens A (completeness/fit/consistency) 3B/4M/4P · Lens B (security/crypto
 - **BLK-5 — No domain separation across Ed25519 contexts.** **DISPOSITION:** every signature = `Ed25519(unique_ctx_label ‖ msg)`; distinct labels for lacre/STH/ack/sender-cert/ticket; fixed-width fields, no shape aliasing. → `03` (+ refs in 02,04,08).
 - **BLK-6 — Dedup GC vs replay race → double-commit.** **DISPOSITION:** the dest maintains a **signed monotonic low-watermark**; **reject any arriving `seq` below it** (not merely lookup); GC floor lags the max in-flight/replay horizon, not the source checkpoint. → `05`.
 - **BLK-7 — Parse-before-verify** (attacker `ETIQUETA_LEN`/`CARGA_LEN` read before seal). **DISPOSITION:** total-length sanity + checked arithmetic as **step 0**, before any field read or decrypt. → `02,06`.
-- **BLK-8 — Delivery-proof not bound + no `cofre_id` recompute.** **DISPOSITION:** `dest_ack` + leaf MUST commit to `route_id‖stream_id‖seq‖STH-root`(+epoch); verifier MUST recompute `cofre_id==BLAKE3(CARGA)` and reject mismatch. → `04`.
+- **BLK-8 — Delivery-proof not bound + no `cofre_id` recompute.** **DISPOSITION (resolved):** **ack** binds `route_id‖stream_id‖seq‖STH-root`(+epoch); **leaf** binds `route_id‖stream_id‖seq‖epoch‖cofre_id` — **NOT** STH-root (circular: leaves feed the root the STH signs; caught by the apply-clone, lead-resolved). Verifier MUST recompute `cofre_id==BLAKE3(CARGA)` and reject mismatch. → `04`.
 
 ## Key MAJORS (close before freeze)
 

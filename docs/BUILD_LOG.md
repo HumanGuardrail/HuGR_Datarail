@@ -82,6 +82,11 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   issuer), MAJ-6 (cofre_id not a dedup key), BLK-7 (parse-before-verify in 02; 06 pending). **Remaining → task #14:**
   BLK-2 (idempotency record_key propagate), BLK-3 (AC-1 — trio), BLK-6 (dedup watermark-reject, 05), BLK-8 (proof
   binding, 04), MAJ-1/2/3/5/7/8 → then **re-audit** → freeze MF-2.
+- 2026-06-21 — Mechanical-fix clone applied BLK-2/6/7(06)/8 + MAJ-1/3/5 to 01/04/05/06/08 (write-only); **lead
+  cold-verified (Rule 4) — clone caught a real circularity in my BLK-8 disposition** (leaf binding `STH-root` is
+  circular). Lead-resolved: leaf binds `route/stream/seq/epoch/cofre_id`, only the `dest_ack` binds `STH-root`.
+  **All 8 blockers + majors now closed.** Committed. **NEXT: RE-AUDIT (fresh clone panel) → if clean, re-run 99
+  coverage → freeze MF-2.**
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

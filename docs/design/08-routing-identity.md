@@ -20,7 +20,14 @@ secret, no PKI round-trips, no negotiation (WireGuard discipline — one fixed s
    store.
 2. **PAKE short-code** — zero-PKI: an operator pastes a one-time code on both ends (SPAKE2, wormhole-style)
    → derives the pinned identities. **Audited PAKE crate only** — never roll our own (croc's CVE-2021-31603:
-   home-grown PAKE → plaintext recovery).
+   home-grown PAKE → plaintext recovery). **PAKE hardening (MAJ-5):**
+   - **High-entropy, single-use code** — the pairing code carries enough entropy that online guessing is
+     infeasible, and it is **burned after one use** (never reusable).
+   - **Hard attempt-cap with burn-on-fail** — a strict cap on failed attempts; **on exceeding it the code is
+     burned** (invalidated) and pairing must restart with a fresh code, defeating online dictionary attacks.
+   - **Identity binding into the transcript** — both endpoint identities (their static pubkeys) are **bound into
+     the PAKE transcript**, so a successful exchange authenticates *which* endpoints paired and blocks
+     relay/MITM substitution.
 
 ## Route descriptor (capability token)
 

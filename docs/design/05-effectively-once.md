@@ -14,16 +14,25 @@
 
 - Source sends `(cofre, seq, idempotency_key)`. The rail may deliver ≥1× (at-least-once), or the ephemeral
   rail dies mid-flight → re-spawn resends from the last un-acked `seq`.
-- Destination: verify seal → check `idempotency_key` against the **dedup index** → if seen, **drop + re-ack**
-  (idempotent); else **commit** (transactional / upsert-by-key into the sink) → record key → ack.
+- Destination: verify seal → check the dedup key `idempotency_key = HMAC(tenant_secret, record_key)` (record-key,
+  matching 01/02/03) against the **dedup index** → if seen, **drop + re-ack** (idempotent); else **commit**
+  (transactional / upsert-by-key into the sink) → record key → ack.
 - **Exactly-once at the sink** = at-least-once delivery + dedup + transactional/idempotent commit (a clause of
   the offloading contract; only as strong as the sink allows).
 
-## Dedup index — unbounded, crypto-anchored (fixes NATS's 2-min RAM window)
+## Dedup index — bounded, crypto-anchored (fixes NATS's 2-min RAM window)
 
-- Keyed by `idempotency_key` (32 B), **persisted** (not an in-RAM time window). 
-- Compaction: once a `seq` watermark is durably committed **and** the source's checkpoint has advanced past
-  it, keys below the watermark are GC'd (the source never resends below an acked watermark).
+- Keyed by `idempotency_key = HMAC(tenant_secret, record_key)` (32 B), **persisted** (not an in-RAM time window).
+- **Bounded (MAJ-2):** a **bloom-filter prefilter** (in-RAM, fast negative) fronts an **on-disk map** (authoritative
+  membership). The index is never unbounded: on bloom/map **overflow** or a **poisoned gap** that cannot be
+  resolved, the offending cofres go to **dead-letter** and the dest performs a **sealed gap-skip** (the skip is
+  recorded under the dest watermark, see below) — this prevents an unbounded-growth DoS.
+- **Reject-below, not merely lookup (BLK-6):** the destination keeps a **signed monotonic low-watermark per stream**
+  and **REJECTS any arriving `seq` below it** outright (not just a dedup lookup). Below-watermark `seq` is already
+  durably accounted for; admitting it would risk a GC-vs-replay double-commit.
+- Compaction / GC floor: the dedup-index GC floor **lags the max in-flight / replay horizon, bound to the dest
+  watermark** — **NOT** the source checkpoint. Keys are GC'd only once the dest watermark has advanced past them,
+  so no still-replayable `seq` can ever fall through a GC'd slot.
 
 ## Crash matrix (proof = DST, hypothesis H2)
 
