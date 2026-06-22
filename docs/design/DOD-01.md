@@ -47,7 +47,7 @@
 1. **GATE-WARP bound `X` + representative VAES hardware** (#13) — set X and re-bench on the target HW; the CI guard must fail until X is set (MAJ-7).
 2. **AC-10 fairness** — provide the real competitor engines + the anti-cheat rig (#20).
 3. **MF-0 trio ratification** (DECOMPOSITION.md §6): A3 AEAD→GCM-SIV default, AC-1 metamorphic redefinition, C1 idempotency = record_key.
-4. **Post-v1 (not blocking v1):** real network substrates (QUIC/shmem/S3) to upgrade AC-6 to "× 3 real substrates" and complete the AC-8 WAN-vs-TCP benchmark; X25519 AAD-binding hardening (AUDIT-02 F5); `zeroize` of secrets (F4); `Gcm256` gate or removal (F2).
+4. **Post-v1 (not blocking v1):** real network substrates (QUIC/shmem/S3) to upgrade AC-6 to "× 3 real substrates" and complete the AC-8 WAN-vs-TCP benchmark. *(The AUDIT-02 hardening TODOs F4 zeroize / F5 AEAD-AAD-binding are now FIXED in `cb79d75`; F2 resolved-by-design.)*
 
 ## Summary
 
