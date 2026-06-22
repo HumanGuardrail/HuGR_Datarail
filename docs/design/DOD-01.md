@@ -42,7 +42,7 @@
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `GATE-WARP` (throughput ≥ X) | **PENDING** | bound `X` unset; requires representative **x86 VAES** HW (this box reports `x86_64` — real Intel *or* Rosetta; VAES unconfirmed, task #13). BENCH-01 gives directional throughput (BLAKE3 ~3.4 GB/s, GCM-SIV ~1 GB/s) but that is **not** a GATE-WARP pass |
+| `GATE-WARP` (throughput ≥ X) | **PENDING** (measurement) — **X now set** | **X = 1 GiB/s/core** sealed-payload (batched) — a tech-lead **design target** (SPEC-11, set 2026-06-22). The binding *pass* needs representative VAES HW (this box is Rosetta-x86_64, no VAES — #13); the CI guard stays **red until a real VAES run records it**. BENCH-01 directional figures are **not** a GATE-WARP pass. |
 | `GATE-LATENCY` (p50/p99 per hop) | **DIRECTIONAL** | BENCH-01 (Rosetta-x86_64): board ~**1.45 ms** / offload ~**0.94 ms**, dominated by **emulated** X25519 (~0.5–0.7 ms/side) — **NOT sub-ms on this box**; native arm64 was ~190 µs / ~136 µs (sub-ms). Amortizes per batch (wrap once per cofre). Formal p50/p99 on representative native/VAES HW pending (#13) |
 | `GATE-FEATHER` (idle ≈ 0) | **DIRECTIONAL** (architectural half PROVEN) | `gate_feather_*` test: idle in-flight returns to 0 every cycle (no standing data); the in-process substrate is a passive struct (no thread/fd). Real-substrate idle-RSS measurement still PENDING |
 

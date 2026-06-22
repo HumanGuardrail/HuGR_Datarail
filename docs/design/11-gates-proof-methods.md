@@ -7,7 +7,7 @@
 
 | Gate | Bound | CI mechanism |
 |---|---|---|
-| `GATE-WARP` | per-core sealed throughput ≥ **X** (X = **PENDING** → MUST be set on representative VAES HW before MF-4) | criterion bench → assert ≥ bound; **CI guard fails if bound still PENDING at MF-4** (MAJ-7); harness includes the dedup-index lookup cost (MAJ-2) |
+| `GATE-WARP` | per-core sealed throughput ≥ **X = 1 GiB/s/core** *(batched sealed-payload bytes/s; **design target** set by the tech lead 2026-06-22 — rationale: AES-256-GCM-SIV on VAES ≈ 2–4 GB/s/core and the per-cofre X25519 wrap amortizes over a batch, so ~1 GiB/s/core end-to-end is conservative-but-real; the **binding pass measurement requires VAES HW**, #13)* | bench → assert ≥ X **on representative VAES HW**; the CI guard stays **red until a real VAES measurement is recorded** (MAJ-7); harness includes the dedup-index lookup cost (MAJ-2) |
 | `GATE-LATENCY` | p50/p99 per hop ≤ bound (shmem µs · QUIC ms); **STH/TSA anchoring is async, OFF the delivery path** (MAJ-1) | bench → assert p99 |
 | `GATE-FEATHER` | **idle footprint ≈ 0** (no standing process; scale-to-zero) + active RSS ≪ a mesh sidecar | measure idle (must be ~0) + active RSS bound |
 

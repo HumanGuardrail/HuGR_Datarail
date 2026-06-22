@@ -1,9 +1,13 @@
 # DECOMPOSITION — the demand
 
-> **Owner-reserved. Status: DRAFT — pending ratification + freeze (MF-0).** Everything downstream (SPEC →
-> ROADMAP → WPs → code) is derived from this and proven against it. Completeness is anchored here, not on a
-> doc count: the product is done when every Acceptance Criterion is green and every invariant, gate, and
-> proof method is owned, implemented, and proven.
+> **Status: RATIFIED (MF-0) — tech lead, owner-delegated 2026-06-22.** The owner delegated the trio decisions
+> to the tech lead; the three audit-driven reconciliations (**A3** AEAD default = AES-256-GCM-SIV + random
+> nonce, no derived nonce · **AC-1** metamorphic = swap CARGA for an equal-length re-signed ciphertext ·
+> **C1** idempotency key = `HMAC(tenant_secret, record_key)`, not a content hash) are hereby **ratified** into
+> the trio and the implementation matches them (AUDIT-01 §6, AUDIT-02). Everything downstream (SPEC → ROADMAP →
+> WPs → code) is derived from this and proven against it. Completeness is anchored here, not on a doc count:
+> the product is done when every Acceptance Criterion is green and every invariant, gate, and proof method is
+> owned, implemented, and proven.
 
 ## Capabilities (the leaves)
 
