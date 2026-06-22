@@ -1,0 +1,11 @@
+[package]
+name = "datarail-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-core — the Cofre envelope + the rail/terminal contracts (transcribes the frozen SPEC)."
+
+[lints]
+workspace = true
+
+[dependencies]
