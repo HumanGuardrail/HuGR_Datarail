@@ -231,6 +231,114 @@ impl Substrate for ResumableSubstrate {
     }
 }
 
+/// A **cross-process** [`Substrate`] over a connected Unix-domain-socket pair (same-host — the first rung of
+/// the cross-container ladder). Cofres are serialized with the canonical wire codec
+/// ([`encode`](datarail_cofre::encode) / [`decode`](datarail_cofre::decode)), length-prefixed, and moved over a
+/// real kernel transport that sees **only opaque bytes** (`INV-OPAQUE-CARGO`) and holds **no keys**
+/// (`INV-DUMB-PIPE`). It passes the same [`substrate_conformance`] harness as the in-memory substrates —
+/// `INV-SUBSTRATE-POLYMORPHIC` now demonstrated over a real pipe, not just in RAM.
+///
+/// `send` writes a `u32`-length-prefixed frame to the write end; `recv` non-blockingly drains the read end into
+/// a buffer and decodes one complete frame (returning `None` until a full frame has arrived). Unix-only.
+///
+/// v1 note: a single connected pair with kernel-buffered sends — fine for bounded batches; a production
+/// substrate would interleave send/recv or size the socket buffer to avoid back-pressure on huge bursts.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct SocketSubstrate {
+    tx: std::os::unix::net::UnixStream,
+    rx: std::os::unix::net::UnixStream,
+    buf: Vec<u8>,
+    acked: Vec<[u8; 32]>,
+}
+
+#[cfg(unix)]
+impl SocketSubstrate {
+    /// Build a substrate over a fresh connected socket pair: bytes written by `send` (to `tx`) are read by
+    /// `recv` (from `rx`). The read end is set non-blocking so `recv` can return `None` on an empty pipe.
+    ///
+    /// # Errors
+    /// Returns the underlying [`std::io::Error`] if the socket pair cannot be created or set non-blocking.
+    pub fn pair() -> std::io::Result<Self> {
+        let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
+        rx.set_nonblocking(true)?;
+        Ok(Self {
+            tx,
+            rx,
+            buf: Vec::new(),
+            acked: Vec::new(),
+        })
+    }
+
+    /// The `cofre_id`s acked so far, in ack order.
+    #[must_use]
+    pub fn acked(&self) -> &[[u8; 32]] {
+        &self.acked
+    }
+}
+
+#[cfg(unix)]
+impl Substrate for SocketSubstrate {
+    type Error = std::io::Error;
+
+    /// Serialize the cofre (wire codec) and write a `u32`-length-prefixed frame.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on a write failure, or if the encoded cofre exceeds a `u32` frame length.
+    fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
+        use std::io::Write as _;
+        let bytes = datarail_cofre::encode(cofre);
+        let len = u32::try_from(bytes.len()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "cofre exceeds u32 frame")
+        })?;
+        self.tx.write_all(&len.to_le_bytes())?;
+        self.tx.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Drain whatever is readable into the buffer, then decode one complete length-prefixed frame if present
+    /// (`None` until a full frame has arrived). Routes from the bytes only — never inspects the plaintext.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on a read failure, or `InvalidData` if a framed cofre fails to decode (corrupt pipe).
+    fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
+        use std::io::Read as _;
+        let mut tmp = [0u8; 8192];
+        loop {
+            match self.rx.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if self.buf.len() < 4 {
+            return Ok(None);
+        }
+        let mut len_bytes = [0u8; 4];
+        len_bytes.copy_from_slice(&self.buf[..4]);
+        let len = u32::from_le_bytes(len_bytes) as usize;
+        if self.buf.len() < 4 + len {
+            return Ok(None); // frame not fully arrived yet
+        }
+        let frame = self.buf[4..4 + len].to_vec();
+        self.buf.drain(..4 + len);
+        let cofre = datarail_cofre::decode(&frame)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        Ok(Some(cofre))
+    }
+
+    /// Record an acknowledgement (header-only; the payload is never consulted).
+    ///
+    /// # Errors
+    /// Never returns an error — recording is in-memory; the `Result` satisfies the [`Substrate`] contract.
+    fn ack(&mut self, cofre_id: [u8; 32]) -> Result<(), Self::Error> {
+        self.acked.push(cofre_id);
+        Ok(())
+    }
+}
+
 /// Shared cofre fixtures — `pub` so downstream substrate crates can reuse them in the same harness.
 pub mod testsupport {
     use datarail_cofre::seal;
@@ -284,6 +392,14 @@ mod tests {
     fn ac6_resumable_passes_substrate_conformance() {
         // The resumable substrate (with no partition) satisfies the same polymorphic flow.
         substrate_conformance(ResumableSubstrate::new);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ac6_socket_passes_substrate_conformance() {
+        // The SAME AC-6 flow, now over a REAL cross-process kernel transport (Unix domain socket) — the wire
+        // codec round-trips through the kernel and the polymorphic harness is satisfied unchanged.
+        substrate_conformance(|| super::SocketSubstrate::pair().expect("unix socket pair"));
     }
 
     #[test]
