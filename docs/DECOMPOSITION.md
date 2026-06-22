@@ -12,7 +12,7 @@ Grouped by responsibility; these map toward the eventual crate boundaries.
 ### A — The Cofre (sealed vault)
 - **A1** Envelope structure: authenticated header (*etiqueta*) + AEAD-encrypted payload + signature (*lacre*).
 - **A2** Seal completeness: signature covers header ⊗ payload, byte-for-byte (`INV-SEAL-COMPLETE`).
-- **A3** AEAD with nonce-misuse resistance (AES-GCM-SIV / XChaCha20-Poly1305); nonce derived from the idempotency key.
+- **A3** Pluggable AEAD; **default AES-256-GCM-SIV** (nonce-misuse-resistant); per-cofre fresh data key + **random** nonce; ChaCha20-Poly1305 / AES-256-GCM as alternates. *(audit-reconciled: no derived nonce — AUDIT-01 §6, owner-ratify at MF-0)*
 - **A4** Sealed-sender: sender identity lives encrypted *inside* the payload; the header carries only routing-minimum.
 - **A5** Envelope encryption: payload under a per-shipment data key; wrapped data key rides in the header (rotation without re-encrypt).
 
@@ -22,7 +22,7 @@ Grouped by responsibility; these map toward the eventual crate boundaries.
 - **B3** External RFC-3161 timestamp (never trust the pipe's clock).
 
 ### C — Effectively-once
-- **C1** Idempotency key = `HMAC(per-tenant secret, content)` in the authenticated header — never a raw content hash.
+- **C1** Idempotency key = `HMAC(per-tenant secret, record_key)` in the authenticated header — never a raw content hash. *(audit-reconciled: record_key not content — AUDIT-01 §6)*
 - **C2** Destination dedup against the seal; unbounded window (crypto-anchored), not an in-RAM time window.
 - **C3** Crash/retry/partition safety: durability anchored at source terminal + cofre + manifest, not in the rail.
 
@@ -57,7 +57,7 @@ Grouped by responsibility; these map toward the eventual crate boundaries.
 
 | AC | Statement | Owns | Proof method |
 |---|---|---|---|
-| **AC-1** | A sealed cofre is byte-opaque to the rail; route/dedup/checkpoint use header+seal only | A1,A4,E | metamorphic: rail with payload zeroed behaves identically |
+| **AC-1** | A sealed cofre is byte-opaque to the rail; route/dedup/checkpoint use header+seal only | A1,A4,E | metamorphic: swap CARGA for another validly-sealed ciphertext of equal length (re-signed), routing fixed → identical rail behavior *(AUDIT-01 §6)* |
 | **AC-2** | Any single-byte mutation of header or payload is detected → dead-lettered, never delivered | A2,D3 | property test: mutate every byte position → 100% reject |
 | **AC-3** | A forged cofre (wrong source key) is rejected | A2,F2 | differential vs a known-good signer |
 | **AC-4** | Under crash/retry/partition with an idempotent sink, every acked record is delivered exactly once (0 loss, 0 dup) | C1,C2,C3 | DST (deterministic simulation), N seeds |

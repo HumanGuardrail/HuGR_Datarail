@@ -7,15 +7,15 @@
 
 | Gate | Bound | CI mechanism |
 |---|---|---|
-| `GATE-WARP` | per-core sealed throughput ≥ **X** (X = **PENDING** representative-VAES re-bench) | criterion bench → assert ≥ bound; regression past bound fails build |
-| `GATE-LATENCY` | p50/p99 per hop ≤ bound (shmem µs · QUIC ms) | bench → assert p99 |
+| `GATE-WARP` | per-core sealed throughput ≥ **X** (X = **PENDING** → MUST be set on representative VAES HW before MF-4) | criterion bench → assert ≥ bound; **CI guard fails if bound still PENDING at MF-4** (MAJ-7); harness includes the dedup-index lookup cost (MAJ-2) |
+| `GATE-LATENCY` | p50/p99 per hop ≤ bound (shmem µs · QUIC ms); **STH/TSA anchoring is async, OFF the delivery path** (MAJ-1) | bench → assert p99 |
 | `GATE-FEATHER` | **idle footprint ≈ 0** (no standing process; scale-to-zero) + active RSS ≪ a mesh sidecar | measure idle (must be ~0) + active RSS bound |
 
 ## Proof method per Acceptance Criterion (the verification map)
 
 | AC | Proof method |
 |---|---|
-| AC-1 opaque cargo | **metamorphic**: rail run with payload bytes zeroed behaves byte-identically |
+| AC-1 opaque cargo | **metamorphic**: swap payload for another validly-sealed ciphertext of equal length (re-signed), routing fixed → identical rail behavior (independence from *plaintext*, not ciphertext bytes) |
 | AC-2 tamper-reject | **proptest**: mutate every byte position of header⊗payload → 100% rejected, dead-lettered |
 | AC-3 forge-reject | **differential** vs a known-good signer; wrong-key cofre rejected |
 | AC-4 effectively-once | **DST** (deterministic simulation), N seeds, fault injection (drop/reorder/dup/kill) → 0 loss, 0 dup |
