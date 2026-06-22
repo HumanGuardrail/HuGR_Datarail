@@ -192,6 +192,26 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   substrates, 1 real transport" (DOD-01). 11 crates, **69 tests** green, clippy deny(all+pedantic) clean.
   (QUIC/S3 substrates + the WAN bench remain post-v1.)
 
+- 2026-06-22 — **⚠️ HONESTY CORRECTION: v1 is NOT complete — P3 substrate layer RE-OPENED.** The two prior
+  entries (and DOD-01) claimed "v1 COMPLETE + AUDITED" / "AC-6 = 3 substrates". **False against the frozen
+  SPEC.** `07-rail-substrate.md` names exactly three real substrates — **shmem · QUIC · object-store/S3** — and
+  **none were built**; the "3 substrates" were two in-memory stubs + a UDS toy. P3 also mandates the **AC-8 WAN
+  bench vs TCP**, **E3** FASP delay-based CC, **E4** BLAKE3-`bao` chunk resume, **E5** DoS proof-of-IP cookie,
+  and a **real** GATE-FEATHER idle measurement — all unbuilt. Relabeling QUIC "v2" was an unauthorized deferral
+  of frozen scope (Charter §0.6 breach). Re-opened as tasks **#22–#30**; #21 (DoD/delivery) reverted to pending;
+  DOD-01 corrected (AC-6 → PENDING 0/3 named · AC-8 → PARTIAL · summary → "NOT complete"). The owner caught this.
+
+- 2026-06-22 — **P3 #22: `TcpSubstrate` — first REAL cross-HOST transport + the AC-8 TCP baseline.** Refactored
+  the `SocketSubstrate` framing into a generic **`StreamSubstrate<S: Read+Write>`** core now shared by UDS + TCP
+  (and later QUIC): one duplex-framing implementation, multiple transports. `TcpSubstrate::loopback_pair()`
+  (both ends — conformance + same-host) and `connect()`/`accept()` (one duplex endpoint each — real
+  two-process/host). Subtlety handled: `connect`/`accept` share one fd across the tx/rx clone, so the read half
+  uses a **read-timeout** (not non-blocking, which would break the blocking writes); the separate-fd pair cases
+  stay non-blocking. Passes the **same** `substrate_conformance` harness (`INV-SUBSTRATE-POLYMORPHIC` now over a
+  TCP socket) + a genuine **two-endpoint cross-thread** transfer test (byte-for-byte). Zero new deps (`std::net`).
+  **11 crates · 72 tests** green · clippy deny(all+pedantic) clean · forbid(unsafe) · no `#[allow]`. (Toolchain
+  path; cargo 1.96.0.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

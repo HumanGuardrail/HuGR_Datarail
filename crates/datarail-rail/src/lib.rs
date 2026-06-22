@@ -231,45 +231,33 @@ impl Substrate for ResumableSubstrate {
     }
 }
 
-/// A **cross-process** [`Substrate`] over a connected Unix-domain-socket pair (same-host — the first rung of
-/// the cross-container ladder). Cofres are serialized with the canonical wire codec
-/// ([`encode`](datarail_cofre::encode) / [`decode`](datarail_cofre::decode)), length-prefixed, and moved over a
-/// real kernel transport that sees **only opaque bytes** (`INV-OPAQUE-CARGO`) and holds **no keys**
-/// (`INV-DUMB-PIPE`). It passes the same [`substrate_conformance`] harness as the in-memory substrates —
-/// `INV-SUBSTRATE-POLYMORPHIC` now demonstrated over a real pipe, not just in RAM.
+/// The shared core behind every **real byte-stream** [`Substrate`] (cross-process / cross-host): a duplex
+/// transport `S` (anything `Read + Write` — a kernel socket, a TCP connection, later a QUIC stream).
 ///
-/// `send` writes a `u32`-length-prefixed frame to the write end; `recv` non-blockingly drains the read end into
-/// a buffer and decodes one complete frame (returning `None` until a full frame has arrived). Unix-only.
+/// Cofres are serialized with the canonical wire codec ([`encode`](datarail_cofre::encode) /
+/// [`decode`](datarail_cofre::decode)), `u32`-length-prefixed, and moved over a transport that sees **only
+/// opaque bytes** (`INV-OPAQUE-CARGO`) and holds **no keys** (`INV-DUMB-PIPE`). The very same
+/// [`substrate_conformance`] harness passes over an in-memory queue, a Unix pipe, and a TCP connection
+/// unchanged — `INV-SUBSTRATE-POLYMORPHIC` demonstrated identically across all of them.
 ///
-/// v1 note: a single connected pair with kernel-buffered sends — fine for bounded batches; a production
-/// substrate would interleave send/recv or size the socket buffer to avoid back-pressure on huge bursts.
-#[cfg(unix)]
+/// `send` writes a framed cofre to the write half (`tx`); `recv` drains the read half (`rx`) into a buffer
+/// and decodes one complete frame (returning `None` until a full frame has arrived). The read half is made
+/// *non-immediately-blocking* by the concrete constructor — non-blocking for the separate-fd pair cases
+/// ([`SocketSubstrate::pair`] / [`TcpSubstrate::loopback_pair`]) or a short read-timeout for the shared-fd
+/// duplex cases ([`TcpSubstrate::connect`] / [`TcpSubstrate::accept`], where the write half must stay
+/// blocking) — so `recv` returns promptly on an empty transport.
+///
+/// v1 note: a single connection with kernel-buffered sends — fine for bounded batches; a production substrate
+/// would interleave send/recv or size the socket buffer to avoid back-pressure on huge bursts.
 #[derive(Debug)]
-pub struct SocketSubstrate {
-    tx: std::os::unix::net::UnixStream,
-    rx: std::os::unix::net::UnixStream,
+pub struct StreamSubstrate<S> {
+    tx: S,
+    rx: S,
     buf: Vec<u8>,
     acked: Vec<[u8; 32]>,
 }
 
-#[cfg(unix)]
-impl SocketSubstrate {
-    /// Build a substrate over a fresh connected socket pair: bytes written by `send` (to `tx`) are read by
-    /// `recv` (from `rx`). The read end is set non-blocking so `recv` can return `None` on an empty pipe.
-    ///
-    /// # Errors
-    /// Returns the underlying [`std::io::Error`] if the socket pair cannot be created or set non-blocking.
-    pub fn pair() -> std::io::Result<Self> {
-        let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
-        rx.set_nonblocking(true)?;
-        Ok(Self {
-            tx,
-            rx,
-            buf: Vec::new(),
-            acked: Vec::new(),
-        })
-    }
-
+impl<S> StreamSubstrate<S> {
     /// The `cofre_id`s acked so far, in ack order.
     #[must_use]
     pub fn acked(&self) -> &[[u8; 32]] {
@@ -277,16 +265,14 @@ impl SocketSubstrate {
     }
 }
 
-#[cfg(unix)]
-impl Substrate for SocketSubstrate {
+impl<S: std::io::Read + std::io::Write> Substrate for StreamSubstrate<S> {
     type Error = std::io::Error;
 
-    /// Serialize the cofre (wire codec) and write a `u32`-length-prefixed frame.
+    /// Serialize the cofre (wire codec) and write a `u32`-length-prefixed frame to the write half.
     ///
     /// # Errors
     /// [`std::io::Error`] on a write failure, or if the encoded cofre exceeds a `u32` frame length.
     fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
-        use std::io::Write as _;
         let bytes = datarail_cofre::encode(cofre);
         let len = u32::try_from(bytes.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "cofre exceeds u32 frame")
@@ -302,13 +288,18 @@ impl Substrate for SocketSubstrate {
     /// # Errors
     /// [`std::io::Error`] on a read failure, or `InvalidData` if a framed cofre fails to decode (corrupt pipe).
     fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
-        use std::io::Read as _;
         let mut tmp = [0u8; 8192];
         loop {
             match self.rx.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                // WouldBlock (non-blocking fd) and TimedOut (read-timeout fd) both mean "no more right now".
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    break
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -336,6 +327,102 @@ impl Substrate for SocketSubstrate {
     fn ack(&mut self, cofre_id: [u8; 32]) -> Result<(), Self::Error> {
         self.acked.push(cofre_id);
         Ok(())
+    }
+}
+
+/// A **cross-process** [`Substrate`] over a connected Unix-domain-socket pair (same host — the first rung of
+/// the cross-container ladder). A [`StreamSubstrate`] over [`UnixStream`](std::os::unix::net::UnixStream).
+#[cfg(unix)]
+pub type SocketSubstrate = StreamSubstrate<std::os::unix::net::UnixStream>;
+
+#[cfg(unix)]
+impl StreamSubstrate<std::os::unix::net::UnixStream> {
+    /// Build a substrate over a fresh connected socket pair: bytes written by `send` (to `tx`) are read by
+    /// `recv` (from `rx`). The read end is set non-blocking so `recv` can return `None` on an empty pipe.
+    ///
+    /// # Errors
+    /// Returns the underlying [`std::io::Error`] if the socket pair cannot be created or set non-blocking.
+    pub fn pair() -> std::io::Result<Self> {
+        let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
+        rx.set_nonblocking(true)?;
+        Ok(Self {
+            tx,
+            rx,
+            buf: Vec::new(),
+            acked: Vec::new(),
+        })
+    }
+}
+
+/// A **cross-host** [`Substrate`] over a TCP connection — the cross-cluster rung of the ladder, and the
+/// literal **TCP baseline** the AC-8 WAN benchmark measures against. A [`StreamSubstrate`] over
+/// [`TcpStream`](std::net::TcpStream).
+///
+/// The cofre is already sealed, so TCP is used purely as a dumb byte pipe — **no TLS is needed for
+/// confidentiality** (`INV-OPAQUE-CARGO` already holds; this validates the DERP-style blind relay). Two
+/// constructor shapes: [`loopback_pair`](Self::loopback_pair) holds both ends locally (conformance + same-host
+/// hops); [`connect`](Self::connect) / [`accept`](Self::accept) hold a single duplex endpoint each, for a real
+/// two-process / two-host transfer.
+pub type TcpSubstrate = StreamSubstrate<std::net::TcpStream>;
+
+impl StreamSubstrate<std::net::TcpStream> {
+    /// A same-object loopback pair over `127.0.0.1` (both ends held locally): `send` writes the client end,
+    /// `recv` reads the accepted server end. Used by the conformance harness and same-host hops; the two ends
+    /// are *separate* sockets, so the read end can be set non-blocking without affecting writes.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] if binding, connecting, accepting, or socket configuration fails.
+    pub fn loopback_pair() -> std::io::Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let tx = std::net::TcpStream::connect(addr)?;
+        tx.set_nodelay(true)?;
+        let (rx, _peer) = listener.accept()?;
+        rx.set_nonblocking(true)?;
+        Ok(Self {
+            tx,
+            rx,
+            buf: Vec::new(),
+            acked: Vec::new(),
+        })
+    }
+
+    /// Connect to a remote rail endpoint (the cross-host **source** side): one duplex connection where `send`
+    /// writes and `recv` reads the same socket. The read half is given a short read-timeout (rather than
+    /// non-blocking, which — sharing the file description with the write half — would make writes fail) so
+    /// `recv` returns promptly when the peer has sent nothing, while `send` stays blocking.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on connect / clone / socket-configuration failure.
+    pub fn connect(addr: impl std::net::ToSocketAddrs) -> std::io::Result<Self> {
+        let tx = std::net::TcpStream::connect(addr)?;
+        tx.set_nodelay(true)?;
+        let rx = tx.try_clone()?;
+        rx.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;
+        Ok(Self {
+            tx,
+            rx,
+            buf: Vec::new(),
+            acked: Vec::new(),
+        })
+    }
+
+    /// Accept one connection from `listener` (the cross-host **destination** side). Same single-duplex,
+    /// read-timeout shape as [`connect`](Self::connect).
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on accept / clone / socket-configuration failure.
+    pub fn accept(listener: &std::net::TcpListener) -> std::io::Result<Self> {
+        let (tx, _peer) = listener.accept()?;
+        tx.set_nodelay(true)?;
+        let rx = tx.try_clone()?;
+        rx.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;
+        Ok(Self {
+            tx,
+            rx,
+            buf: Vec::new(),
+            acked: Vec::new(),
+        })
     }
 }
 
@@ -400,6 +487,42 @@ mod tests {
         // The SAME AC-6 flow, now over a REAL cross-process kernel transport (Unix domain socket) — the wire
         // codec round-trips through the kernel and the polymorphic harness is satisfied unchanged.
         substrate_conformance(|| super::SocketSubstrate::pair().expect("unix socket pair"));
+    }
+
+    #[test]
+    fn ac6_tcp_passes_substrate_conformance() {
+        // The SAME AC-6 flow over a REAL cross-host transport (TCP, loopback) — INV-SUBSTRATE-POLYMORPHIC now
+        // holds over a network socket too, not only a kernel pipe. This substrate is the AC-8 TCP baseline.
+        substrate_conformance(|| super::TcpSubstrate::loopback_pair().expect("tcp loopback pair"));
+    }
+
+    #[test]
+    fn tcp_cross_endpoint_transfers_cofre_byte_for_byte() {
+        // A genuine TWO-ENDPOINT transfer (separate connect + accept across threads, as a cross-host hop would
+        // be): a cofre sealed at the source survives the TCP transport byte-for-byte at the destination.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let sent = super::testsupport::cofre_seq(42);
+        let expected = sent.clone();
+
+        let server = std::thread::spawn(move || {
+            let mut dst = super::TcpSubstrate::accept(&listener).expect("accept");
+            loop {
+                if let Some(c) = dst.recv().expect("recv") {
+                    dst.ack(c.etiqueta.cofre_id).expect("ack");
+                    return c;
+                }
+            }
+        });
+
+        let mut src = super::TcpSubstrate::connect(addr).expect("connect");
+        src.send(&sent).expect("send");
+        let got = server.join().expect("server thread");
+        assert_eq!(
+            got, expected,
+            "cofre survived a real cross-endpoint TCP transport byte-for-byte"
+        );
     }
 
     #[test]

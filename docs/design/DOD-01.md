@@ -2,8 +2,19 @@
 
 > Honest status of every Acceptance Criterion, gate, and invariant, labeled per the SPEC-11 taxonomy:
 > **PROVEN** (self-contained, gated, cold-verified) · **DIRECTIONAL** (measured-but-caveated) · **PENDING**
-> (needs absent resources). 10 crates · 68 tests · clippy `deny(all+pedantic)` clean · `forbid(unsafe)` ·
-> no `#[allow]`. As of `4b92570` (post AUDIT-02). Verified via the toolchain directly (see AUDIT-02 env note).
+> (needs absent resources). 11 crates · 72 tests · clippy `deny(all+pedantic)` clean · `forbid(unsafe)` ·
+> no `#[allow]`. Verified via the toolchain directly (see AUDIT-02 env note).
+>
+> ## ⚠️ CORRECTION (2026-06-22) — P3 RE-OPENED; v1 is **NOT** complete
+>
+> A prior revision of this ledger claimed "the v1 product is complete" and marked **AC-6 PROVEN (×3
+> substrates)**. That was **false against the frozen SPEC**. SPEC `07-rail-substrate.md` names exactly three
+> real substrates — **shmem · QUIC · object-store/S3** — and **none were built**; the "3 substrates" counted
+> two in-memory stubs + a Unix-socket toy. The roadmap's P3 also mandates **AC-8 WAN bench vs TCP**, **E3**
+> FASP delay-based CC, **E4** BLAKE3-`bao` chunk resume, **E5** DoS proof-of-IP cookie, and a **real**
+> GATE-FEATHER idle measurement — all unbuilt. P3 is **re-opened** (tasks #22–#30). Honest position today:
+> **P0–P2 + P4–P5(partial) PROVEN; P3 substrate layer in progress** (`TcpSubstrate` = first real cross-host
+> transport + AC-8 baseline, landed). The statuses below are corrected to reflect this.
 
 ## Acceptance Criteria
 
@@ -14,9 +25,9 @@
 | AC-3 forge-reject (differential) | **PROVEN** | `datarail-cofre::ac3_wrong_and_forged_key_rejected` + `datarail-terminal::ac9_forged_cofre_wrong_signer` |
 | AC-4 effectively-once (DST) | **PROVEN** | `datarail-once/tests/ac4_dst.rs` — 1000 seeds, drop/reorder/dup/kill-respawn, **0 loss / 0 dup**, now with `gc_lag=3` so the GC path fires (AUDIT-02 F7) |
 | AC-5 delivery proof (differential) | **PROVEN** (TSA out of scope) | `datarail-manifest` 13 tests (independent root re-derivation + tamper rejection) + MF-4 `verify_delivery`. Bundle = `{inclusion, STH, ack}`; **TSA/RFC-3161 anchoring is async, off the delivery path** (SPEC 04 / MAJ-1) → not in v1 |
-| AC-6 substrate parity | **PROVEN** (harness + **3 substrates, 1 real transport**) | `substrate_conformance<S>` passed by `LoopbackSubstrate`, `ResumableSubstrate`, **and `SocketSubstrate`** (cross-process Unix domain socket; `tests/socket_pipe.rs` proves board→socket→offload end-to-end). QUIC/S3 remain post-v1, but polymorphism is now proven over a real kernel pipe, not only RAM. |
+| AC-6 substrate parity | **PENDING** — harness PROVEN; **0 / 3 named substrates** built | The `substrate_conformance<S>` harness is real and passed by `LoopbackSubstrate`, `ResumableSubstrate`, `SocketSubstrate` (UDS), **and `TcpSubstrate`** (real cross-host TCP; `tcp_cross_endpoint_transfers_cofre_byte_for_byte`). **But AC-6 requires the three SPEC-named substrates — shmem / QUIC / object-store-S3 — and those are unbuilt** (#24/#25/#23). The polymorphism *mechanism* is proven over RAM + a kernel pipe + a TCP socket; the *named substrate set* is not yet met. |
 | AC-7 featherweight (GATE-FEATHER) | **DIRECTIONAL** | in-memory substrates hold **no idle resources** (idle ≈ 0 by construction); a real serverless substrate's idle RSS is a deployment measurement → PENDING |
-| AC-8 WAN/resume | **PROVEN** (kill-resume) / **PENDING** (WAN bench vs TCP) | `datarail-acceptance/tests/ac8_resume.rs` — partition + resume-from-last-acked, **0 loss / 0 dup**, in order. The lossy/high-RTT throughput benchmark vs a TCP baseline needs a network substrate → post-v1 |
+| AC-8 WAN/resume | **PARTIAL** — in-memory kill-resume PROVEN; real-socket resume + WAN bench + `bao` PENDING | `ac8_resume.rs` proves partition + resume-from-last-acked, **0 loss / 0 dup**, in order — but over an *in-memory* substrate. The SPEC-11 proof needs (a) a throughput bench on a lossy/high-RTT link **vs the TCP baseline** (`TcpSubstrate` is now that baseline; WAN shim + bench = #26) and (b) **E4 `bao`** chunk-level resume (#27). Whole-cofre cursor resume ≠ bao chunk resume. |
 | AC-9 contract enforcement | **PROVEN** | `datarail-terminal` `ac9_*` — onboarding refusal (never boards) + offloading refusals (contract_fp, post-decrypt record, tampered, forged, route-mismatch), both terminals; case-based (proptest randomization a strengthening TODO) |
 | AC-10 fairness benchmark | **PENDING** | needs **real competitor engines** + the 17-case anti-cheat rig (external infra, task #20). Not faked. |
 
@@ -39,7 +50,7 @@
 | INV-MANIFEST-RECONCILES | **PROVEN** | `verify_delivery` (AC-5) |
 | INV-CONTRACT-SPLIT | **PROVEN** | content contract at the terminal only (AC-9, audit) |
 | INV-DUMB-PIPE | **PROVEN** | substrates hold no keys / do no crypto (audit) |
-| INV-SUBSTRATE-POLYMORPHIC | **PROVEN** | one `substrate_conformance` harness, 2 substrates (AC-6) |
+| INV-SUBSTRATE-POLYMORPHIC | **PROVEN** (mechanism) | one `substrate_conformance` harness, 4 transports (loopback/resumable/UDS/TCP); the 3 *named* substrates (shmem/QUIC/S3) still owed for AC-6 |
 | INV-EPHEMERAL-RAIL | **DIRECTIONAL** | architectural; in-memory substrates; a real ephemeral (serverless) substrate is post-v1 |
 
 ## Standing STOP-THE-LINE for the owner
@@ -51,8 +62,11 @@
 
 ## Summary
 
-**The v1 product is complete and self-consistent:** a provider-blind, tamper-evident, effectively-once data
-rail — sealed cofres with per-cofre X25519-wrapped keys, a dumb polymorphic substrate, smart terminals with
-content-contracts + dead-letter, an offline-verifiable manifest, a `rail.toml` + `datarail` CLI, and an
-end-to-end vertical slice. Everything provable on this hardware is **PROVEN**; performance is **DIRECTIONAL**
-pending representative HW; AC-10 and the GATE-WARP bound are honestly **PENDING** on external resources.
+**v1 is NOT complete — corrected 2026-06-22.** The *spine* is real and PROVEN: sealed cofres with per-cofre
+X25519-wrapped keys, smart terminals with content-contracts + dead-letter, an offline-verifiable manifest, a
+`rail.toml` + `datarail` CLI, effectively-once, and a vertical slice over in-memory + real cross-process/host
+(UDS/TCP) transports. **What v1 still owes (frozen P3 scope, re-opened):** the three SPEC-named substrates
+(shmem #24, QUIC #25, object-store/S3 #23); the AC-8 WAN bench vs the TCP baseline (#26); E4 `bao` chunk
+resume (#27); E3 FASP CC + E5 DoS cookie (#28); AC-9 proptest (#29); the real-hop P5 slice + real
+GATE-FEATHER measurement (#30). Genuinely external (STOP-THE-LINE): GATE-WARP bound + VAES HW (#13), AC-10
+engines (#20), MF-0 trio ratification.
