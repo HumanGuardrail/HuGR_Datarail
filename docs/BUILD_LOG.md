@@ -169,6 +169,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   (GATE-LATENCY/throughput, honest HW labels), AC-8 (WAN/resume — needs a network substrate; likely PENDING),
   AC-10 (PENDING engines), AUDIT-02 (6-lens over the CODE) + DoD.
 
+- 2026-06-22 — **P6 AUDIT + DoD COMPLETE.** 6-lens adversarial code audit (parallel read-only clones, every
+  finding lead-cold-verified) → `docs/design/AUDIT-02.md`: **all 6 INV-* hold**; crypto / parse / effectively-once
+  / dead-letter cores confirmed sound. **5 findings FIXED** (`e74e75c`): [HIGH] random nonce (was `seq`-derived
+  → fork/snapshot `(key,nonce)` reuse risk), [MED] redacted `Debug` on every secret-bearing struct, [LOW-MED]
+  `unframe_batch` alloc cap, [MED] AC-4 DST now fires GC (`gc_lag=3`), [LOW] corrected `gc_lag` doc; 3
+  hardening-TODOs tracked (zeroize, AAD-binding, `Gcm256` gate). **DoD ledger** → `docs/design/DOD-01.md`:
+  AC-1,2,3,4,5(¬TSA),9 + 8/9 INV-* **PROVEN**; AC-6 (harness+2 substrates) & AC-8 (kill-resume) PROVEN, their
+  real-substrate / WAN-bench halves post-v1; AC-7 / GATE-LATENCY / GATE-FEATHER **DIRECTIONAL**; **AC-10 +
+  GATE-WARP bound PENDING** (external engines #20, VAES HW #13). 10 crates · 68 tests · clippy deny(all+pedantic)
+  clean · forbid(unsafe) · no `#[allow]`. **v1 is COMPLETE + AUDITED**; open items are only the honestly-external
+  blockers + the MF-0 trio ratification. (Env: rustup proxy broke mid-session → verified via the toolchain path;
+  see AUDIT-02 env note.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
