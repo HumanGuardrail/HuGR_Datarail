@@ -120,6 +120,20 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   core+crypto+cofre+once+manifest; content-contract enforce; dead-letter — AC-9) + a file/in-mem connector →
   **P5** spec + CLI + the **first vertical slice (MF-4)**.
 
+- 2026-06-22 — **P4 COMPLETE: datarail-terminal merged (`c803e6d`)** — the integration. board (validate →
+  frame RECORD_BATCH → `hmac_blake3` idempotency → `aead_seal` → `cofre::seal`) + offload (verify → contract_fp
+  → `aead_open` → re-validate → `Once::admit` → commit) + reason-coded dead-letter siding + in-mem sink. Built by
+  a clone, **cold-verified** (clippy deny(all+pedantic) clean, **no `#[allow]`** — config→`TerminalConfig`,
+  errors→`DeadLetterReason` at root per C4). **AC-9 proven** (onboarding + offloading refusals → dead-letter,
+  never committed) + **exactly-once** (same cofre 2× → Delivered then Duplicate, sink once). **Full workspace: 7
+  crates, 47 tests green.** Proven cumulatively: **AC-1,2,3,4,5,6,9 + exactly-once**. **PENDING hardening
+  (labeled, not faked):** v1 uses a shared route data-key + `AAD=&[]` + deterministic nonce → the per-cofre
+  **X25519-wrapped key** (SPEC A5) is a later crypto-seam add; `aad=etiqueta` is blocked on the `cofre_id`
+  ordering cycle (resolve when X25519 lands); the core `Terminal` trait impl is deferred (inherent methods used).
+  **NEXT: P5** — datarail-spec (`rail.toml`) + datarail-cli + the **FIRST VERTICAL SLICE (MF-4)**:
+  board→seal→rail(loopback)→verify→offload→manifest receipt, exactly-once + dead-letter, as a passing
+  end-to-end integration test.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
