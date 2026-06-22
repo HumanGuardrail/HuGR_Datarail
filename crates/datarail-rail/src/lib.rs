@@ -855,6 +855,36 @@ mod tests {
         assert!(!CookieGate::new([9u8; 32], 1).verify(addr, &cookie), "a different secret rejects it");
     }
 
+    // ---- GATE-FEATHER: an idle ephemeral substrate holds no standing in-flight state -----------------------
+
+    #[test]
+    fn gate_feather_idle_substrate_retains_nothing() {
+        // An in-process ephemeral substrate is a passive struct — no spawned thread, fd, or timer — so when
+        // there is no work it holds no standing resource. Concretely: across repeated burst→drain→ack cycles
+        // the in-flight count returns to 0 every time (no accumulation of standing state when idle). This is
+        // the architectural half of GATE-FEATHER; a real serverless substrate's idle RSS is a deployment
+        // measurement (DIRECTIONAL/PENDING).
+        let mut loopback = LoopbackSubstrate::new();
+        for _ in 0..5 {
+            for seq in 0..8 {
+                loopback.send(&super::testsupport::cofre_seq(seq)).unwrap();
+            }
+            while let Some(c) = loopback.recv().unwrap() {
+                loopback.ack(c.etiqueta.cofre_id).unwrap();
+            }
+            assert_eq!(loopback.queued_len(), 0, "nothing retained in-flight once drained (idle ≈ 0)");
+        }
+
+        let mut resumable = ResumableSubstrate::new();
+        for seq in 0..8 {
+            resumable.send(&super::testsupport::cofre_seq(seq)).unwrap();
+        }
+        while let Some(c) = resumable.recv().unwrap() {
+            resumable.ack(c.etiqueta.cofre_id).unwrap();
+        }
+        assert_eq!(resumable.inflight(), 0, "all acked ⇒ no standing in-flight state when idle");
+    }
+
     #[test]
     fn resumable_partition_then_resume_redelivers_unacked() {
         let mut sub = ResumableSubstrate::new();

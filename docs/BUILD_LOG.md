@@ -287,6 +287,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   E3 algorithm PROVEN; real-WAN throughput-vs-TCP measurement stays DIRECTIONAL (needs a real lossy link).**
   **13 crates · 95 tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
 
+- 2026-06-22 — **P3 #30: P5 real-hop vertical slice + concrete GATE-FEATHER + truthful DOD-01.** (a)
+  `real_hop_slice.rs` — the full pipe board→seal→**[REAL hop]**→verify→open→admit→commit→**Delivered** over
+  **QUIC** (`loopback_pair`) and the **object-store** (temporally decoupled: source PUTs then drops, a separate
+  dest GETs), records intact, the polymorphic terminals unchanged. (b)
+  `gate_feather_idle_substrate_retains_nothing` — an ephemeral substrate retains **0 in-flight state** across
+  burst→drain→ack cycles (passive struct: no thread/fd/timer); the architectural half of GATE-FEATHER is PROVEN,
+  the real serverless idle-RSS stays DIRECTIONAL/PENDING. (c) **DOD-01 rewritten to the true current state**
+  (banner → "rebuilt for real", AC-6/AC-7/GATE-FEATHER rows, summary). **Every buildable P3/P5 rung is now
+  PROVEN; only shmem (#24, ⛔ owner-blocked) + external items (#13/#20/MF-0) remain.** (acceptance now dev-deps
+  the quic + object-store substrate crates.) **13 crates · 98 tests** green · clippy deny(all+pedantic) ·
+  forbid(unsafe) · no `#[allow]`. Next: #21 final 6-lens audit over the new code.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

@@ -15,3 +15,5 @@ datarail-cofre = { path = "../datarail-cofre" }
 datarail-manifest = { path = "../datarail-manifest" }
 datarail-rail = { path = "../datarail-rail" }
 datarail-terminal = { path = "../datarail-terminal" }
+datarail-substrate-quic = { path = "../datarail-substrate-quic" }
+datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }

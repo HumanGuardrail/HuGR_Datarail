@@ -275,6 +275,8 @@ dependencies = [
  "datarail-crypto",
  "datarail-manifest",
  "datarail-rail",
+ "datarail-substrate-objectstore",
+ "datarail-substrate-quic",
  "datarail-terminal",
 ]
 
