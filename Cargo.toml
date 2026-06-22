@@ -10,6 +10,7 @@ members = [
     "crates/datarail-rail",
     "crates/datarail-terminal",
     "crates/datarail-spec",
+    "crates/datarail-cli",
     "crates/datarail-acceptance",
 ]
 

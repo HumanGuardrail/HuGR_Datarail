@@ -234,6 +234,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-cli"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-crypto",
+ "datarail-manifest",
+ "datarail-rail",
+ "datarail-spec",
+ "datarail-terminal",
+]
+
+[[package]]
 name = "datarail-cofre"
 version = "0.0.0"
 dependencies = [
@@ -280,6 +293,14 @@ dependencies = [
  "datarail-cofre",
  "datarail-core",
  "datarail-crypto",
+]
+
+[[package]]
+name = "datarail-spec"
+version = "0.0.0"
+dependencies = [
+ "datarail-core",
+ "datarail-terminal",
 ]
 
 [[package]]

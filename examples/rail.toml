@@ -1,0 +1,22 @@
+# datarail — example route config (local demo).
+# In production, [keys] carries key-refs / KMS handles, never raw secrets like this.
+
+[route]
+route_id   = "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"   # 16 bytes
+stream_id  = "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"   # 16 bytes
+aead       = "gcm-siv-256"                            # nonce-misuse-resistant default
+guarantee  = "exactly-once"
+
+[onboarding]
+max_record_len  = 4096
+required_prefix = "evt:"
+
+[offloading]
+max_record_len  = 4096
+required_prefix = "evt:"
+
+[keys]
+source_seed    = "0x1111111111111111111111111111111111111111111111111111111111111111"
+dest_seed      = "0x2222222222222222222222222222222222222222222222222222222222222222"
+route_data_key = "0x3333333333333333333333333333333333333333333333333333333333333333"
+tenant_secret  = "0x4444444444444444444444444444444444444444444444444444444444444444"

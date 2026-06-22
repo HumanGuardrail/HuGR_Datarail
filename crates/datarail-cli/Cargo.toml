@@ -1,0 +1,22 @@
+[package]
+name = "datarail-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-cli — the `datarail` binary (validate/keygen/run/verify/ticket), SPEC 09."
+
+[[bin]]
+name = "datarail"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
+datarail-cofre = { path = "../datarail-cofre" }
+datarail-manifest = { path = "../datarail-manifest" }
+datarail-rail = { path = "../datarail-rail" }
+datarail-terminal = { path = "../datarail-terminal" }
+datarail-spec = { path = "../datarail-spec" }
