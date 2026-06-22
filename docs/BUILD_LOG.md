@@ -134,6 +134,17 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   board→seal→rail(loopback)→verify→offload→manifest receipt, exactly-once + dead-letter, as a passing
   end-to-end integration test.
 
+- 2026-06-22 — 🎉 **MF-4 ACHIEVED: first vertical slice GREEN (`780053e`).** `datarail-acceptance` e2e test:
+  `SourceTerminal::board` → seal → `LoopbackSubstrate` (rail) send/recv → `DestTerminal::offload` = **Delivered**
+  (records committed once); the **offline manifest delivery-proof verifies** (BLK-8 `cofre_id` recompute);
+  **replay the same cofre → Duplicate** (exactly-once, sink unchanged); **tampered carga → DeadLettered**
+  (siding, never committed). **The whole pipe moves data end-to-end: exactly-once, tamper-rejected, provable.**
+  Full workspace: **8 crates, 48 tests green, clippy deny(all+pedantic) clean.** Proven: AC-1,2,3,4,5,6,9 +
+  exactly-once + the end-to-end slice. **NEXT (P5 surface → P6):** datarail-spec (`rail.toml`) + datarail-cli
+  (run/validate/keygen/ticket/verify) → then GATE-FEATHER/GATE-LATENCY measurement, AC-8 (WAN/resume — needs a
+  network substrate beyond loopback), AC-10 fairness benchmark, final 6-lens audit over the CODE. Standing
+  PENDING/STOP-THE-LINE unchanged (X25519 key-wrap, GATE-WARP on VAES HW, AC-10 engines, trio §6 ratification).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
