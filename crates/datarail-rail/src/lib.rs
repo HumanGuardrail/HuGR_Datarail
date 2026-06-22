@@ -516,6 +516,143 @@ impl<S: Substrate> Substrate for WanLink<S> {
     }
 }
 
+/// E3 — FASP-style **delay-based** congestion control (SPEC 07): a sender-side rate window that reacts to
+/// measured **queueing delay** (RTT inflation above the path's base RTT), *not* to packet loss. A large
+/// transfer over a lossy / high-RTT WAN therefore does not collapse the way loss-based TCP does — loss is
+/// recovered by retransmission (`bao` resume, E4), never by cutting the rate. Pure state machine: feed it RTT
+/// samples and (observed-only) loss events; it owns no I/O.
+pub mod congestion {
+    use std::time::Duration;
+
+    /// A delay-based congestion-window controller (TCP-Vegas / BBR-like).
+    #[derive(Debug, Clone)]
+    pub struct DelayController {
+        base_rtt: Duration,
+        window: f64,
+        min_window: f64,
+        max_window: f64,
+        increase: f64,
+        decrease: f64,
+        queue_threshold: Duration,
+        losses: u64,
+    }
+
+    impl DelayController {
+        /// A controller starting at `init_window` (clamped to `[min_window, max_window]`), treating queueing
+        /// delay above `queue_threshold` as congestion. `base_rtt` starts at the maximum and is pulled down by
+        /// observed samples (the learned uncongested path delay).
+        #[must_use]
+        pub fn new(init_window: f64, min_window: f64, max_window: f64, queue_threshold: Duration) -> Self {
+            Self {
+                base_rtt: Duration::MAX,
+                window: init_window.clamp(min_window, max_window),
+                min_window,
+                max_window,
+                increase: 1.0,
+                decrease: 0.85,
+                queue_threshold,
+                losses: 0,
+            }
+        }
+
+        /// The current congestion window (cofres the sender may keep outstanding).
+        #[must_use]
+        pub fn window(&self) -> f64 {
+            self.window
+        }
+
+        /// The learned base (uncongested) RTT.
+        #[must_use]
+        pub fn base_rtt(&self) -> Duration {
+            self.base_rtt
+        }
+
+        /// Observed losses so far — recorded for visibility but **deliberately not acted on** (see [`on_loss`]).
+        ///
+        /// [`on_loss`]: Self::on_loss
+        #[must_use]
+        pub fn losses(&self) -> u64 {
+            self.losses
+        }
+
+        /// Feed one RTT sample: learn the base RTT, then **additively grow** the window while the queue is
+        /// shallow and **multiplicatively shrink** it once queueing delay exceeds the threshold (the
+        /// delay-based congestion signal).
+        pub fn on_rtt_sample(&mut self, rtt: Duration) {
+            if rtt < self.base_rtt {
+                self.base_rtt = rtt;
+            }
+            let queue = rtt.saturating_sub(self.base_rtt);
+            if queue > self.queue_threshold {
+                self.window = (self.window * self.decrease).max(self.min_window);
+            } else {
+                self.window = (self.window + self.increase).min(self.max_window);
+            }
+        }
+
+        /// Record a packet loss. **Delay-based control does not treat loss as congestion** — the rate window is
+        /// left unchanged (the lost cofre/chunk is recovered by retransmission / `bao` resume, E4). This is the
+        /// FASP physics that decouples throughput from loss; loss-based TCP would halve here. The loss is
+        /// counted for observability only.
+        pub fn on_loss(&mut self) {
+            self.losses += 1;
+        }
+    }
+}
+
+/// E5 — stateless **proof-of-IP cookie** denial-of-service defense (SPEC 07; `WireGuard` `mac1`/`mac2` style). A scale-to-zero
+/// rail endpoint must not allocate per-connection state for a *spoofed* flood: on an unauthenticated
+/// initiation it returns a stateless cookie `HMAC(secret, client_addr ‖ epoch)` and allocates **nothing**, and
+/// only proceeds once the initiator **echoes a valid cookie** — which a source lying about its address cannot
+/// produce. The secret never leaves the endpoint; bumping `epoch` expires outstanding cookies. This is
+/// connection *admission*, separate from the dumb substrate (it touches no cofre, holds no cofre key).
+pub mod admission {
+    use datarail_crypto::hmac_blake3;
+
+    /// A stateless cookie gate: an endpoint secret bound to the current epoch.
+    #[derive(Debug, Clone)]
+    pub struct CookieGate {
+        secret: [u8; 32],
+        epoch: u64,
+    }
+
+    impl CookieGate {
+        /// A gate keyed by `secret` at `epoch` (bump the epoch to rotate / expire outstanding cookies).
+        #[must_use]
+        pub fn new(secret: [u8; 32], epoch: u64) -> Self {
+            Self { secret, epoch }
+        }
+
+        /// Issue a stateless cookie for `client_addr` = `HMAC(secret, addr ‖ epoch_le)`. Allocates no state.
+        #[must_use]
+        pub fn issue(&self, client_addr: &[u8]) -> [u8; 32] {
+            hmac_blake3(&self.secret, &cookie_preimage(client_addr, self.epoch))
+        }
+
+        /// Constant-time check that `cookie` is the one this gate would issue for `client_addr` at this epoch.
+        /// A spoofed source (wrong `client_addr`), a forged cookie, the wrong secret, or an expired epoch all
+        /// fail — so connection state is allocated only after a genuine round-trip to the claimed address.
+        #[must_use]
+        pub fn verify(&self, client_addr: &[u8], cookie: &[u8; 32]) -> bool {
+            ct_eq(&self.issue(client_addr), cookie)
+        }
+    }
+
+    /// The cookie preimage: `client_addr ‖ epoch_le`.
+    fn cookie_preimage(client_addr: &[u8], epoch: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(client_addr.len() + 8);
+        buf.extend_from_slice(client_addr);
+        buf.extend_from_slice(&epoch.to_le_bytes());
+        buf
+    }
+
+    /// Constant-time equality for two 32-byte tags — folds over all bytes with no early return, so it leaks no
+    /// timing oracle on the MAC.
+    fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+        a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    }
+}
+
 /// Shared cofre fixtures — `pub` so downstream substrate crates can reuse them in the same harness.
 pub mod testsupport {
     use datarail_cofre::seal;
@@ -657,6 +794,65 @@ mod tests {
             t.elapsed() >= std::time::Duration::from_millis(20),
             "recv waited out the simulated WAN latency"
         );
+    }
+
+    // ---- E3 delay-based congestion control ------------------------------------------------------------------
+
+    #[test]
+    fn cc_backs_off_under_queue_buildup() {
+        use super::congestion::DelayController;
+        use std::time::Duration;
+        let mut cc = DelayController::new(20.0, 1.0, 100.0, Duration::from_millis(5));
+        cc.on_rtt_sample(Duration::from_millis(10)); // learn base RTT = 10 ms (queue 0 → grow)
+        let before = cc.window();
+        cc.on_rtt_sample(Duration::from_millis(50)); // queue = 40 ms > 5 ms threshold → back off
+        assert!(cc.window() < before, "delay-based CC shrinks the window on queue build-up");
+    }
+
+    #[test]
+    fn cc_ignores_loss_unlike_loss_based_tcp() {
+        use super::congestion::DelayController;
+        use std::time::Duration;
+        let mut cc = DelayController::new(20.0, 1.0, 100.0, Duration::from_millis(5));
+        let w = cc.window();
+        cc.on_loss();
+        cc.on_loss();
+        cc.on_loss();
+        assert!((cc.window() - w).abs() < f64::EPSILON, "loss must NOT cut the rate (FASP physics)");
+        assert_eq!(cc.losses(), 3, "losses observed for visibility, not acted on");
+    }
+
+    #[test]
+    fn cc_grows_while_uncongested_and_clamps_to_max() {
+        use super::congestion::DelayController;
+        use std::time::Duration;
+        let mut cc = DelayController::new(1.0, 1.0, 5.0, Duration::from_millis(5));
+        for _ in 0..20 {
+            cc.on_rtt_sample(Duration::from_millis(10)); // always uncongested → additive increase
+        }
+        assert!((cc.window() - 5.0).abs() < f64::EPSILON, "window grows but clamps at max_window");
+    }
+
+    // ---- E5 DoS proof-of-IP cookie --------------------------------------------------------------------------
+
+    #[test]
+    fn cookie_valid_admits_spoofed_and_forged_rejected() {
+        use super::admission::CookieGate;
+        let gate = CookieGate::new([7u8; 32], 1);
+        let real = b"203.0.113.7:51000";
+        let cookie = gate.issue(real);
+        assert!(gate.verify(real, &cookie), "a genuine round-trip cookie admits");
+        assert!(!gate.verify(b"198.51.100.9:40000", &cookie), "a spoofed source address fails");
+        assert!(!gate.verify(real, &[0u8; 32]), "a forged cookie fails");
+    }
+
+    #[test]
+    fn cookie_rotates_on_epoch_and_secret() {
+        use super::admission::CookieGate;
+        let addr = b"203.0.113.7:51000";
+        let cookie = CookieGate::new([7u8; 32], 1).issue(addr);
+        assert!(!CookieGate::new([7u8; 32], 2).verify(addr, &cookie), "an epoch bump expires the cookie");
+        assert!(!CookieGate::new([9u8; 32], 1).verify(addr, &cookie), "a different secret rejects it");
     }
 
     #[test]

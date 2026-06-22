@@ -11,7 +11,5 @@ workspace = true
 [dependencies]
 datarail-core = { path = "../datarail-core" }
 datarail-cofre = { path = "../datarail-cofre" }
-
-[dev-dependencies]
-# Existing path dep: AC-1 tests verify the metamorphic re-seals are genuinely valid (verifying_key/verify).
+# E5 DoS proof-of-IP cookie uses hmac_blake3; AC-1 tests also use verifying_key/verify.
 datarail-crypto = { path = "../datarail-crypto" }

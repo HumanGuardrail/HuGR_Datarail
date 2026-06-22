@@ -274,6 +274,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   live wiring into the substrate send/recv path is a future integration. AC-8 row updated. **13 crates · 90
   tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
 
+- 2026-06-22 — **P3 #28: E3 FASP delay-based CC + E5 DoS proof-of-IP cookie** (both in datarail-rail, std-only).
+  **E3 `congestion::DelayController`** — a TCP-Vegas/BBR-like sender window that grows additively while
+  queueing delay (RTT above the learned base RTT) is shallow and shrinks multiplicatively once it crosses a
+  threshold; `on_loss()` **deliberately does not cut the rate** (loss is recovered by `bao` resume, not treated
+  as congestion) — the FASP physics that decouples throughput from loss. Tested: backs-off-under-queue-buildup,
+  **loss-does-not-cut-rate** (vs loss-based TCP halving), grows-and-clamps-to-max. **E5 `admission::CookieGate`**
+  — a stateless `HMAC(secret, client_addr ‖ epoch)` proof-of-IP cookie (`WireGuard` mac-style): the endpoint
+  issues it with zero allocated state and only proceeds on a valid echo, so a spoofed-address flood can't make
+  it allocate state; constant-time compare; epoch/secret rotation expires cookies. Tested: valid-admits,
+  spoofed/forged-rejected, epoch+secret rotation. (rail now deps datarail-crypto for `hmac_blake3`.) **AC-8 (d)
+  E3 algorithm PROVEN; real-WAN throughput-vs-TCP measurement stays DIRECTIONAL (needs a real lossy link).**
+  **13 crates · 95 tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
