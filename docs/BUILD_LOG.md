@@ -261,6 +261,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   loopback) is #28; bao chunk-resume is #27. **13 crates · 84 tests** green · clippy deny(all+pedantic) ·
   forbid(unsafe) · no `#[allow]`.
 
+- 2026-06-22 — **P3 #27: E4 BLAKE3 verified-streaming chunk resume (`manifest::bao`).** The `bao` crate is not
+  cached (offline), so rather than hand-roll crypto I **built it on this crate's proven BLAKE3 Merkle tree**
+  (which SPEC 07 explicitly ties E4's root to — "the same root as the 04 receipt"). A payload is split into
+  fixed-size chunks; each chunk is an **index-bound** Merkle leaf (`chunk_leaf = BLAKE3(ctx ‖ index ‖ total ‖
+  bytes)` — binds content + position + count, so a chunk can't be replayed at a different index/payload). The
+  tree root is the authenticated commitment; `ChunkReceiver` authenticates every chunk against the root via its
+  inclusion proof, tracks a received-chunk bitfield, and on resume requests **only the missing** chunks. 6
+  tests: round-trip reassembly, **partial-then-resume** (receive evens → `missing()` = odds → resume →
+  reassembles byte-for-byte), tamper-rejected, wrong-index-rejected (index/proof cross-check + leaf binding),
+  cross-payload-unauthenticated, empty-payload round-trip. Reuses proven Merkle code (no new crypto surface);
+  live wiring into the substrate send/recv path is a future integration. AC-8 row updated. **13 crates · 90
+  tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

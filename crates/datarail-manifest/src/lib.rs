@@ -483,6 +483,286 @@ pub fn verify_delivery(p: &DeliveryProof<'_>) -> Result<(), ManifestError> {
     verify_ack(p.ack, p.dest_vk, p.route_id, p.stream_id, p.seq, p.epoch, &p.sth.root)
 }
 
+/// E4 — BLAKE3 verified-streaming **chunk resume** (SPEC 07), built on this crate's Merkle tree.
+///
+/// A large cofre's `carga` is split into fixed-size chunks; each chunk is an **index-bound** Merkle leaf and
+/// the tree root is the authenticated commitment (the *same* machinery as the 04 manifest receipt root). A
+/// receiver verifies every chunk against the root via its inclusion proof, tracks received chunks in a
+/// bitfield, and on resume requests **only the missing** chunks — authenticating each incrementally, so a dead
+/// rail can re-spawn and safely complete from a partial/untrusted source. A tampered chunk (or one replayed at
+/// the wrong index, or from a different payload's tree) fails authentication and is rejected.
+pub mod bao {
+    use datarail_crypto::blake3_256;
+
+    use super::{verify_inclusion, InclusionProof, ManifestLog};
+
+    /// Default chunk size (64 KiB) — bounded by the SPEC-02 max-cofre-size; a payload below this is one chunk.
+    pub const CHUNK_SIZE: usize = 64 * 1024;
+
+    /// Domain tag separating chunk leaves from the manifest's cofre leaves.
+    const CHUNK_LEAF_CTX: &[u8] = b"dr:bao:chunk:v1";
+
+    /// The index-bound leaf for chunk `index` of `total`: binds content **and** position **and** the chunk
+    /// count, so a chunk cannot be replayed at a different index, count, or payload tree.
+    #[must_use]
+    pub fn chunk_leaf(index: usize, total: usize, bytes: &[u8]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(CHUNK_LEAF_CTX.len() + 16 + bytes.len());
+        buf.extend_from_slice(CHUNK_LEAF_CTX);
+        buf.extend_from_slice(&(index as u64).to_le_bytes());
+        buf.extend_from_slice(&(total as u64).to_le_bytes());
+        buf.extend_from_slice(bytes);
+        blake3_256(&buf)
+    }
+
+    /// One authenticated chunk on the wire: its index, bytes, and inclusion proof against the root.
+    #[derive(Debug, Clone)]
+    pub struct ChunkPiece {
+        /// Zero-based chunk index.
+        pub index: usize,
+        /// The chunk's bytes.
+        pub bytes: Vec<u8>,
+        /// Inclusion proof of this chunk's index-bound leaf against the committed root.
+        pub proof: InclusionProof,
+    }
+
+    /// A commitment to a chunked payload: the Merkle `root`, the `total` chunk count, and the authenticated
+    /// `pieces` ready to stream.
+    #[derive(Debug, Clone)]
+    pub struct Committed {
+        /// BLAKE3 Merkle root over the index-bound chunk leaves (the authenticated commitment).
+        pub root: [u8; 32],
+        /// Number of chunks.
+        pub total: usize,
+        /// Every chunk + its inclusion proof, in index order.
+        pub pieces: Vec<ChunkPiece>,
+    }
+
+    /// Why a chunk was rejected by [`ChunkReceiver::accept`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BaoError {
+        /// The chunk's index is `>= total`.
+        IndexOutOfRange,
+        /// The wire `index` disagrees with the proof's bound index.
+        ProofIndexMismatch,
+        /// The leaf + proof did not re-derive the trusted root (tampered / wrong index / wrong payload).
+        Unauthenticated,
+        /// [`ChunkReceiver::reassemble`] was called before every chunk had arrived.
+        Incomplete,
+    }
+
+    impl core::fmt::Display for BaoError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let s = match self {
+                Self::IndexOutOfRange => "chunk index out of range",
+                Self::ProofIndexMismatch => "chunk index disagrees with its proof",
+                Self::Unauthenticated => "chunk failed authentication against the root",
+                Self::Incomplete => "cannot reassemble: chunks still missing",
+            };
+            f.write_str(s)
+        }
+    }
+
+    impl core::error::Error for BaoError {}
+
+    /// Split `data` into chunks of `chunk_size` (min 1) and commit them to a BLAKE3 Merkle root. An empty
+    /// payload yields a single empty chunk so the tree (and round-trip) is well-defined.
+    #[must_use]
+    pub fn split_and_commit(data: &[u8], chunk_size: usize) -> Committed {
+        let mut chunks: Vec<&[u8]> = data.chunks(chunk_size.max(1)).collect();
+        if chunks.is_empty() {
+            chunks.push(data); // empty payload → one empty chunk
+        }
+        let total = chunks.len();
+        let mut log = ManifestLog::new();
+        for (i, c) in chunks.iter().enumerate() {
+            log.append_leaf(chunk_leaf(i, total, c));
+        }
+        let root = log.root();
+        let mut pieces = Vec::with_capacity(total);
+        for (i, c) in chunks.iter().enumerate() {
+            // `i < total == leaf count`, so the proof is infallible here; skip-on-Err avoids an unwrap.
+            if let Ok(proof) = log.inclusion_proof(i) {
+                pieces.push(ChunkPiece {
+                    index: i,
+                    bytes: (*c).to_vec(),
+                    proof,
+                });
+            }
+        }
+        Committed { root, total, pieces }
+    }
+
+    /// A resumable chunk receiver: the trusted `root` + `total`, a received-chunk bitfield, and the reassembly
+    /// buffer. Every chunk is authenticated against the root before it is stored.
+    #[derive(Debug, Clone)]
+    pub struct ChunkReceiver {
+        root: [u8; 32],
+        total: usize,
+        slots: Vec<Option<Vec<u8>>>,
+    }
+
+    impl ChunkReceiver {
+        /// A fresh receiver for a payload of `total` chunks committed to `root`.
+        #[must_use]
+        pub fn new(root: [u8; 32], total: usize) -> Self {
+            Self {
+                root,
+                total,
+                slots: vec![None; total],
+            }
+        }
+
+        /// Accept a chunk iff its index-bound leaf + inclusion proof re-derive the trusted root. Idempotent: a
+        /// re-accepted chunk simply overwrites its (identical, already-verified) slot.
+        ///
+        /// # Errors
+        /// [`BaoError::IndexOutOfRange`], [`BaoError::ProofIndexMismatch`], or [`BaoError::Unauthenticated`].
+        pub fn accept(&mut self, piece: &ChunkPiece) -> Result<(), BaoError> {
+            if piece.index >= self.total {
+                return Err(BaoError::IndexOutOfRange);
+            }
+            if piece.proof.index != piece.index {
+                return Err(BaoError::ProofIndexMismatch);
+            }
+            let leaf = chunk_leaf(piece.index, self.total, &piece.bytes);
+            if !verify_inclusion(&leaf, &piece.proof, &self.root) {
+                return Err(BaoError::Unauthenticated);
+            }
+            self.slots[piece.index] = Some(piece.bytes.clone());
+            Ok(())
+        }
+
+        /// Whether chunk `index` has been received and authenticated.
+        #[must_use]
+        pub fn has(&self, index: usize) -> bool {
+            self.slots.get(index).is_some_and(Option::is_some)
+        }
+
+        /// The indices still missing — the resume request set.
+        #[must_use]
+        pub fn missing(&self) -> Vec<usize> {
+            (0..self.total).filter(|&i| self.slots[i].is_none()).collect()
+        }
+
+        /// Whether every chunk has arrived.
+        #[must_use]
+        pub fn is_complete(&self) -> bool {
+            self.slots.iter().all(Option::is_some)
+        }
+
+        /// Reassemble the original bytes once every chunk has been authenticated.
+        ///
+        /// # Errors
+        /// [`BaoError::Incomplete`] if any chunk is still missing.
+        pub fn reassemble(&self) -> Result<Vec<u8>, BaoError> {
+            if !self.is_complete() {
+                return Err(BaoError::Incomplete);
+            }
+            let mut out = Vec::new();
+            for bytes in self.slots.iter().flatten() {
+                out.extend_from_slice(bytes);
+            }
+            Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{split_and_commit, BaoError, ChunkReceiver};
+
+        /// Deterministic payload of `n` bytes.
+        fn payload(n: usize) -> Vec<u8> {
+            (0..n).map(|i| u8::try_from(i % 251).unwrap_or(0)).collect()
+        }
+
+        #[test]
+        fn round_trip_all_chunks_reassemble() {
+            let data = payload(200); // 13 chunks at size 16
+            let c = split_and_commit(&data, 16);
+            assert_eq!(c.total, 13);
+            let mut rx = ChunkReceiver::new(c.root, c.total);
+            for piece in &c.pieces {
+                rx.accept(piece).expect("authentic chunk accepted");
+            }
+            assert!(rx.is_complete());
+            assert_eq!(rx.reassemble().expect("complete"), data);
+        }
+
+        #[test]
+        fn partial_then_resume_reassembles() {
+            // A dead rail received only the even chunks; on resume it requests exactly the missing (odd) ones.
+            let data = payload(200);
+            let c = split_and_commit(&data, 16);
+            let mut rx = ChunkReceiver::new(c.root, c.total);
+
+            for piece in c.pieces.iter().filter(|p| p.index % 2 == 0) {
+                rx.accept(piece).expect("even chunk");
+            }
+            assert!(!rx.is_complete());
+            let missing = rx.missing();
+            assert!(missing.iter().all(|i| i % 2 == 1), "only odd chunks remain: {missing:?}");
+            assert_eq!(rx.reassemble(), Err(BaoError::Incomplete));
+
+            // Resume: deliver exactly the missing chunks.
+            for &i in &missing {
+                rx.accept(&c.pieces[i]).expect("resumed chunk");
+            }
+            assert!(rx.is_complete());
+            assert_eq!(rx.reassemble().expect("complete"), data, "partial + resume reassembles the original");
+        }
+
+        #[test]
+        fn tampered_chunk_is_rejected() {
+            let data = payload(100);
+            let c = split_and_commit(&data, 16);
+            let mut rx = ChunkReceiver::new(c.root, c.total);
+            let mut bad = c.pieces[2].clone();
+            bad.bytes[0] ^= 0x01; // flip one byte
+            assert_eq!(rx.accept(&bad), Err(BaoError::Unauthenticated), "a tampered chunk is rejected");
+            assert!(!rx.has(2));
+        }
+
+        #[test]
+        fn chunk_replayed_at_wrong_index_is_rejected() {
+            let data = payload(100);
+            let c = split_and_commit(&data, 16);
+            let mut rx = ChunkReceiver::new(c.root, c.total);
+
+            // Same bytes+proof but a lying wire index → caught by the index/proof cross-check.
+            let mut relabelled = c.pieces[2].clone();
+            relabelled.index = 3;
+            assert_eq!(rx.accept(&relabelled), Err(BaoError::ProofIndexMismatch));
+
+            // Another chunk's bytes presented under index 2's identity → leaf mismatch → unauthenticated.
+            let mut swapped = c.pieces[2].clone();
+            swapped.bytes = c.pieces[3].bytes.clone();
+            assert_eq!(rx.accept(&swapped), Err(BaoError::Unauthenticated));
+        }
+
+        #[test]
+        fn chunk_from_a_different_payload_is_unauthenticated() {
+            let c1 = split_and_commit(&payload(100), 16);
+            let c2 = split_and_commit(&payload(100), 16); // identical bytes here…
+            let c3 = split_and_commit(b"a totally different payload entirely", 16);
+            // Same content ⇒ same root (content-addressed), so c2's piece verifies against c1's root…
+            let mut rx = ChunkReceiver::new(c1.root, c1.total);
+            assert_eq!(rx.accept(&c2.pieces[0]), Ok(()));
+            // …but a piece from a genuinely different payload does not.
+            let mut rx3 = ChunkReceiver::new(c1.root, c1.total);
+            assert_eq!(rx3.accept(&c3.pieces[0]), Err(BaoError::Unauthenticated));
+        }
+
+        #[test]
+        fn empty_payload_round_trips() {
+            let c = split_and_commit(&[], 16);
+            assert_eq!(c.total, 1, "empty payload is one empty chunk");
+            let mut rx = ChunkReceiver::new(c.root, c.total);
+            rx.accept(&c.pieces[0]).expect("empty chunk");
+            assert_eq!(rx.reassemble().expect("complete"), Vec::<u8>::new());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
