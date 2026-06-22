@@ -271,9 +271,16 @@ impl<S: std::io::Read + std::io::Write> Substrate for StreamSubstrate<S> {
     /// Serialize the cofre (wire codec) and write a `u32`-length-prefixed frame to the write half.
     ///
     /// # Errors
-    /// [`std::io::Error`] on a write failure, or if the encoded cofre exceeds a `u32` frame length.
+    /// [`std::io::Error`] on a write failure, or if the encoded cofre exceeds [`MAX_COFRE_WIRE_LEN`]
+    /// ([`datarail_core::MAX_COFRE_WIRE_LEN`]) — the same cap the receiver enforces.
     fn send(&mut self, cofre: &Cofre) -> Result<(), Self::Error> {
         let bytes = datarail_cofre::encode(cofre);
+        if bytes.len() > datarail_core::MAX_COFRE_WIRE_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cofre exceeds the maximum wire size",
+            ));
+        }
         let len = u32::try_from(bytes.len()).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "cofre exceeds u32 frame")
         })?;
@@ -292,7 +299,17 @@ impl<S: std::io::Read + std::io::Write> Substrate for StreamSubstrate<S> {
         loop {
             match self.rx.read(&mut tmp) {
                 Ok(0) => break,
-                Ok(n) => self.buf.extend_from_slice(&tmp[..n]),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&tmp[..n]);
+                    // Bound buffering (AUDIT-03 F1): a peer cannot make us hold more than one max-size frame,
+                    // so a huge declared length or an endless dribble can't exhaust memory.
+                    if self.buf.len() > datarail_core::MAX_COFRE_WIRE_LEN + 4 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stream frame exceeds the maximum cofre size",
+                        ));
+                    }
+                }
                 // WouldBlock (non-blocking fd) and TimedOut (read-timeout fd) both mean "no more right now".
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -310,6 +327,13 @@ impl<S: std::io::Read + std::io::Write> Substrate for StreamSubstrate<S> {
         let mut len_bytes = [0u8; 4];
         len_bytes.copy_from_slice(&self.buf[..4]);
         let len = u32::from_le_bytes(len_bytes) as usize;
+        // Reject an over-large declared frame up front (AUDIT-03 F1), before waiting to buffer its body.
+        if len > datarail_core::MAX_COFRE_WIRE_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream frame length exceeds the maximum cofre size",
+            ));
+        }
         if self.buf.len() < 4 + len {
             return Ok(None); // frame not fully arrived yet
         }
@@ -610,10 +634,21 @@ pub mod admission {
     use datarail_crypto::hmac_blake3;
 
     /// A stateless cookie gate: an endpoint secret bound to the current epoch.
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct CookieGate {
         secret: [u8; 32],
         epoch: u64,
+    }
+
+    // Manual `Debug` that **redacts the secret** (AUDIT-03 F2) — a derived `Debug` would print the endpoint
+    // key, the same leak AUDIT-02 closed for the terminal secrets.
+    impl core::fmt::Debug for CookieGate {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("CookieGate")
+                .field("secret", &"<redacted>")
+                .field("epoch", &self.epoch)
+                .finish()
+        }
     }
 
     impl CookieGate {
@@ -883,6 +918,38 @@ mod tests {
             resumable.ack(c.etiqueta.cofre_id).unwrap();
         }
         assert_eq!(resumable.inflight(), 0, "all acked ⇒ no standing in-flight state when idle");
+    }
+
+    // ---- AUDIT-03 F1: a malicious oversized frame length is rejected, not buffered toward 4 GiB -----------
+
+    #[test]
+    fn oversized_frame_length_is_rejected() {
+        use std::io::Write as _;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Attacker: connect raw and declare a ~4 GiB frame, then dribble a little body.
+        let mut attacker = TcpStream::connect(addr).expect("connect");
+        attacker.write_all(&u32::MAX.to_le_bytes()).expect("write len");
+        attacker.write_all(&[0u8; 1024]).expect("write body");
+        attacker.flush().expect("flush");
+
+        let mut sub = super::TcpSubstrate::accept(&listener).expect("accept");
+        let err = loop {
+            match sub.recv() {
+                Ok(None) => {} // still waiting for bytes to arrive; the loop re-iterates
+                Ok(Some(_)) => panic!("an oversized frame must never decode"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "the substrate rejects an over-large declared frame instead of exhausting memory"
+        );
+        drop(attacker);
     }
 
     #[test]

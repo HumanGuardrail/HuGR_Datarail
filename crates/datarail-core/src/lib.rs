@@ -7,6 +7,12 @@
 //! Invariants embodied here: `INV-OPAQUE-CARGO` (the rail sees only the header + seal),
 //! `INV-SEAL-COMPLETE` (the lacre covers the whole cofre), `INV-DUMB-PIPE` (the substrate holds no keys).
 
+/// The maximum wire-encoded size of a single cofre (the transport frame cap). Framed byte-stream substrates
+/// (TCP / QUIC) refuse to buffer or accept a frame larger than this, bounding memory against a malicious or
+/// buggy peer that declares an enormous length (AUDIT-03 F1). Generous — 64 MiB ≫ any realistic batched cofre —
+/// but finite. The cofre's *logical* max is a SPEC-02 concern; this is the substrate's defensive transport bound.
+pub const MAX_COFRE_WIRE_LEN: usize = 64 * 1024 * 1024;
+
 /// AEAD algorithm selector. **Default = `Gcmsiv256`** (nonce-misuse-resistant — AUDIT-01 BLK-1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AeadAlg {

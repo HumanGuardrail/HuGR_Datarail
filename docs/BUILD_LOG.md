@@ -299,6 +299,22 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   the quic + object-store substrate crates.) **13 crates · 98 tests** green · clippy deny(all+pedantic) ·
   forbid(unsafe) · no `#[allow]`. Next: #21 final 6-lens audit over the new code.
 
+- 2026-06-22 — **#21 FINAL 6-lens audit of the P3 re-open code → `docs/design/AUDIT-03.md`.** Focused
+  self-audit, every finding cold-verified in the cited code. **3 findings, all FIXED at the root:** **F1
+  (MED, memory-DoS)** — the framed substrates (`StreamSubstrate`/Tcp + `QuicSubstrate`) had **no max-frame
+  cap**, so a peer could declare ~4 GiB and force unbounded buffering; added `datarail_core::MAX_COFRE_WIRE_LEN`
+  (64 MiB), both substrates reject `len > MAX` up front + bound the read buffer + `send` enforces it
+  symmetrically (test `oversized_frame_length_is_rejected`). **F2 (LOW-MED)** — `admission::CookieGate` derived
+  `Debug`, leaking the endpoint secret → manual redacted `Debug`. **F3 (LOW)** — object-store `recv` read a
+  whole object uncapped → `metadata().len()` guard before `fs::read`. **Verified sound (not bugs):** the QUIC
+  blind-relay accept-any-cert is correct by design (the seal, not TLS, carries integrity+confidentiality; a
+  MITM sees only ciphertext, tamper caught by the lacre, replay by effectively-once); hex object paths can't
+  traverse; CT cookie compare; bao index/content binding; INV-OPAQUE-CARGO/DUMB-PIPE/SUBSTRATE-POLYMORPHIC all
+  hold for the new substrates. **13 crates · 99 tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no
+  `#[allow]`. **DELIVERY: every buildable P3/P5 rung is now PROVEN + AUDITED.** The only remaining open items
+  are owner/external (shmem #24, GATE-WARP HW #13, AC-10 engines #20, MF-0 trio) — the autonomous build has
+  reached its buildable terminus; those four need the owner.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

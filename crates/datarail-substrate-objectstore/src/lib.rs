@@ -109,6 +109,14 @@ impl Substrate for ObjectStoreSubstrate {
     fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
         for path in self.sorted_objects()? {
             if !self.delivered.contains(&path) {
+                // Bound the read (AUDIT-03 F3): refuse an object larger than one max cofre, so a malicious
+                // storage operator cannot force an unbounded read.
+                if std::fs::metadata(&path)?.len() > datarail_core::MAX_COFRE_WIRE_LEN as u64 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "stored object exceeds the maximum cofre size",
+                    ));
+                }
                 let bytes = std::fs::read(&path)?;
                 let cofre = datarail_cofre::decode(&bytes).map_err(|e| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())

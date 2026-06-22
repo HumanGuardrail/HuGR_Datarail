@@ -2,8 +2,9 @@
 
 > Honest status of every Acceptance Criterion, gate, and invariant, labeled per the SPEC-11 taxonomy:
 > **PROVEN** (self-contained, gated, cold-verified) · **DIRECTIONAL** (measured-but-caveated) · **PENDING**
-> (needs absent resources). 13 crates · 98 tests · clippy `deny(all+pedantic)` clean · `forbid(unsafe)` ·
-> no `#[allow]`. Verified via the toolchain directly (see AUDIT-02 env note).
+> (needs absent resources). 13 crates · 99 tests · clippy `deny(all+pedantic)` clean · `forbid(unsafe)` ·
+> no `#[allow]`. Verified via the toolchain directly (see AUDIT-02 env note). **The P3 re-open code is audited
+> — AUDIT-03 (3 findings: F1 frame-cap MED, F2 cookie-Debug-redact, F3 object-size-cap; all FIXED).**
 >
 > ## ⚠️ CORRECTION (2026-06-22) — P3 was RE-OPENED, then rebuilt for real
 >

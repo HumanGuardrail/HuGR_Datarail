@@ -272,6 +272,12 @@ async fn send_frame(
     stream: &mut Option<quinn::SendStream>,
     bytes: &[u8],
 ) -> io::Result<()> {
+    if bytes.len() > datarail_core::MAX_COFRE_WIRE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cofre exceeds the maximum wire size",
+        ));
+    }
     if stream.is_none() {
         *stream = Some(conn.open_uni().await.map_err(io::Error::other)?);
     }
@@ -318,6 +324,13 @@ async fn fill_buf(
     match tokio::time::timeout(STEP_TIMEOUT, s.read(&mut tmp)).await {
         Ok(Ok(Some(n))) if n > 0 => {
             buf.extend_from_slice(&tmp[..n]);
+            // Bound buffering (AUDIT-03 F1): never hold more than one max-size frame.
+            if buf.len() > datarail_core::MAX_COFRE_WIRE_LEN + 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stream frame exceeds the maximum cofre size",
+                ));
+            }
             Ok(true)
         }
         Ok(Err(e)) => Err(io::Error::other(e)),
@@ -334,6 +347,13 @@ fn decode_frame(buf: &mut Vec<u8>) -> io::Result<Option<Cofre>> {
     let mut len_bytes = [0u8; 4];
     len_bytes.copy_from_slice(&buf[..4]);
     let len = u32::from_le_bytes(len_bytes) as usize;
+    // Reject an over-large declared frame up front (AUDIT-03 F1).
+    if len > datarail_core::MAX_COFRE_WIRE_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stream frame length exceeds the maximum cofre size",
+        ));
+    }
     if buf.len() < 4 + len {
         return Ok(None);
     }
