@@ -1,0 +1,15 @@
+[package]
+name = "datarail-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-terminal — onboarding/offloading terminals: content contract, seal, dedup, dead-letter (SPEC 06)."
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
+datarail-cofre = { path = "../datarail-cofre" }
+datarail-once = { path = "../datarail-once" }

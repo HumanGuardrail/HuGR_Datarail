@@ -271,6 +271,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-terminal"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-crypto",
+ "datarail-once",
+]
+
+[[package]]
 name = "der"
 version = "0.7.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
