@@ -5,9 +5,18 @@
 
 - **Git HEAD at freeze:** `856502f4d789cd6f7ee823205afab3703c691006` (re-frozen 2026-06-22)
 - **Content hash (sha256 of the 3 contract crates' `lib.rs`, sorted, concatenated):**
-  `22d1f9e442715f922e39bad8d54a5efb3742d9bab8ad5fd219c60477518f54f8`
-- **Size:** 3 crates · 697 lines.
+  `3851940485f2a1fd137c9feec4d4c07047ab0f0db7c576948ad103493cd38179`
+- **Size:** 3 crates · 720 lines.
 - **Re-freeze log:**
+  - 2026-06-22 — **STRUCTURAL** (`datarail-core` + `datarail-cofre`): `Etiqueta` grew `sender_present: bool`
+    + `ts: u64` (SPEC-02 A4 sealed-sender flag + the informational timestamp); `ETIQUETA_LEN` 213→222 +
+    encode/decode. The fine-grained sender identity now rides as an issuer-signed `SENDER_CERT` **inside** the
+    encrypted carga (terminal `SenderCredential` / `issue_sender_cert` / `validate_sender_cert`), invisible to
+    the rail; `ts` is informational-only (stamped 0, never trusted). **Design reconciliation (tech lead):** the
+    SPEC says the cert is "bound to `cofre_id`+epoch", but `cofre_id = BLAKE3(carga)` and the cert lives inside
+    the carga ⇒ a literal binding is **circular**; bound to **`eph_pk`+epoch** instead (per-cofre-unique,
+    lacre-authenticated, pre-seal) — same anti-lift property, non-circular. All dependents updated; 115 tests
+    green. Prior stamp `22d1f9e4…f54f8` @ `856502f`.
   - 2026-06-22 — **STRUCTURAL** (`datarail-core` + `datarail-cofre`): `Etiqueta` grew an `eph_pk: [u8;32]`
     field (the per-cofre ephemeral X25519 public key); `ETIQUETA_LEN` 181→213 + encode/decode. This wires the
     X25519 key-wrap end-to-end — the shared-route-key v1 simplification is now **CLOSED** (fresh per-cofre key,

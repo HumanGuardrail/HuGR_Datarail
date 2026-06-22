@@ -45,7 +45,7 @@ fn aead_aad(e: &Etiqueta) -> Vec<u8> {
         AeadAlg::ChaCha20Poly1305 => 2,
         AeadAlg::Gcm256 => 3,
     };
-    let mut aad = Vec::with_capacity(16 + 16 + 8 + 32 + 32 + 1 + 12 + 32);
+    let mut aad = Vec::with_capacity(16 + 16 + 8 + 32 + 32 + 1 + 12 + 32 + 1 + 8);
     aad.extend_from_slice(&e.route_id);
     aad.extend_from_slice(&e.stream_id);
     aad.extend_from_slice(&e.seq.to_le_bytes());
@@ -54,6 +54,8 @@ fn aead_aad(e: &Etiqueta) -> Vec<u8> {
     aad.push(aead_tag);
     aad.extend_from_slice(&e.nonce);
     aad.extend_from_slice(&e.eph_pk);
+    aad.push(u8::from(e.sender_present));
+    aad.extend_from_slice(&e.ts.to_le_bytes());
     aad
 }
 
@@ -168,6 +170,138 @@ fn unframe_batch(bytes: &[u8]) -> Result<Vec<Vec<u8>>, TerminalError> {
 }
 
 // ----------------------------------------------------------------------------------------------------------
+// Sealed-sender (SPEC-02 A4 / 03 MAJ-4) — the fine-grained sender identity rides ENCRYPTED inside the carga,
+// so the rail never sees it; only the destination, after AEAD-open, validates it.
+// ----------------------------------------------------------------------------------------------------------
+
+/// Fixed on-wire `SENDER_CERT` length: `sender_id(32) ‖ sender_vk(32) ‖ epoch(8) ‖ issuer_sig(64) ‖
+/// sender_sig(64)`.
+const SENDER_CERT_LEN: usize = 32 + 32 + 8 + 64 + 64;
+
+/// Issue a long-lived sender certificate: the **route authority** (issuer) vouches that `sender_id` owns
+/// `sender_vk` for `epoch` — `Ed25519(ctx::CERT, issuer_seed, sender_id ‖ sender_vk ‖ epoch_le)`. Signed once,
+/// offline (SPEC 03 MAJ-4: issuer-signed, **not** self-signed); the destination pins the issuer's verifying key.
+#[must_use]
+pub fn issue_sender_cert(
+    issuer_seed: &[u8; 32],
+    sender_id: &[u8; 32],
+    sender_vk: &[u8; 32],
+    epoch: u64,
+) -> [u8; 64] {
+    datarail_crypto::sign_domain(datarail_crypto::ctx::CERT, issuer_seed, &cert_identity_msg(sender_id, sender_vk, epoch))
+}
+
+/// The issuer-signed preimage: `sender_id ‖ sender_vk ‖ epoch_le`.
+fn cert_identity_msg(sender_id: &[u8; 32], sender_vk: &[u8; 32], epoch: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(72);
+    m.extend_from_slice(sender_id);
+    m.extend_from_slice(sender_vk);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m
+}
+
+/// The per-cofre preimage the sender signs: `eph_pk ‖ epoch_le` — binds the cert to **this** cofre (via its
+/// unique ephemeral key) without the circular dependency a literal `cofre_id` binding would have
+/// (`cofre_id = BLAKE3(carga)`, and the cert is *inside* the carga). See AUDIT-03 / FOOTER-FREEZE.
+fn cert_binding_msg(eph_pk: &[u8; 32], epoch: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(40);
+    m.extend_from_slice(eph_pk);
+    m.extend_from_slice(&epoch.to_le_bytes());
+    m
+}
+
+/// A source terminal's sealed-sender credential: the sender's secret signing identity plus the issuer's
+/// vouching certificate. The sender signs a fresh per-cofre binding over `eph_pk` at board time.
+#[derive(Clone)]
+pub struct SenderCredential {
+    /// The sender principal id (issuer-asserted; dest-visible after open).
+    pub sender_id: [u8; 32],
+    /// The sender's Ed25519 signing seed (per-cofre binding; **secret**).
+    sender_seed: [u8; 32],
+    /// Epoch the issuer cert was minted for (freshness / revocation window).
+    pub epoch: u64,
+    /// The issuer's signature vouching `sender_id ↔ sender_vk @ epoch`.
+    pub issuer_sig: [u8; 64],
+}
+
+impl SenderCredential {
+    /// Build a credential from the sender's signing seed, its id, and a pre-issued `issuer_sig` (from
+    /// [`issue_sender_cert`] over the matching `sender_id`/`sender_vk`/`epoch`).
+    #[must_use]
+    pub fn new(sender_id: [u8; 32], sender_seed: [u8; 32], epoch: u64, issuer_sig: [u8; 64]) -> Self {
+        Self { sender_id, sender_seed, epoch, issuer_sig }
+    }
+
+    /// Encode the wire `SENDER_CERT` for a cofre with ephemeral key `eph_pk`: appends the per-cofre
+    /// `sender_sig = Ed25519(ctx::CERT, sender_seed, eph_pk ‖ epoch_le)`.
+    fn encode(&self, eph_pk: &[u8; 32]) -> Vec<u8> {
+        let sender_vk = datarail_crypto::verifying_key(&self.sender_seed);
+        let sender_sig = datarail_crypto::sign_domain(
+            datarail_crypto::ctx::CERT,
+            &self.sender_seed,
+            &cert_binding_msg(eph_pk, self.epoch),
+        );
+        let mut out = Vec::with_capacity(SENDER_CERT_LEN);
+        out.extend_from_slice(&self.sender_id);
+        out.extend_from_slice(&sender_vk);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.issuer_sig);
+        out.extend_from_slice(&sender_sig);
+        out
+    }
+}
+
+/// Redacting `Debug` (never print the sender signing seed).
+impl core::fmt::Debug for SenderCredential {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SenderCredential")
+            .field("sender_id", &self.sender_id)
+            .field("sender_seed", &"<redacted>")
+            .field("epoch", &self.epoch)
+            .field("issuer_sig", &self.issuer_sig)
+            .finish()
+    }
+}
+
+/// Validate a wire `SENDER_CERT` at the destination against the pinned issuer key and this cofre's `eph_pk`.
+/// Returns the authenticated `sender_id` on success. Both signatures must hold: the **issuer** vouches for the
+/// sender's identity↔key, and the **sender** authorized this specific cofre (via `eph_pk`).
+fn validate_sender_cert(
+    bytes: &[u8],
+    eph_pk: &[u8; 32],
+    pinned_issuer_vk: &[u8; 32],
+) -> Option<[u8; 32]> {
+    if bytes.len() != SENDER_CERT_LEN {
+        return None;
+    }
+    let sender_id: [u8; 32] = bytes[0..32].try_into().ok()?;
+    let sender_vk: [u8; 32] = bytes[32..64].try_into().ok()?;
+    let epoch = u64::from_le_bytes(bytes[64..72].try_into().ok()?);
+    let issuer_sig: [u8; 64] = bytes[72..136].try_into().ok()?;
+    let sender_sig: [u8; 64] = bytes[136..200].try_into().ok()?;
+
+    // (a) the issuer vouches for sender_id ↔ sender_vk @ epoch (route authority, not self-signed).
+    if !datarail_crypto::verify_domain(
+        datarail_crypto::ctx::CERT,
+        pinned_issuer_vk,
+        &cert_identity_msg(&sender_id, &sender_vk, epoch),
+        &issuer_sig,
+    ) {
+        return None;
+    }
+    // (b) the sender authorized THIS cofre (binding over its unique eph_pk).
+    if !datarail_crypto::verify_domain(
+        datarail_crypto::ctx::CERT,
+        &sender_vk,
+        &cert_binding_msg(eph_pk, epoch),
+        &sender_sig,
+    ) {
+        return None;
+    }
+    Some(sender_id)
+}
+
+// ----------------------------------------------------------------------------------------------------------
 // Errors.
 // ----------------------------------------------------------------------------------------------------------
 
@@ -234,6 +368,9 @@ pub enum DeadLetterReason {
     MalformedBatch,
     /// A decrypted record violated the offloading content contract (AC-9, offload side).
     ContractViolation,
+    /// A sealed-sender cofre's `SENDER_CERT` failed validation (bad issuer/sender signature, wrong epoch
+    /// binding, malformed, or no issuer key pinned at the destination) — SPEC-02 A4 / 03 MAJ-4.
+    SenderCertInvalid,
 }
 
 impl core::fmt::Display for DeadLetterReason {
@@ -245,6 +382,7 @@ impl core::fmt::Display for DeadLetterReason {
             Self::OpenFailed => f.write_str("AEAD open failed (tamper/wrong key)"),
             Self::MalformedBatch => f.write_str("decrypted record batch is malformed"),
             Self::ContractViolation => f.write_str("decrypted record violates offloading contract"),
+            Self::SenderCertInvalid => f.write_str("sealed-sender certificate failed validation"),
         }
     }
 }
@@ -386,6 +524,9 @@ pub struct SourceTerminal {
     source_seed: [u8; 32],
     /// Monotonic per-stream sequence counter.
     seq: u64,
+    /// Optional sealed-sender credential (SPEC-02 A4). When set, `board` rides an issuer-signed `SENDER_CERT`
+    /// **inside** the encrypted carga and sets `sender_present`; when `None`, cofres carry no sender identity.
+    sender: Option<SenderCredential>,
 }
 
 /// Redacting `Debug` (AUDIT-02): never print the Ed25519 `source_seed`.
@@ -396,6 +537,7 @@ impl core::fmt::Debug for SourceTerminal {
             .field("contract", &self.contract)
             .field("source_seed", &"<redacted>")
             .field("seq", &self.seq)
+            .field("sender", &self.sender)
             .finish()
     }
 }
@@ -409,7 +551,16 @@ impl SourceTerminal {
             contract,
             source_seed,
             seq: 0,
+            sender: None,
         }
+    }
+
+    /// Enable **sealed-sender** (SPEC-02 A4): every subsequent [`board`](Self::board) rides the issuer-signed
+    /// `SENDER_CERT` encrypted inside the carga, hidden from the rail. Builder-style; returns `self`.
+    #[must_use]
+    pub fn with_sender(mut self, sender: SenderCredential) -> Self {
+        self.sender = Some(sender);
+        self
     }
 
     /// The next sequence number this terminal will assign (the count of cofres boarded so far).
@@ -448,8 +599,19 @@ impl SourceTerminal {
         let (eph_pk, mut data_key) = seal_key(&self.config.dest_x25519_pk, &eph_secret);
         eph_secret.zeroize(); // forward secrecy: wipe the ephemeral secret immediately (AUDIT-02 F4).
 
-        // (5) Build the etiqueta (cofre_id/signer_key_id are stamped by `seal`), then AEAD-seal the batch under
-        // the per-cofre data key with a fresh random nonce and the header bound as AAD (AUDIT-02 F5).
+        // (5) Sealed-sender (SPEC-02 A4): if a credential is configured, prepend the issuer-signed SENDER_CERT
+        // (bound to this cofre's eph_pk) ahead of the RECORD_BATCH — it rides ENCRYPTED, invisible to the rail.
+        let (inner, sender_present) = match &self.sender {
+            Some(cred) => {
+                let mut inner = cred.encode(&eph_pk);
+                inner.extend_from_slice(&batch);
+                (inner, true)
+            }
+            None => (batch, false),
+        };
+
+        // (6) Build the etiqueta (cofre_id/signer_key_id are stamped by `seal`), then AEAD-seal INNER under the
+        // per-cofre data key with a fresh random nonce and the header bound as AAD (AUDIT-02 F5).
         let nonce = Self::fresh_nonce()?;
         let etiqueta = Etiqueta {
             route_id: self.config.route_id,
@@ -462,8 +624,10 @@ impl SourceTerminal {
             nonce,
             signer_key_id: [0u8; 32],
             eph_pk,
+            sender_present,
+            ts: 0, // informational only; never trusted (SPEC-02). A real wall-clock stamp is a deployment concern.
         };
-        let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, &aead_aad(&etiqueta), &batch)?;
+        let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, &aead_aad(&etiqueta), &inner)?;
         data_key.zeroize(); // the per-cofre data key is consumed; wipe it (AUDIT-02 F4).
 
         // (6) Seal (Ed25519 over etiqueta ⊗ carga) and advance the per-stream sequence.
@@ -500,6 +664,11 @@ pub struct DestTerminal {
     pinned_source_vk: [u8; 32],
     /// This destination's X25519 secret — unwraps the per-cofre data key from the cofre's `eph_pk`.
     dest_x25519_secret: [u8; 32],
+    /// Optional pinned **issuer** verifying key for sealed-sender (SPEC-02 A4). A cofre with `sender_present`
+    /// is validated against this; if `None`, such a cofre is dead-lettered (can't validate the claimed sender).
+    sender_issuer_vk: Option<[u8; 32]>,
+    /// The `sender_id` validated on the most recent `Delivered` sealed-sender cofre (observability; dest-only).
+    last_sender_id: Option<[u8; 32]>,
     once: Once,
     sink: Sink,
     dead_letters: DeadLetterSiding,
@@ -514,6 +683,8 @@ impl core::fmt::Debug for DestTerminal {
             .field("contract", &self.contract)
             .field("pinned_source_vk", &self.pinned_source_vk)
             .field("dest_x25519_secret", &"<redacted>")
+            .field("sender_issuer_vk", &self.sender_issuer_vk)
+            .field("last_sender_id", &self.last_sender_id)
             .field("once", &self.once)
             .field("sink", &self.sink)
             .field("dead_letters", &self.dead_letters)
@@ -537,10 +708,28 @@ impl DestTerminal {
             contract,
             pinned_source_vk,
             dest_x25519_secret,
+            sender_issuer_vk: None,
+            last_sender_id: None,
             once: Once::new(dest_seed),
             sink: Sink::new(),
             dead_letters: DeadLetterSiding::new(),
         }
+    }
+
+    /// Pin the sealed-sender **issuer** verifying key (SPEC-02 A4): cofres with `sender_present` are validated
+    /// against it; a valid cert's `sender_id` is exposed via [`last_sender_id`](Self::last_sender_id). Without
+    /// this, a `sender_present` cofre is dead-lettered (the claimed sender cannot be validated). Builder-style.
+    #[must_use]
+    pub fn with_sender_issuer(mut self, issuer_vk: [u8; 32]) -> Self {
+        self.sender_issuer_vk = Some(issuer_vk);
+        self
+    }
+
+    /// The `sender_id` validated on the most recent `Delivered` sealed-sender cofre, if any (dest-only — the
+    /// rail never sees it).
+    #[must_use]
+    pub fn last_sender_id(&self) -> Option<[u8; 32]> {
+        self.last_sender_id
     }
 
     /// The destination's commit sink (records delivered exactly once).
@@ -610,21 +799,44 @@ impl DestTerminal {
             return Ok(Disposition::DeadLettered);
         };
 
-        // (4) Un-frame the RECORD_BATCH; a malformed batch dead-letters.
-        let Ok(records) = unframe_batch(&batch) else {
+        // (4) Sealed-sender (SPEC-02 A4): if the (authenticated) header says a SENDER_CERT rides inside, split
+        // and validate it against the pinned issuer + this cofre's eph_pk; the rest is the RECORD_BATCH. The
+        // rail never saw any of this — it was encrypted. A bad/absent cert dead-letters.
+        let (record_bytes, sender_id): (&[u8], Option<[u8; 32]>) = if cofre.etiqueta.sender_present {
+            let Some(issuer_vk) = self.sender_issuer_vk else {
+                self.dead_letters.push(cofre.clone(), DeadLetterReason::SenderCertInvalid);
+                return Ok(Disposition::DeadLettered);
+            };
+            if batch.len() < SENDER_CERT_LEN {
+                self.dead_letters.push(cofre.clone(), DeadLetterReason::SenderCertInvalid);
+                return Ok(Disposition::DeadLettered);
+            }
+            let (cert, rest) = batch.split_at(SENDER_CERT_LEN);
+            if let Some(sid) = validate_sender_cert(cert, &cofre.etiqueta.eph_pk, &issuer_vk) {
+                (rest, Some(sid))
+            } else {
+                self.dead_letters.push(cofre.clone(), DeadLetterReason::SenderCertInvalid);
+                return Ok(Disposition::DeadLettered);
+            }
+        } else {
+            (&batch, None)
+        };
+
+        // (5) Un-frame the RECORD_BATCH; a malformed batch dead-letters.
+        let Ok(records) = unframe_batch(record_bytes) else {
             self.dead_letters
                 .push(cofre.clone(), DeadLetterReason::MalformedBatch);
             return Ok(Disposition::DeadLettered);
         };
 
-        // (5) Re-validate EVERY record against the offloading contract — any failure dead-letters (AC-9).
+        // (6) Re-validate EVERY record against the offloading contract — any failure dead-letters (AC-9).
         if !records.iter().all(|r| self.contract.validate(r)) {
             self.dead_letters
                 .push(cofre.clone(), DeadLetterReason::ContractViolation);
             return Ok(Disposition::DeadLettered);
         }
 
-        // (6) Effectively-once admission, then commit-on-Delivered only (exactly-once at the sink).
+        // (7) Effectively-once admission, then commit-on-Delivered only (exactly-once at the sink).
         match self.once.admit(
             cofre.etiqueta.stream_id,
             cofre.etiqueta.seq,
@@ -632,6 +844,7 @@ impl DestTerminal {
         ) {
             Disposition::Delivered => {
                 self.sink.commit(records);
+                self.last_sender_id = sender_id; // expose the validated sender (dest-only) on delivery.
                 Ok(Disposition::Delivered)
             }
             // A duplicate is dropped without committing; DeadLettered cannot come from the once gate.

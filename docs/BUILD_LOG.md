@@ -378,6 +378,21 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   working for real** — "define a route, `datarail run`, sealed over the cheapest substrate." Remaining product
   surface: #33 sealed-sender · #34 Noise_KK/PAKE · #35 replay + `--watch`.
 
+- 2026-06-22 — **#33 A4 sealed-sender — the fine-grained sender rides ENCRYPTED inside the carga (+ seam
+  re-freeze).** STRUCTURAL: `Etiqueta` grew `sender_present: bool` + `ts: u64` (`ETIQUETA_LEN` 213→222,
+  encode/decode + AEAD-AAD + all 4 fixtures). When a `SourceTerminal` carries a `SenderCredential`
+  (`with_sender`), `board` prepends an issuer-signed `SENDER_CERT` ahead of the RECORD_BATCH **inside** the
+  AEAD-encrypted carga; the dest (`with_sender_issuer`) validates it after open and exposes the authenticated
+  `sender_id` via `last_sender_id()`. **Two-level, non-circular construction (tech-lead reconciliation):** the
+  SPEC's "bound to `cofre_id`+epoch" is circular (`cofre_id=BLAKE3(carga)`, cert is *in* the carga) → the
+  offline **issuer** vouches `sender_id↔sender_vk@epoch` (`issue_sender_cert`), and the **sender** signs a
+  per-cofre binding over **`eph_pk`** (unique, lacre-authenticated) — same anti-lift property, no online issuer.
+  6 tests: round-trip + sender exposed · **the sender_id never appears in the cleartext wire** (opacity) ·
+  no-issuer-pinned / forged-issuer / wrong-sender-key all dead-lettered (`SenderCertInvalid`) · non-sealed path
+  unchanged. **Seam re-frozen** (FOOTER-FREEZE `3851940485f2…`, 720 lines). **16 crates · 115 tests** green ·
+  clippy deny(all+pedantic) · forbid(unsafe) (shmem waiver only). Remaining product surface: #34 Noise_KK/PAKE
+  · #35 replay + `--watch`.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

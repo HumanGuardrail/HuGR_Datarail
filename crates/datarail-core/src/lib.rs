@@ -52,6 +52,15 @@ pub struct Etiqueta {
     /// `open_key(dest_x25519_secret, eph_pk)`. Authenticated by the `lacre` like every other header field;
     /// `INV-OPAQUE-CARGO` still holds (the rail can read it but cannot derive the key without the dest secret).
     pub eph_pk: [u8; 32],
+    /// Sealed-sender flag (SPEC-02 A4): when `true`, an issuer-signed `SENDER_CERT` rides **inside** the
+    /// encrypted `carga` (ahead of the `RECORD_BATCH`), carrying the fine-grained sender identity that the rail
+    /// must **not** see. The cleartext header still carries only the route-level `signer_key_id` pin; the
+    /// principal is dest-only. `false` ⇒ no cert, the carga is just the `RECORD_BATCH`.
+    pub sender_present: bool,
+    /// Informational source timestamp (ms). **Never trusted** for ordering (that is `seq`) or for proof time
+    /// (that is the manifest STH, SPEC-04). Present for wire-completeness (SPEC-02); a real wall-clock stamp is
+    /// a deployment concern, so the terminal stamps `0` by default.
+    pub ts: u64,
 }
 
 /// A sealed cofre on the wire: `etiqueta` (authenticated) + `carga` (opaque ciphertext) + `lacre` (Ed25519).

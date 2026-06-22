@@ -254,6 +254,117 @@ fn distinct_record_keys_are_both_delivered() {
     assert_eq!(dst.sink().len(), 2);
 }
 
+// ---- A4 sealed-sender: the fine-grained sender rides ENCRYPTED inside the carga (SPEC-02 A4 / 03 MAJ-4) ----
+mod sealed_sender {
+    use super::{config, contract, DEST_SEED, DEST_X_SECRET, SOURCE_SEED};
+    use crate::{issue_sender_cert, DeadLetterReason, DestTerminal, SenderCredential, SourceTerminal};
+    use datarail_core::Disposition;
+    use datarail_crypto::verifying_key;
+
+    const ISSUER_SEED: [u8; 32] = [70u8; 32];
+    const SENDER_SEED: [u8; 32] = [71u8; 32];
+    const SENDER_ID: [u8; 32] = [0xABu8; 32];
+    const EPOCH: u64 = 7;
+
+    /// A source configured with a valid issuer-signed sealed-sender credential.
+    fn sealed_source() -> SourceTerminal {
+        let sender_vk = verifying_key(&SENDER_SEED);
+        let issuer_sig = issue_sender_cert(&ISSUER_SEED, &SENDER_ID, &sender_vk, EPOCH);
+        SourceTerminal::new(config(), contract(), SOURCE_SEED)
+            .with_sender(SenderCredential::new(SENDER_ID, SENDER_SEED, EPOCH, issuer_sig))
+    }
+
+    fn dest_with_issuer(issuer_vk: [u8; 32]) -> DestTerminal {
+        DestTerminal::new(config(), contract(), verifying_key(&SOURCE_SEED), DEST_SEED, DEST_X_SECRET)
+            .with_sender_issuer(issuer_vk)
+    }
+
+    #[test]
+    fn sealed_sender_round_trips_and_dest_validates_the_sender() {
+        let mut src = sealed_source();
+        let mut dst = dest_with_issuer(verifying_key(&ISSUER_SEED));
+        let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
+        assert!(cofre.etiqueta.sender_present, "header flags the sealed sender");
+
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
+        assert_eq!(dst.sink().committed(), &[b"OK:hello".to_vec()]);
+        assert_eq!(dst.last_sender_id(), Some(SENDER_ID), "the dest validated + exposed the sender id");
+        assert!(dst.dead_letters().is_empty());
+    }
+
+    #[test]
+    fn the_rail_never_sees_the_sender_id_in_cleartext() {
+        // INV-OPAQUE-CARGO for the sender: the plaintext sender_id must appear NOWHERE on the wire — it rides
+        // inside the AEAD-encrypted carga, so its raw bytes cannot occur in the encoded cofre.
+        let mut src = sealed_source();
+        let cofre = src.board(&[b"OK:secret-sender"], b"rk").expect("board");
+        let wire = datarail_cofre::encode(&cofre);
+        let appears = wire.windows(SENDER_ID.len()).any(|w| w == SENDER_ID);
+        assert!(!appears, "the sender_id bytes must not be observable in the cleartext wire cofre");
+    }
+
+    #[test]
+    fn sealed_sender_with_no_issuer_pinned_is_dead_lettered() {
+        // A dest that did not pin an issuer cannot validate the claimed sender → dead-letter, never deliver.
+        let mut src = sealed_source();
+        let mut dst = DestTerminal::new(
+            config(),
+            contract(),
+            verifying_key(&SOURCE_SEED),
+            DEST_SEED,
+            DEST_X_SECRET,
+        ); // no with_sender_issuer
+        let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+        assert!(dst.sink().is_empty());
+        assert_eq!(dst.dead_letters().entries()[0].reason, DeadLetterReason::SenderCertInvalid);
+    }
+
+    #[test]
+    fn forged_issuer_is_dead_lettered() {
+        // The cert is validated against the WRONG issuer key (an impostor authority) → fails → dead-letter.
+        let mut src = sealed_source();
+        let mut dst = dest_with_issuer(verifying_key(&[88u8; 32])); // not the real issuer
+        let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+        assert!(dst.sink().is_empty());
+        assert_eq!(dst.dead_letters().entries()[0].reason, DeadLetterReason::SenderCertInvalid);
+        assert_eq!(dst.last_sender_id(), None);
+    }
+
+    #[test]
+    fn a_cert_minted_for_a_different_sender_key_is_rejected() {
+        // The issuer signs sender_id↔sender_vk; if the credential's signing seed does not match the vk the
+        // issuer vouched for, the per-cofre sender binding is signed by the wrong key → validation fails.
+        let real_vk = verifying_key(&SENDER_SEED);
+        let issuer_sig = issue_sender_cert(&ISSUER_SEED, &SENDER_ID, &real_vk, EPOCH);
+        // Credential carries a DIFFERENT signing seed than the one the issuer vouched for.
+        let mut src = SourceTerminal::new(config(), contract(), SOURCE_SEED)
+            .with_sender(SenderCredential::new(SENDER_ID, [0x55u8; 32], EPOCH, issuer_sig));
+        let mut dst = dest_with_issuer(verifying_key(&ISSUER_SEED));
+        let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+        assert_eq!(dst.dead_letters().entries()[0].reason, DeadLetterReason::SenderCertInvalid);
+    }
+
+    #[test]
+    fn non_sealed_sender_still_works_unchanged() {
+        // A plain source (no credential) produces sender_present=false; a plain dest delivers as before.
+        let mut src = SourceTerminal::new(config(), contract(), SOURCE_SEED);
+        let mut dst = DestTerminal::new(
+            config(),
+            contract(),
+            verifying_key(&SOURCE_SEED),
+            DEST_SEED,
+            DEST_X_SECRET,
+        );
+        let cofre = src.board(&[b"OK:plain"], b"rk").expect("board");
+        assert!(!cofre.etiqueta.sender_present);
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
+        assert_eq!(dst.last_sender_id(), None);
+    }
+}
+
 // ---- AC-9 (proptest): the SPEC-11 *named* proof method — randomized conforming/violating cases, both sides --
 mod prop {
     use super::{contract, dest, source, Disposition, TerminalError, MAX_LEN, PREFIX};

@@ -712,6 +712,8 @@ pub mod testsupport {
             nonce: [6; 12],
             signer_key_id: [0; 32],
             eph_pk: [7; 32],
+            sender_present: false,
+            ts: 0,
         }
     }
 
