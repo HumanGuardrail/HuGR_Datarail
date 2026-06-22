@@ -6,6 +6,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use datarail_core::AeadAlg;
+use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XSecret};
 
 /// Ed25519 domain-separation context labels (BLK-5). Each signature role gets a distinct prefix.
 pub mod ctx {
@@ -33,6 +34,56 @@ pub fn blake3_256(data: &[u8]) -> [u8; 32] {
 #[must_use]
 pub fn hmac_blake3(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
     *blake3::keyed_hash(key, msg).as_bytes()
+}
+
+/// Domain-separation label for the X25519 per-cofre key-wrap KDF.
+const KEYWRAP_CTX: &[u8] = b"dr:keywrap:v1";
+
+/// The X25519 public key for a 32-byte secret (a destination's static key-agreement key).
+#[must_use]
+pub fn x25519_public(secret: &[u8; 32]) -> [u8; 32] {
+    XPublicKey::from(&XSecret::from(*secret)).to_bytes()
+}
+
+/// Raw X25519 Diffie–Hellman shared secret between `secret` and `public`.
+fn x25519_shared(secret: &[u8; 32], public: &[u8; 32]) -> [u8; 32] {
+    XSecret::from(*secret)
+        .diffie_hellman(&XPublicKey::from(*public))
+        .to_bytes()
+}
+
+/// Derive the per-cofre data key from the ECDH shared secret, domain-separated and bound to **both** public
+/// keys (so the key cannot be re-targeted by swapping an endpoint).
+fn kdf_data_key(shared: &[u8; 32], eph_public: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 32] {
+    let mut m = Vec::with_capacity(KEYWRAP_CTX.len() + 96);
+    m.extend_from_slice(KEYWRAP_CTX);
+    m.extend_from_slice(shared);
+    m.extend_from_slice(eph_public);
+    m.extend_from_slice(recipient_pk);
+    blake3_256(&m)
+}
+
+/// **Source side** of the per-cofre key-wrap (SPEC 03 / A5): given the destination's X25519 public key and a
+/// fresh random ephemeral secret, derive `(eph_public, data_key)`. The `eph_public` travels in the cofre's
+/// etiqueta; the `data_key` encrypts that one cofre's carga and is **never transmitted**.
+///
+/// A fresh `eph_secret` per cofre ⇒ a fresh `data_key` per cofre — forward-secure once the ephemeral is
+/// discarded, and provider-blind: only the holder of the recipient secret can re-derive it ([`open_key`]).
+#[must_use]
+pub fn seal_key(recipient_pk: &[u8; 32], eph_secret: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let eph_public = x25519_public(eph_secret);
+    let shared = x25519_shared(eph_secret, recipient_pk);
+    let data_key = kdf_data_key(&shared, &eph_public, recipient_pk);
+    (eph_public, data_key)
+}
+
+/// **Destination side** of the per-cofre key-wrap: recover the `data_key` from the cofre's `eph_public` using
+/// the recipient's X25519 secret. Only the holder of `recipient_secret` can derive the key.
+#[must_use]
+pub fn open_key(recipient_secret: &[u8; 32], eph_public: &[u8; 32]) -> [u8; 32] {
+    let shared = x25519_shared(recipient_secret, eph_public);
+    let recipient_pk = x25519_public(recipient_secret);
+    kdf_data_key(&shared, eph_public, &recipient_pk)
 }
 
 fn framed(context: &[u8], msg: &[u8]) -> Vec<u8> {
@@ -164,6 +215,24 @@ mod tests {
         assert_ne!(a, hmac_blake3(&[1u8; 32], b"record-key"));
         assert_ne!(a, hmac_blake3(&KEY, b"other"));
         assert_ne!(a, blake3_256(b"record-key"));
+    }
+
+    #[test]
+    fn x25519_keywrap_round_trips() {
+        // Source seals a per-cofre key to the dest's X25519 public key; only the dest re-derives it.
+        let recipient_secret = [9u8; 32];
+        let recipient_pk = super::x25519_public(&recipient_secret);
+        let (eph_public, k_src) = super::seal_key(&recipient_pk, &[3u8; 32]);
+        assert_eq!(super::open_key(&recipient_secret, &eph_public), k_src, "dest re-derives the key");
+        // A different recipient cannot open it.
+        assert_ne!(super::open_key(&[1u8; 32], &eph_public), k_src);
+        // A tampered ephemeral public key yields a different (wrong) key — AEAD-open would then fail.
+        let mut bad = eph_public;
+        bad[0] ^= 1;
+        assert_ne!(super::open_key(&recipient_secret, &bad), k_src);
+        // A fresh ephemeral per cofre ⇒ a fresh data key.
+        let (_e2, k2) = super::seal_key(&recipient_pk, &[4u8; 32]);
+        assert_ne!(k2, k_src);
     }
 
     #[test]
