@@ -393,6 +393,24 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   clippy deny(all+pedantic) · forbid(unsafe) (shmem waiver only). Remaining product surface: #34 Noise_KK/PAKE
   · #35 replay + `--watch`.
 
+- 2026-06-22 — **#34 `datarail-identity` (F2 Noise_KK + F3 PAKE) — delegated to an agent, COLD-VERIFIED by the
+  lead (`0da2619`).** New quarantined crate: **F2** `Noise_KK` session via `snow` 0.9
+  (`Noise_KK_25519_ChaChaPoly_BLAKE2s`, both statics pinned → mutual auth + forward-secret transport;
+  impostor-pin handshake-fail tested); **F3** SPAKE2 short-code bootstrap via the audited `spake2` crate with all
+  three MAJ-5 hardenings (128-bit single-use `/dev/urandom` code · attempt-cap=3 burn-on-fail (terminal) ·
+  both static pubkeys bound into the PAKE identities + the confirmation transcript). 9 unit + 2 doctests.
+  **Lead cold-verify (security-critical, Rule 5 — read the actual code, didn't trust the card):** re-ran clippy
+  `--workspace` clean + `cargo test --workspace` = **126 green** myself; read `noise.rs` + `pairing.rs` in full.
+  **Accepted the agent's flagged deviation as necessary + correct:** bare `spake2` does NO key confirmation
+  (`finish` returns Ok with a *different* key on a wrong code — so a "failed attempt" is undetectable, which the
+  burn hardening *requires*); the agent added the standard Wormhole/croc confirmation (domain-separated SHA-256
+  tag, role-tagged to block reflection, length-prefixed bound identities, constant-time `subtle` compare) — a
+  textbook KDF-as-MAC over vetted primitives (`sha2`,`subtle`, already in-tree), **not** a hand-rolled PAKE; the
+  tag is one-way over the key so no offline-dictionary oracle. **Optional future hardening (logged, non-blocking):**
+  HKDF-split the SPAKE2 output into distinct confirm-key vs session-key instead of reusing the raw key for both
+  (current construction is sound; this is textbook-cleaner). **17 crates · 126 tests** green · clippy
+  deny(all+pedantic) · forbid(unsafe) (shmem waiver only). Remaining product surface: #35 replay + `--watch`.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

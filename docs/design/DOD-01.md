@@ -2,7 +2,7 @@
 
 > Honest status of every Acceptance Criterion, gate, and invariant, labeled per the SPEC-11 taxonomy:
 > **PROVEN** (self-contained, gated, cold-verified) · **DIRECTIONAL** (measured-but-caveated) · **PENDING**
-> (needs absent resources). **14 crates · 104 tests** · clippy `deny(all+pedantic)` clean. `forbid(unsafe)`
+> (needs absent resources). **17 crates · 126 tests** · clippy `deny(all+pedantic)` clean. `forbid(unsafe)`
 > workspace-wide **except** the quarantined `datarail-substrate-shmem` crate (`deny(unsafe)` + **one** audited
 > `#[allow]` for the shared-memory atomic cursors — owner-delegated WAIVER, `BUILD_LOG` §6 / AUDIT-03).
 > Verified via the toolchain directly (see AUDIT-02 env note). **P3 re-open code audited — AUDIT-03 (F1/F2/F3
@@ -29,7 +29,7 @@
 |---|---|---|
 | AC-1 opaque cargo (metamorphic) | **PROVEN** | `datarail-rail` metamorphic trace test (payload-swap under fixed header ⇒ byte-identical substrate trace) + MF-4 slice |
 | AC-2 tamper-reject | **PROVEN** | `datarail-cofre::ac2_mutate_every_byte_is_rejected` (exhaustive byte-flip — stronger than sampled proptest) |
-| AC-3 forge-reject (differential) | **PROVEN** | `datarail-cofre::ac3_wrong_and_forged_key_rejected` + `datarail-terminal::ac9_forged_cofre_wrong_signer` |
+| AC-3 forge-reject (differential) | **PROVEN** | `datarail-cofre::ac3_wrong_and_forged_key_rejected` + `datarail-terminal::ac9_forged_cofre_wrong_signer`. **Identity layer (F2/F3) now built** (`datarail-identity`): `Noise_KK` mutual-static auth (impostor pin ⇒ handshake fails) + SPAKE2 short-code bootstrap (cold-verified) — the channel-auth counterpart to the per-cofre seal. |
 | AC-4 effectively-once (DST) | **PROVEN** | `datarail-once/tests/ac4_dst.rs` — 1000 seeds, drop/reorder/dup/kill-respawn, **0 loss / 0 dup**, now with `gc_lag=3` so the GC path fires (AUDIT-02 F7) |
 | AC-5 delivery proof (differential) | **PROVEN** (TSA out of scope) | `datarail-manifest` 13 tests (independent root re-derivation + tamper rejection) + MF-4 `verify_delivery`. Bundle = `{inclusion, STH, ack}`; **TSA/RFC-3161 anchoring is async, off the delivery path** (SPEC 04 / MAJ-1) → not in v1 |
 | AC-6 substrate parity | **PROVEN** — harness + **3/3 named substrates** | The `substrate_conformance<S>` harness passes over `LoopbackSubstrate`, `ResumableSubstrate`, `SocketSubstrate` (UDS), `TcpSubstrate`, **and all three SPEC-named substrates: `ShmemRing`** (lock-free SPSC shared-memory ring, µs same-host — cross-mapping/back-pressure/wraparound tested), **`ObjectStoreSubstrate`** (SPEC-10 object store, cross-cloud), **`QuicSubstrate`** (real QUIC, cross-host blind relay). The full board→real-hop→verify→offload→Delivered pipe is proven over **all three** real hops in `real_hop_slice.rs`. |
