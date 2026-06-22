@@ -99,6 +99,15 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   contract freeze (cofre/header/manifest IDL + terminal seam + compilable stubs) → Kage-Bunshin fan-out build of
   the crates (scaffold-first, disjoint WPs, cold-verify each).**
 
+- 2026-06-22 — **P0 + P1 built (real code, not just docs).** P0: ROADMAP + cargo workspace (datarail-core
+  contract crate). P1: **datarail-crypto** (BLAKE3, domain-sep Ed25519, pluggable AEAD GCM-SIV default) +
+  **datarail-cofre** (canonical encode/decode, parse-before-verify, seal/verify). Every crate: `forbid(unsafe)`,
+  clippy **deny(all+pedantic)** clean, tests green. **Proofs PROVEN:** AC-2 (exhaustive every-byte-flip →
+  reject), AC-3 (wrong/forged key → reject), Ed25519 domain-separation, AEAD tamper/AAD reject. Commits
+  `ead8b02` / `c222c30` / `d87dd98`. **NEXT:** FOOTER-FREEZE the core+crypto+cofre contract seam (content-hash)
+  → fan out P2 (manifest+once: AC-5, AC-4 DST) ∥ P3 (rail+substrates: AC-1/6/8, GATE-FEATHER) to background
+  clones → P4 terminals (AC-9) → P5 CLI + first vertical slice (MF-4).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
