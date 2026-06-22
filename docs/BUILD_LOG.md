@@ -482,6 +482,20 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   external physical resources (#13 VAES HW, #20 real engines); remaining v2-class is now just *remote* PAKE
   pairing across two hosts (primitives + the encrypted transport both exist).
 
+- 2026-06-22 — **#38 remote PAKE pairing — the last v2-class buildable item, DONE.** `datarail pair
+  --connect ADDR | --listen ADDR --code <hex> [--my-static <hex>]` runs a **genuine two-process** SPEC-08 F3
+  pairing over TCP: each side mints/loads its own Noise static, the two exchange static **publics** over the
+  socket (initiator writes-first → no deadlock), bind both into the SPAKE2 transcript, run the PAKE + the
+  key-confirmation from the shared short code, and end with the **authenticated** peer static + an agreed
+  secret (printed as a BLAKE3 fingerprint both sides match). A matching code → same fpr + mutual static auth; a
+  **wrong code → confirm-fail + burn-on-fail** (MAJ-5). DRY: factored `bind_announce_accept` (shared with
+  `recv`) + small framed-stream helpers. Proven by `tests/two_process.rs::two_process_remote_pairing_agrees`
+  (two OS processes, same code → matching fpr) + a live demo (matching code → fpr `a1e353f22f20bada` on both
+  sides; wrong code → both confirm-fail). **The whole SPEC-08 identity layer is now real: F2 Noise-hop + F3
+  remote pairing + F4 ticket.** **16 crates · 140 tests** green · clippy deny(all+pedantic) · forbid(unsafe)
+  (one shmem waiver). **Every buildable item across the white-paper + SPEC + roadmap is now done; the only open
+  items are the two external physical resources (#13 VAES HW, #20 real engines).**
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

@@ -2,7 +2,7 @@
 //! shipment to `datarail recv` (a *separate* OS process), which verifies → opens → offloads it to a sink file.
 //! This exercises the cross-host product path across real process boundaries — not threads inside one test.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 
 /// Path to the built `datarail` binary (cargo sets this for integration tests of the bin's crate).
@@ -189,4 +189,68 @@ fn two_process_noise_protected_transfer_delivers() {
     assert!(out.contains("evt:noise-2"), "sink missing record 2: {out:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Extract the `shared fpr = 0x<hex>` token from a `datarail pair` result.
+fn extract_fpr(text: &str) -> Option<String> {
+    text.lines()
+        .find(|l| l.contains("shared fpr"))
+        .and_then(|l| l.split("0x").nth(1))
+        .map(|rest| rest.split_whitespace().next().unwrap_or("").to_owned())
+}
+
+#[test]
+fn two_process_remote_pairing_agrees_on_a_secret() {
+    // A genuine two-process SPEC-08 F3 pairing: a shared 16-byte short code, each side a separate OS process,
+    // exchanging the SPAKE2 protocol over a real socket. Success ⇒ both derive the SAME secret (matching fpr).
+    const CODE: &str = "0x00112233445566778899aabbccddeeff";
+
+    // Responder side (listens, announces its port, then completes the pairing).
+    let mut resp = Command::new(BIN)
+        .arg("pair")
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--code")
+        .arg(CODE)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn pair responder");
+
+    let stdout = resp.stdout.take().expect("resp stdout");
+    let mut reader = BufReader::new(stdout);
+    let addr = loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read resp stdout");
+        assert!(n > 0, "responder closed stdout before announcing its address");
+        if let Some(rest) = line.strip_prefix("DATARAIL-LISTENING ") {
+            break rest.trim().to_owned();
+        }
+    };
+
+    // Initiator side (separate process) connects with the same code.
+    let init = Command::new(BIN)
+        .arg("pair")
+        .arg("--connect")
+        .arg(&addr)
+        .arg("--code")
+        .arg(CODE)
+        .output()
+        .expect("run pair initiator");
+    assert!(
+        init.status.success(),
+        "initiator pairing failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let init_out = String::from_utf8_lossy(&init.stdout).into_owned();
+
+    // Drain the responder's remaining output + reap it.
+    let mut resp_rest = String::new();
+    reader.read_to_string(&mut resp_rest).expect("read responder result");
+    assert!(resp.wait().expect("wait resp").success(), "responder pairing failed");
+
+    let init_fpr = extract_fpr(&init_out).expect("initiator fpr");
+    let resp_fpr = extract_fpr(&resp_rest).expect("responder fpr");
+    assert_eq!(init_fpr, resp_fpr, "both processes must derive the same shared secret");
+    assert!(init_out.contains("paired (initiator)"), "{init_out}");
+    assert!(resp_rest.contains("paired (responder)"), "{resp_rest}");
 }

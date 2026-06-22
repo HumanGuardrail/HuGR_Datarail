@@ -18,14 +18,14 @@
 #![forbid(unsafe_code)]
 
 use std::io::Read;
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use datarail_connectors::{LineFileSink, LineFileSource, Sink, SliceSource, Source, VecSink};
 use datarail_core::{Cofre, Disposition, Substrate};
-use datarail_crypto::{ctx, sign_domain, verifying_key};
-use datarail_identity::{NoiseSubstrate, StaticKeypair};
+use datarail_crypto::{blake3_256, ctx, sign_domain, verifying_key};
+use datarail_identity::{NoiseSubstrate, Pairing, ShortCode, StaticKeypair};
 use datarail_rail::{LoopbackSubstrate, TcpSubstrate};
 use datarail_spec::{RailSpec, SpecError};
 use datarail_terminal::{DestTerminal, SourceTerminal, TerminalError};
@@ -41,6 +41,8 @@ USAGE:
     datarail verify <rail.toml> <cofre-hex>
     datarail ticket <rail.toml>
     datarail pair                                     (local F2/F3 identity rehearsal — see note)
+    datarail pair --listen ADDR  --code <hex> [--my-static <hex>]    (F3 remote pairing: responder)
+    datarail pair --connect ADDR --code <hex> [--my-static <hex>]    (F3 remote pairing: initiator)
     datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]   (cross-process dest)
     datarail send <rail.toml> --connect ADDR [--source-file F | record ...] (cross-process source)
 
@@ -77,7 +79,7 @@ fn dispatch(args: &[String]) -> Result<String, CliError> {
         "replay" => cmd_replay(rest),
         "verify" => cmd_verify(rest),
         "ticket" => cmd_ticket(rest),
-        "pair" => cmd_pair(),
+        "pair" => cmd_pair(rest),
         "send" => cmd_send(rest),
         "recv" => cmd_recv(rest),
         "help" | "-h" | "--help" => Ok(USAGE.to_owned()),
@@ -656,19 +658,121 @@ fn cmd_ticket(rest: &[String]) -> Result<String, CliError> {
     ))
 }
 
-/// `datarail pair` — exercise the endpoint-identity layer (SPEC-08 F2/F3) end-to-end through the real binary.
-///
-/// HONEST SCOPE: F2 `Noise_KK` and F3 SPAKE2 pairing are inherently **two-party** protocols. A genuine pairing
-/// runs across two endpoints exchanging messages over a transport; that needs the cross-host network plumbing
-/// (the same class as the network substrate). This command is a **local rehearsal** — it drives *both* sides
-/// in one process — so the `datarail-identity` primitives are reachable and self-tested from the CLI, and you
-/// can see them work. It is not a remote pairing.
-///
-/// It runs: (F3) mint a single-use short code → both sides run the PAKE bound to their static identities →
-/// confirm they agree on a shared secret; then (F2) a `Noise_KK` handshake between the two pinned statics →
-/// a sealed message round-trips over the established forward-secret session.
-fn cmd_pair() -> Result<String, CliError> {
-    use datarail_identity::{KkSession, Pairing, ShortCode, StaticKeypair};
+/// `datarail pair` — SPEC-08 F3 short-code pairing. With `--connect ADDR` / `--listen ADDR` it runs a **real
+/// two-process pairing** over TCP (each side a separate OS process; see [`cmd_pair_remote`]); with neither it
+/// runs a local self-test rehearsal of the F2/F3 primitives ([`cmd_pair_local`]).
+fn cmd_pair(rest: &[String]) -> Result<String, CliError> {
+    let body = rest.to_vec();
+    let (connect, r1) = take_flag(&body, "--connect");
+    let (listen, r2) = take_flag(&r1, "--listen");
+    match (connect, listen) {
+        (None, None) => cmd_pair_local(),
+        (Some(addr), None) => cmd_pair_remote(&r2, PairRole::Initiator, &addr),
+        (None, Some(addr)) => cmd_pair_remote(&r2, PairRole::Responder, &addr),
+        (Some(_), Some(_)) => Err(CliError::Rail("give --connect OR --listen, not both".to_owned())),
+    }
+}
+
+/// Which side of a remote pairing this process is. The `--connect` side is the initiator (A); the `--listen`
+/// side is the responder (B). Both bind the static keys in the **same** `(A, B)` order.
+#[derive(Clone, Copy)]
+enum PairRole {
+    Initiator,
+    Responder,
+}
+
+/// `datarail pair --connect ADDR | --listen ADDR --code <hex> [--my-static <hex>]` — a genuine **two-process**
+/// SPEC-08 F3 pairing over TCP. Each side mints/loads its own Noise static keypair, the two exchange their
+/// static **public** keys over the socket, bind both into the SPAKE2 transcript, run the PAKE + key-confirmation
+/// from the shared short `--code`, and end up with the **authenticated** peer static + an agreed secret. A
+/// man-in-the-middle that swaps a static changes the bound identity, so confirmation fails (MAJ-5). The
+/// resulting peer static is exactly what you then pin as `--peer-public` for the Noise hop / a `rail.toml`.
+fn cmd_pair_remote(rest: &[String], role: PairRole, addr: &str) -> Result<String, CliError> {
+    let (code_hex, r1) = take_flag(rest, "--code");
+    let code_bytes: [u8; 16] = from_hex(&code_hex.ok_or(CliError::MissingArg("--code <hex>"))?)
+        .and_then(|v| v.try_into().ok())
+        .ok_or(CliError::BadHex)?;
+    let code = ShortCode::from_bytes(code_bytes);
+    let (my_static, _r2) = take_flag(&r1, "--my-static");
+    let local = match my_static {
+        Some(h) => {
+            let s: [u8; 32] = from_hex(&h).and_then(|v| v.try_into().ok()).ok_or(CliError::BadHex)?;
+            StaticKeypair::from_secret(s)
+        }
+        None => StaticKeypair::generate().map_err(|e| CliError::Identity(e.to_string()))?,
+    };
+    let my_pub = local.public();
+
+    // Establish the connection (initiator connects; responder binds + announces + accepts).
+    let mut stream = match role {
+        PairRole::Initiator => connect_with_retry(addr)?,
+        PairRole::Responder => bind_announce_accept(addr)?.0,
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| CliError::Rail(e.to_string()))?;
+
+    // (0) Exchange static public keys (initiator writes first → no deadlock). Now both know (A_pub, B_pub).
+    let (a_pub, b_pub) = match role {
+        PairRole::Initiator => {
+            write_framed_stream(&mut stream, &my_pub)?;
+            let peer = read_framed_array::<32>(&mut stream)?;
+            (my_pub, peer)
+        }
+        PairRole::Responder => {
+            let peer = read_framed_array::<32>(&mut stream)?;
+            write_framed_stream(&mut stream, &my_pub)?;
+            (peer, my_pub)
+        }
+    };
+
+    // (1) Build the pairing bound to both identities; exchange the PAKE messages.
+    let (mut pairing, my_msg) = match role {
+        PairRole::Initiator => Pairing::start_initiator(&code, a_pub, b_pub),
+        PairRole::Responder => Pairing::start_responder(&code, a_pub, b_pub),
+    }
+    .map_err(|e| CliError::Identity(e.to_string()))?;
+    let peer_msg = exchange(&mut stream, role, &my_msg)?;
+
+    // (2) Derive (always succeeds for a well-formed message); exchange the confirmation tags.
+    let my_tag = pairing.derive(&peer_msg).map_err(|e| CliError::Identity(e.to_string()))?;
+    let peer_tag = exchange(&mut stream, role, &my_tag)?;
+
+    // (3) Confirm: a wrong code or a swapped (MITM) static makes the tags disagree → failure.
+    let secret = pairing.confirm(&peer_tag).map_err(|e| CliError::Identity(e.to_string()))?;
+
+    let (role_name, peer_pub) = match role {
+        PairRole::Initiator => ("initiator", b_pub),
+        PairRole::Responder => ("responder", a_pub),
+    };
+    let fpr = blake3_256(&secret);
+    Ok(format!(
+        "paired ({role_name}) with {addr}\n  peer static = 0x{}\n  shared fpr  = 0x{}   (pin the peer static as --peer-public)\n",
+        to_hex(&peer_pub),
+        to_hex(&fpr[..8]),
+    ))
+}
+
+/// One request/response message exchange over the pairing socket, ordered by role to avoid deadlock
+/// (initiator writes then reads; responder reads then writes).
+fn exchange(stream: &mut TcpStream, role: PairRole, mine: &[u8]) -> Result<Vec<u8>, CliError> {
+    match role {
+        PairRole::Initiator => {
+            write_framed_stream(stream, mine)?;
+            read_framed_vec(stream)
+        }
+        PairRole::Responder => {
+            let peer = read_framed_vec(stream)?;
+            write_framed_stream(stream, mine)?;
+            Ok(peer)
+        }
+    }
+}
+
+/// The local self-test rehearsal of the F2/F3 primitives (no network) — kept so `datarail pair` with no
+/// transport flag still demonstrates the identity layer end-to-end in one process.
+fn cmd_pair_local() -> Result<String, CliError> {
+    use datarail_identity::KkSession;
 
     // Two endpoints, each with a long-term Noise static keypair (the SPEC-08 X25519 KEM key).
     let a = StaticKeypair::generate().map_err(|e| CliError::Identity(e.to_string()))?;
@@ -832,6 +936,84 @@ fn connect_with_retry(addr: &str) -> Result<TcpStream, CliError> {
     Err(CliError::Rail(format!("could not connect to {addr}: {last}")))
 }
 
+/// Bind `listen`, announce the bound address (`DATARAIL-LISTENING <addr>`, flushed, so a peer/orchestrator can
+/// discover the OS-assigned port), and bounded-accept one connection (non-blocking poll + 30s deadline so it
+/// never hangs). Shared by `datarail recv` and `datarail pair --listen`.
+fn bind_announce_accept(listen: &str) -> Result<(TcpStream, std::net::SocketAddr), CliError> {
+    use std::io::Write as _;
+    let listener = TcpListener::bind(listen).map_err(|e| CliError::Rail(format!("{listen}: {e}")))?;
+    let bound = listener.local_addr().map_err(|e| CliError::Rail(e.to_string()))?;
+    println!("DATARAIL-LISTENING {bound}");
+    std::io::stdout().flush().map_err(|e| CliError::Io(e.to_string()))?;
+    listener.set_nonblocking(true).map_err(|e| CliError::Rail(e.to_string()))?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match listener.accept() {
+            Ok((s, _peer)) => return Ok((s, bound)),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(CliError::Rail("timed out waiting for a peer".to_owned()));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(CliError::Rail(e.to_string())),
+        }
+    }
+}
+
+/// Write a `u32`-length-prefixed frame to a pairing socket.
+fn write_framed_stream(s: &mut TcpStream, bytes: &[u8]) -> Result<(), CliError> {
+    use std::io::Write as _;
+    let len = u32::try_from(bytes.len()).map_err(|_| CliError::Rail("frame too large".to_owned()))?;
+    s.write_all(&len.to_le_bytes())
+        .and_then(|()| s.write_all(bytes))
+        .and_then(|()| s.flush())
+        .map_err(|e| CliError::Rail(e.to_string()))
+}
+
+/// Fill `buf` exactly from the pairing socket, tolerating short reads / timeouts within a 30s deadline.
+fn read_exact_dl(s: &mut TcpStream, buf: &mut [u8]) -> Result<(), CliError> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut filled = 0;
+    while filled < buf.len() {
+        match s.read(&mut buf[filled..]) {
+            Ok(0) => return Err(CliError::Rail("peer closed during pairing".to_owned())),
+            Ok(n) => filled += n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    return Err(CliError::Rail("pairing read timed out".to_owned()));
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(CliError::Rail(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// Read one `u32`-length-prefixed frame from a pairing socket (pairing messages are small; cap at 4 KiB).
+fn read_framed_vec(s: &mut TcpStream) -> Result<Vec<u8>, CliError> {
+    let mut hdr = [0u8; 4];
+    read_exact_dl(s, &mut hdr)?;
+    let len = u32::from_le_bytes(hdr) as usize;
+    if len > 4096 {
+        return Err(CliError::Rail("oversized pairing frame".to_owned()));
+    }
+    let mut body = vec![0u8; len];
+    read_exact_dl(s, &mut body)?;
+    Ok(body)
+}
+
+/// Read one length-prefixed frame and require it to be exactly `N` bytes.
+fn read_framed_array<const N: usize>(s: &mut TcpStream) -> Result<[u8; N], CliError> {
+    read_framed_vec(s)?
+        .try_into()
+        .map_err(|_| CliError::Rail("unexpected pairing frame length".to_owned()))
+}
+
 /// `datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]` — the cross-process **destination**.
 ///
 /// Binds a TCP listener (default `127.0.0.1:0`, an OS-assigned port), prints its bound address as
@@ -839,8 +1021,6 @@ fn connect_with_retry(addr: &str) -> Result<TcpStream, CliError> {
 /// connection, then verifies → opens → offloads `N` cofres (default 1) and commits the delivered records to the
 /// sink. A separate OS process from the source — the genuine cross-host destination side.
 fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
-    use std::io::Write as _;
-
     let spec = load_spec(require(rest, 0, "rail.toml")?)?;
     let body: Vec<String> = rest.get(1..).unwrap_or(&[]).to_vec();
     let (listen, r1) = take_flag(&body, "--listen");
@@ -868,28 +1048,7 @@ fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
         None => Box::new(VecSink::new()),
     };
 
-    let listener =
-        std::net::TcpListener::bind(&listen).map_err(|e| CliError::Rail(format!("{listen}: {e}")))?;
-    let bound = listener.local_addr().map_err(|e| CliError::Rail(e.to_string()))?;
-    // Announce the bound address (flushed) so a peer/test can discover the OS-assigned port before connecting.
-    println!("DATARAIL-LISTENING {bound}");
-    std::io::stdout().flush().map_err(|e| CliError::Io(e.to_string()))?;
-
-    // Bounded accept: poll non-blocking with a deadline so `recv` never hangs forever if no peer arrives.
-    listener.set_nonblocking(true).map_err(|e| CliError::Rail(e.to_string()))?;
-    let deadline = Instant::now() + std::time::Duration::from_secs(30);
-    let stream = loop {
-        match listener.accept() {
-            Ok((s, _peer)) => break s,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(CliError::Rail("timed out waiting for a sender".to_owned()));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(e) => return Err(CliError::Rail(e.to_string())),
-        }
-    };
+    let (stream, bound) = bind_announce_accept(&listen)?;
     let hop = if noise.is_some() { "noise" } else { "tcp" };
     let mut rail = build_hop(stream, noise, false)?;
 
@@ -964,7 +1123,7 @@ mod tests {
         // The identity layer (F2 Noise_KK + F3 PAKE) is reachable from the CLI and works end-to-end: the
         // command runs both sides locally and reports success for each. (This also keeps datarail-identity a
         // real, exercised dependency — not an orphan crate.)
-        let out = cmd_pair().expect("local pairing rehearsal should succeed");
+        let out = cmd_pair(&[]).expect("local pairing rehearsal should succeed");
         assert!(out.contains("F3 PAKE     = ok"), "{out}");
         assert!(out.contains("F2 Noise_KK = ok"), "{out}");
     }

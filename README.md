@@ -45,6 +45,9 @@ cargo run -p datarail-cli -- run examples/rail.toml \
     --source-file /tmp/in.txt --sink-file /tmp/out.txt --watch    # board → sealed rail → offload, live
 cargo run -p datarail-cli -- replay examples/rail.toml 1..3 --source-file /tmp/in.txt
 cargo run -p datarail-cli -- pair                                 # F2/F3 identity layer, local rehearsal
+# real two-process F3 pairing over a short code (two terminals): --listen on one, --connect on the other:
+datarail pair --listen 127.0.0.1:7000 --code 0x<shared-16-byte-code>
+datarail pair --connect 127.0.0.1:7000 --code 0x<shared-16-byte-code>
 
 # genuine TWO-PROCESS transfer over a real TCP socket (run in two terminals / hosts):
 datarail recv examples/rail.toml --listen 127.0.0.1:9000 --sink-file /tmp/out.txt --count 1   # destination
