@@ -212,6 +212,24 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   **11 crates · 72 tests** green · clippy deny(all+pedantic) clean · forbid(unsafe) · no `#[allow]`. (Toolchain
   path; cargo 1.96.0.)
 
+- 2026-06-22 — **P3 #23: object-store/S3 substrate (`83e613f`) — AC-6 named substrate 1/3.** New quarantined
+  crate `datarail-substrate-objectstore` (keeps heavy substrate deps out of the std-only rail core). SPEC-10
+  provider-blind durable holding pen, filesystem-backed: `<bucket>/<route>/<stream>/<seq>.cofre`, atomic
+  seq-keyed PUT (idempotent re-PUT = no-op), ordered GET, delete-post-ack GC. Store sees only ciphertext
+  (`INV-OPAQUE-CARGO`), holds no keys (`INV-DUMB-PIPE`). Passes the shared `substrate_conformance` harness +
+  proofs: a **decoupled source-PUTs-then-separate-dest-drains** flow (temporal decoupling — the store's whole
+  point) and idempotent re-PUT. Real S3/GCS/R2 = same trait, credential-gated adapter (post-v1, no crypto added).
+
+- 2026-06-22 — **P3 #29: AC-9 proptest + arch-attribution correction.** AC-9's SPEC-11 *named* proof method is
+  **proptest** (it was case-based). Added `tests::prop::*` to `datarail-terminal` (proptest dev-dep): randomized
+  over both terminals — **boards-iff-all-records-conform** (source never boards a violating batch; seq stays 0),
+  **conforming batch round-trips & commits exactly**, and **any single carga byte-flip is dead-lettered** (via
+  `proptest::sample::Index`, no cast lints). AC-2 stays exhaustive byte-flip (≥ sampled proptest). Also
+  **corrected a factual error** in BENCH-01/DOD-01: this box is **`x86_64-apple-darwin`** (`uname -m`=x86_64 —
+  real Intel or Rosetta), **not** "Apple Silicon arm64 / ARMv8 / NEON" as previously written; numbers stay
+  DIRECTIONAL pending a re-confirm run; GATE-WARP still PENDING representative VAES HW (#13). **12 crates · 78
+  tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
@@ -223,3 +241,27 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
      ciphertext of equal length, re-signed, routing fixed → identical rail behavior); was "zero payload →
      byte-identical", which contradicts `cofre_id=BLAKE3(CARGA)`. [BLK-3]
   3. **C1** → `idempotency_key` preimage = `record_key`, not `content`. [BLK-2]
+
+- 2026-06-22 — **STOP-THE-LINE #24 (shmem): a frozen SPEC requirement collides with the frozen Charter.**
+  SPEC `07` specifies the same-host substrate as a **"lock-free ring in shared memory."** A *lock-free*
+  cross-process ring requires atomic cursors living **inside** the shared mapping — which in Rust means either
+  `unsafe { &*(ptr as *const AtomicU64) }` in our code, or a dep whose constructor is `unsafe` at our call
+  site (`raw_sync`), or a Linux-only crate (`shmem-ipc` needs `memfd`; this box is macOS). The `bytemuck` +
+  `AtomicU64::from_mut` "safe" route is **unsound** cross-process (it asserts `&mut` exclusivity over memory a
+  second process also maps; the compiler may then cache/elide, breaking the atomic). The frozen **Craft Charter
+  is `forbid(unsafe)` + no `#[allow]`** (CONGELADO). On this target the two **cannot both hold** for a genuine
+  lock-free shmem ring. Resolving it means amending a *frozen* artifact → owner's call (not mine; this is
+  exactly the unauthorized-deviation I was just corrected for). **Owner, pick one:**
+  - **(A) ⭐ recommended** — authorize a single, audited, well-contained `unsafe` block in the *quarantined*
+    `datarail-substrate-shmem` crate **only** (a logged WAIVER per rigor-compact §0.6, scoped to the shared
+    atomic cursor; the rest of the workspace stays `forbid(unsafe)`). Delivers the real lock-free µs ring; this
+    is the standard, honest way to do shared-memory atomics.
+  - **(B)** accept a **lock-*coordinated*** shmem (mmap data plane + `fs2` flock cursor) — safe, zero unsafe,
+    but **not** lock-free (deviates from the SPEC word) and only marginally beats the existing UDS substrate, so
+    it under-delivers shmem's whole point (µs lock-free zero-copy).
+  - **(C)** accept a vetted external dep that encapsulates the unsafe **if** one with a *safe* API exists on
+    macOS x86_64 (uncertain; adds a dep + portability risk).
+  - **(D)** descope shmem from the v1 named set → AC-6 closes at **2/3 named** (object-store + QUIC), shmem
+    documented post-v1.
+  Until adjudicated, **#24 is blocked-on-owner**; I am NOT halting the line — continuing on the non-conflicting
+  rungs (QUIC #25, AC-8 WAN #26, bao #27, FASP/DoS #28, P5 #30). My recommendation is **(A)**.

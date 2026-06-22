@@ -3,8 +3,13 @@
 > **Honesty label (Craft Charter L? / THE HUGR METHOD "no number before its artifact"):** every number below
 > is **DIRECTIONAL**, measured on **dev hardware**, in `--release`. It is **NOT a GATE-WARP result.**
 
-- **Machine:** Apple Silicon (arm64), macOS — AES via the ARMv8 crypto extension, BLAKE3 via NEON.
-  This is **not** the x86-64 **VAES** hardware `GATE-WARP` is specified against, so throughput here neither
+- **Machine:** target `x86_64-apple-darwin`, macOS (`uname -m` = `x86_64` — a real Intel Mac *or* an x86_64
+  toolchain under Rosetta 2; the two are indistinguishable from `uname`, and Rosetta notably lacks AVX/VAES).
+  AES via AES-NI, BLAKE3 via SSE/AVX2 — or their Rosetta-translated equivalents. **(Correction 2026-06-22: an
+  earlier revision wrongly attributed these to "Apple Silicon arm64 / ARMv8 crypto extension / NEON"; the
+  toolchain is x86_64. The figures below are unchanged DIRECTIONAL numbers and warrant a re-confirmation run on
+  the verified target — task #13.)** This is **not** the representative **VAES** hardware `GATE-WARP` is
+  specified against (Rosetta has no VAES; a real Intel Mac's VAES is unconfirmed), so throughput here neither
   passes nor fails GATE-WARP — that gate stays **PENDING** representative hardware (task #13).
 - **Harness:** `crates/datarail-bench` — a zero-dependency `std::time::Instant` loop (Charter *leveza*; no
   criterion). Warm-up then N iterations; latency = wall-ns / iters, throughput = bytes/µs (== MB/s).
@@ -34,8 +39,9 @@
   deployments batch; latency-sensitive single-record routes pay the ~190 µs.
 - **GATE-LATENCY (per-cofre):** sub-millisecond end-to-end on dev HW — **DIRECTIONAL pass** (the gate's formal
   target is verified on representative HW; this corroborates the order of magnitude).
-- **GATE-WARP (throughput):** **PENDING** — must be measured on representative VAES hardware (#13). Apple
-  Silicon numbers are not comparable to the x86 VAES target.
+- **GATE-WARP (throughput):** **PENDING** — must be measured on representative VAES hardware (#13). This box
+  reports x86_64 but VAES is unconfirmed (Rosetta has none; a real Intel Mac may or may not), so these numbers
+  are not a GATE-WARP comparison either way.
 - **GATE-FEATHER (idle ≈ 0):** **not measured here** — it is an architectural property of the *ephemeral*
   substrate (scale-to-zero; spawn-deliver-vanish), not a micro-bench. The `LoopbackSubstrate` holds no idle
   resources; a real serverless substrate's idle cost is a deployment measurement (out of v1 scope).

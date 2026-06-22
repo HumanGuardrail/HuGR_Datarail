@@ -28,14 +28,14 @@
 | AC-6 substrate parity | **PENDING** — harness PROVEN; **1 / 3 named substrates** built | The `substrate_conformance<S>` harness passes over `LoopbackSubstrate`, `ResumableSubstrate`, `SocketSubstrate` (UDS), `TcpSubstrate` (real cross-host TCP), **and `ObjectStoreSubstrate`** (SPEC-10 provider-blind object store — ✓ first named substrate; proven with a decoupled source-then-dest drain + idempotent re-PUT). **Still owed for the named set: shmem (#24) + QUIC (#25).** |
 | AC-7 featherweight (GATE-FEATHER) | **DIRECTIONAL** | in-memory substrates hold **no idle resources** (idle ≈ 0 by construction); a real serverless substrate's idle RSS is a deployment measurement → PENDING |
 | AC-8 WAN/resume | **PARTIAL** — in-memory kill-resume PROVEN; real-socket resume + WAN bench + `bao` PENDING | `ac8_resume.rs` proves partition + resume-from-last-acked, **0 loss / 0 dup**, in order — but over an *in-memory* substrate. The SPEC-11 proof needs (a) a throughput bench on a lossy/high-RTT link **vs the TCP baseline** (`TcpSubstrate` is now that baseline; WAN shim + bench = #26) and (b) **E4 `bao`** chunk-level resume (#27). Whole-cofre cursor resume ≠ bao chunk resume. |
-| AC-9 contract enforcement | **PROVEN** | `datarail-terminal` `ac9_*` — onboarding refusal (never boards) + offloading refusals (contract_fp, post-decrypt record, tampered, forged, route-mismatch), both terminals; case-based (proptest randomization a strengthening TODO) |
+| AC-9 contract enforcement | **PROVEN** (+ proptest) | `datarail-terminal` `ac9_*` (case-based: onboarding refusal, contract_fp, post-decrypt record, tampered, forged, route-mismatch — both terminals) **plus `tests::prop::*` randomized proptest** (boards-iff-all-conform · conforming-batch-round-trips · any-byte-flip-dead-lettered) — the SPEC-11 **named proof method now met** (#29). |
 | AC-10 fairness benchmark | **PENDING** | needs **real competitor engines** + the 17-case anti-cheat rig (external infra, task #20). Not faked. |
 
 ## Gates
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `GATE-WARP` (throughput ≥ X) | **PENDING** | bound `X` unset; requires representative **x86 VAES** HW (this box is Apple Silicon arm64, task #13). BENCH-01 gives directional throughput (BLAKE3 ~3.4 GB/s, GCM-SIV ~1 GB/s) but that is **not** a GATE-WARP pass |
+| `GATE-WARP` (throughput ≥ X) | **PENDING** | bound `X` unset; requires representative **x86 VAES** HW (this box reports `x86_64` — real Intel *or* Rosetta; VAES unconfirmed, task #13). BENCH-01 gives directional throughput (BLAKE3 ~3.4 GB/s, GCM-SIV ~1 GB/s) but that is **not** a GATE-WARP pass |
 | `GATE-LATENCY` (p50/p99 per hop) | **DIRECTIONAL** | BENCH-01: board ~190 µs / offload ~136 µs end-to-end (sub-ms per cofre) on dev HW; X25519 wrap dominates (~90 µs/side), amortizes per batch. Formal p50/p99 on representative HW pending |
 | `GATE-FEATHER` (idle ≈ 0) | **DIRECTIONAL** | architectural: the in-process substrates hold no standing resources; the scale-to-zero claim holds by construction; a real-substrate idle measurement is PENDING |
 
