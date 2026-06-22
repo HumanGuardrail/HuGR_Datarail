@@ -108,6 +108,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   → fan out P2 (manifest+once: AC-5, AC-4 DST) ∥ P3 (rail+substrates: AC-1/6/8, GATE-FEATHER) to background
   clones → P4 terminals (AC-9) → P5 CLI + first vertical slice (MF-4).
 
+- 2026-06-22 — **P2/P3 fan-out COMPLETE (3 parallel clones, all cold-verified + merged).** datarail-rail
+  (`30a0022`, AC-1 metamorphic opacity + AC-6 parity), datarail-manifest (`4cbe2c4`, AC-5; **lead fixed a Charter
+  `#[allow]` breach** → refactored to a `DeliveryProof` bundle), datarail-once (AC-4 DST: SplitMix64, 1000 seeds,
+  drop/reorder/dup/kill → **0 loss / 0 dup**). **Full workspace: 6 crates, 34 tests green, clippy deny(all+pedantic)
+  clean.** Proven: **AC-1,2,3,4,5,6** + crypto domain-sep/AEAD. Kage-Bunshin validated (disjoint crates,
+  merge-on-green, cold-verify caught the breach + a stray clone `git checkout`, no damage). **Lead decision-pending
+  (resolve at P4):** datarail-once returns `DeadLettered` for a below-watermark redelivery; the terminal's siding
+  semantics may instead want `Duplicate` (benign re-ack). Note: `WM_CTX = b"dr:once:wm:v1"` is a crate-local
+  domain label (fine; not added to the frozen `ctx`). **NEXT: P4** datarail-terminal (board/offload wiring
+  core+crypto+cofre+once+manifest; content-contract enforce; dead-letter — AC-9) + a file/in-mem connector →
+  **P5** spec + CLI + the **first vertical slice (MF-4)**.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
