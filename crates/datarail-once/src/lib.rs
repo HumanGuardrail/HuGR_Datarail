@@ -3,9 +3,10 @@
 //!
 //! The destination's admission decision (transcribed from SPEC 05 / BLK-6):
 //! 1. **Reject-below, not merely lookup (BLK-6):** keep a *signed monotonic low-watermark per stream* and
-//!    **REJECT** any arriving `seq` *below* it outright — below-watermark `seq` is already durably accounted
-//!    for, so admitting it would risk a GC-vs-replay double-commit. This rejection is a [`Disposition`], not
-//!    an error (it lands on the siding: [`Disposition::DeadLettered`]).
+//!    refuse to re-commit any arriving `seq` *below* it outright — a below-watermark `seq` is already durably
+//!    committed, so admitting it would risk a GC-vs-replay double-commit. It is reported as a benign
+//!    [`Disposition::Duplicate`] (drop + re-ack), never re-committed. (`DeadLettered` is the terminal's domain
+//!    — seal/contract failure, before this gate.)
 //! 2. **Dedup:** an arriving `idempotency_key` already in the dedup index ⇒ [`Disposition::Duplicate`]
 //!    (idempotent drop + re-ack).
 //! 3. Otherwise **commit**: record the key, return [`Disposition::Delivered`], and advance the contiguous
@@ -96,22 +97,25 @@ impl Once {
     /// Admit a received record for `stream` at sequence `seq` with dedup key `idempotency_key`, returning the
     /// [`Disposition`] the destination should act on. **Pure decision + state update; no I/O.**
     ///
-    /// Order of checks (SPEC 05 / BLK-6):
-    /// - `seq` **below** the stream's monotonic low-watermark ⇒ [`Disposition::DeadLettered`] (reject-below;
-    ///   the `seq` is already durably accounted for — admitting it risks a GC-vs-replay double-commit). This
-    ///   fires *before* the dedup lookup, so a redelivery of an already-contiguous `seq` is rejected even if
-    ///   its key was GC'd.
-    /// - `idempotency_key` already seen ⇒ [`Disposition::Duplicate`] (idempotent drop + re-ack). This catches
-    ///   a redelivery of a `seq` still *at or above* the watermark (a parked, not-yet-contiguous one).
+    /// Order of checks (SPEC 05 / BLK-6). The once gate only ever decides Delivered vs Duplicate — it has no
+    /// failure mode (`DeadLettered` is the terminal's domain: seal/contract failure, *before* this gate):
+    /// - `seq` **below** the stream's monotonic low-watermark ⇒ [`Disposition::Duplicate`] (reject-below; the
+    ///   `seq` is already durably committed — a benign already-delivered redelivery: drop + re-ack, never
+    ///   re-commit). Fires *before* the dedup lookup, so it holds even if the key was GC'd (BLK-6).
+    /// - `idempotency_key` already seen ⇒ [`Disposition::Duplicate`] (a redelivery of a `seq` still at/above
+    ///   the watermark — a parked, not-yet-contiguous one).
     /// - otherwise ⇒ [`Disposition::Delivered`]: the key is recorded and the contiguous low-watermark is
     ///   advanced across every already-delivered `seq`.
     pub fn admit(&mut self, stream: [u8; 16], seq: u64, idempotency_key: [u8; 32]) -> Disposition {
         let gc_lag = self.gc_lag;
         let st = self.streams.entry(stream).or_default();
 
-        // (1) Reject-below the monotonic low-watermark (BLK-6) — *before* any dedup lookup.
+        // (1) Reject-below the monotonic low-watermark (BLK-6) — *before* any dedup lookup, so it holds even
+        // if the key was GC'd. A below-watermark seq is already durably committed: a benign already-delivered
+        // redelivery -> Duplicate (drop + re-ack, never re-commit). DeadLettered is the terminal's domain
+        // (seal/contract failure, before this gate); the once gate only ever sees verified cofres.
         if seq < st.low_watermark {
-            return Disposition::DeadLettered;
+            return Disposition::Duplicate;
         }
 
         // (2) Dedup on the sole key. At/above the watermark we may still have seen this exact key (an
@@ -206,10 +210,9 @@ mod tests {
     fn first_delivery_then_redelivery_is_dropped() {
         let mut o = Once::new(SEED);
         assert_eq!(o.admit(S, 0, key(0)), Disposition::Delivered);
-        // Redelivery of seq 0: the watermark has already advanced past it, so reject-below (BLK-6) fires
-        // *before* the dedup lookup -> DeadLettered. Either way it is a drop + re-ack, never a re-commit;
-        // both dispositions satisfy AC-4 at the sink.
-        assert_eq!(o.admit(S, 0, key(0)), Disposition::DeadLettered);
+        // Redelivery of seq 0: the watermark has advanced past it, so reject-below (BLK-6) fires before the
+        // dedup lookup. It's a benign already-delivered redelivery -> Duplicate (drop + re-ack, never re-commit).
+        assert_eq!(o.admit(S, 0, key(0)), Disposition::Duplicate);
     }
 
     #[test]
@@ -230,10 +233,11 @@ mod tests {
             assert_eq!(o.admit(S, n, key(n)), Disposition::Delivered);
         }
         assert_eq!(o.low_watermark(S), 3);
-        // BLK-6: a seq below the watermark is REJECTED outright — even with a brand-new, never-seen key.
-        assert_eq!(o.admit(S, 1, key(999)), Disposition::DeadLettered);
-        // And a below-watermark replay of a key that was GC'd would otherwise look "new" — still rejected.
-        assert_eq!(o.admit(S, 0, key(0)), Disposition::DeadLettered);
+        // BLK-6: a seq below the watermark is never re-committed — even with a brand-new, never-seen key —
+        // and is reported as a benign already-delivered Duplicate (drop + re-ack).
+        assert_eq!(o.admit(S, 1, key(999)), Disposition::Duplicate);
+        // And a below-watermark replay of a key that was GC'd would otherwise look "new" — still not re-committed.
+        assert_eq!(o.admit(S, 0, key(0)), Disposition::Duplicate);
     }
 
     #[test]
@@ -267,9 +271,9 @@ mod tests {
         assert_eq!(o.low_watermark(S), 10);
         // GC floor trails the dest watermark by exactly `lag` (BLK-6), never a source checkpoint.
         assert_eq!(o.gc_floor(S), 10 - lag);
-        // A key at seq below the GC floor was compacted out; replaying it below-watermark is still rejected
-        // (reject-below is what makes GC safe).
-        assert_eq!(o.admit(S, 0, key(0)), Disposition::DeadLettered);
+        // A key at seq below the GC floor was compacted out; replaying it below-watermark is still not
+        // re-committed (reject-below is what makes GC safe) — reported as Duplicate.
+        assert_eq!(o.admit(S, 0, key(0)), Disposition::Duplicate);
     }
 
     #[test]

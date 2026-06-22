@@ -27,6 +27,14 @@ pub fn blake3_256(data: &[u8]) -> [u8; 32] {
     *blake3::hash(data).as_bytes()
 }
 
+/// Keyed BLAKE3 — a MAC / PRF. Used for the idempotency key `HMAC(tenant_secret, record_key)` (SPEC 02/03):
+/// deterministic, plaintext never exposed, and (unlike a raw content hash) keyed per tenant so it leaks no
+/// cross-tenant equality. BLAKE3's native keyed mode is a secure MAC (no length-extension).
+#[must_use]
+pub fn hmac_blake3(key: &[u8; 32], msg: &[u8]) -> [u8; 32] {
+    *blake3::keyed_hash(key, msg).as_bytes()
+}
+
 fn framed(context: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(context.len() + msg.len());
     buf.extend_from_slice(context);
@@ -139,12 +147,24 @@ pub fn aead_open(
 
 #[cfg(test)]
 mod tests {
-    use super::{aead_open, aead_seal, ctx, sign_domain, verify_domain, verifying_key};
+    use super::{
+        aead_open, aead_seal, blake3_256, ctx, hmac_blake3, sign_domain, verify_domain, verifying_key,
+    };
     use datarail_core::AeadAlg;
 
     const SEED: [u8; 32] = [7u8; 32];
     const KEY: [u8; 32] = [9u8; 32];
     const NONCE: [u8; 12] = [3u8; 12];
+
+    #[test]
+    fn hmac_is_keyed_and_deterministic() {
+        // Deterministic per (key, msg); changing key or msg changes the tag; differs from the unkeyed hash.
+        let a = hmac_blake3(&KEY, b"record-key");
+        assert_eq!(a, hmac_blake3(&KEY, b"record-key"));
+        assert_ne!(a, hmac_blake3(&[1u8; 32], b"record-key"));
+        assert_ne!(a, hmac_blake3(&KEY, b"other"));
+        assert_ne!(a, blake3_256(b"record-key"));
+    }
 
     #[test]
     fn ed25519_domain_roundtrip_and_separation() {
