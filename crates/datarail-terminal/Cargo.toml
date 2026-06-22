@@ -13,3 +13,4 @@ datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
 datarail-cofre = { path = "../datarail-cofre" }
 datarail-once = { path = "../datarail-once" }
+zeroize = "1"

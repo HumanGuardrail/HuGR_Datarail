@@ -21,11 +21,10 @@
 //!   a fresh per-cofre data key to the route's destination public key ([`datarail_crypto::seal_key`]); the
 //!   `eph_pk` rides in the etiqueta and only the holder of the destination secret re-derives the key
 //!   ([`datarail_crypto::open_key`]). Forward-secure (the ephemeral is discarded) and provider-blind.
-//! - **`aad = &[]`.** The SPEC names `aad = etiqueta` for the AEAD. v1 passes an **empty AAD**: the outer
-//!   Ed25519 `lacre` already binds `etiqueta ⊗ carga` (`INV-SEAL-COMPLETE`), so integrity of the header is
-//!   not lost. Binding `aad = etiqueta` is a **hardening TODO** with a real ordering cycle to resolve first:
-//!   `cofre_id = BLAKE3(carga)` is set by [`datarail_cofre::seal`] *after* the carga exists, so the etiqueta
-//!   is not final at AEAD-seal time. See [`AAD_V1`].
+//! - **AEAD AAD binds the header (AUDIT-02 F5).** The AEAD's associated data is every *seal-time-final*
+//!   etiqueta field — all except `cofre_id` / `signer_key_id`, which [`datarail_cofre::seal`] stamps *after*
+//!   the carga exists (the ordering cycle that blocks binding the whole etiqueta). This is defense in depth
+//!   atop the outer `lacre`, which already binds `etiqueta ⊗ carga` (`INV-SEAL-COMPLETE`). See [`aead_aad`].
 
 #![forbid(unsafe_code)]
 
@@ -33,13 +32,30 @@ use datarail_core::{AeadAlg, Cofre, Disposition, Etiqueta};
 use datarail_cofre::CofreError;
 use datarail_crypto::{aead_open, aead_seal, blake3_256, hmac_blake3, open_key, seal_key, AeadError};
 use datarail_once::Once;
+use zeroize::Zeroize as _;
 
-/// The AEAD associated data used in v1: **empty**.
-///
-/// The outer `lacre` (Ed25519 over `etiqueta ⊗ carga`) already authenticates the header, so an empty AAD does
-/// not weaken integrity. Binding `aad = etiqueta` is a documented hardening TODO (it has a `cofre_id` ordering
-/// cycle, since `cofre_id = BLAKE3(carga)` is only set inside [`datarail_cofre::seal`]).
-pub const AAD_V1: &[u8] = &[];
+/// Build the AEAD associated data: every **seal-time-final** etiqueta field — all of them *except* `cofre_id`
+/// and `signer_key_id`, which [`datarail_cofre::seal`] stamps *after* the carga exists (the ordering cycle
+/// that blocks binding the whole etiqueta). **AUDIT-02 F5:** this binds the AEAD to the header — defense in
+/// depth atop the outer `lacre`, which already covers `etiqueta ⊗ carga`. `board` and `offload` recompute it
+/// identically (the excluded fields are zero at seal time and verifier-recomputed at open time).
+fn aead_aad(e: &Etiqueta) -> Vec<u8> {
+    let aead_tag: u8 = match e.aead_alg {
+        AeadAlg::Gcmsiv256 => 1,
+        AeadAlg::ChaCha20Poly1305 => 2,
+        AeadAlg::Gcm256 => 3,
+    };
+    let mut aad = Vec::with_capacity(16 + 16 + 8 + 32 + 32 + 1 + 12 + 32);
+    aad.extend_from_slice(&e.route_id);
+    aad.extend_from_slice(&e.stream_id);
+    aad.extend_from_slice(&e.seq.to_le_bytes());
+    aad.extend_from_slice(&e.idempotency_key);
+    aad.extend_from_slice(&e.contract_fp);
+    aad.push(aead_tag);
+    aad.extend_from_slice(&e.nonce);
+    aad.extend_from_slice(&e.eph_pk);
+    aad
+}
 
 /// Read 32 bytes of OS entropy for a fresh per-cofre ephemeral key. Zero-dep (`/dev/urandom`); the source
 /// terminal calls this once per [`SourceTerminal::board`].
@@ -428,14 +444,13 @@ impl SourceTerminal {
 
         // (4) Per-cofre key-wrap (SPEC A5/03): a fresh ephemeral X25519 key seals a fresh data key to the
         // route's destination public key — only the dest can re-derive it (provider-blind, forward-secure).
-        let eph_secret = random_32()?;
-        let (eph_pk, data_key) = seal_key(&self.config.dest_x25519_pk, &eph_secret);
+        let mut eph_secret = random_32()?;
+        let (eph_pk, mut data_key) = seal_key(&self.config.dest_x25519_pk, &eph_secret);
+        eph_secret.zeroize(); // forward secrecy: wipe the ephemeral secret immediately (AUDIT-02 F4).
 
-        // (5) AEAD-seal the batch under the per-cofre data key with a fresh random per-cofre nonce. aad = &[].
+        // (5) Build the etiqueta (cofre_id/signer_key_id are stamped by `seal`), then AEAD-seal the batch under
+        // the per-cofre data key with a fresh random nonce and the header bound as AAD (AUDIT-02 F5).
         let nonce = Self::fresh_nonce()?;
-        let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, AAD_V1, &batch)?;
-
-        // (6) Build the etiqueta; cofre_id/signer_key_id are stamped by `seal`.
         let etiqueta = Etiqueta {
             route_id: self.config.route_id,
             stream_id: self.config.stream_id,
@@ -448,6 +463,8 @@ impl SourceTerminal {
             signer_key_id: [0u8; 32],
             eph_pk,
         };
+        let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, &aead_aad(&etiqueta), &batch)?;
+        data_key.zeroize(); // the per-cofre data key is consumed; wipe it (AUDIT-02 F4).
 
         // (6) Seal (Ed25519 over etiqueta ⊗ carga) and advance the per-stream sequence.
         let cofre = datarail_cofre::seal(etiqueta, carga, &self.source_seed);
@@ -576,16 +593,18 @@ impl DestTerminal {
             return Ok(Disposition::DeadLettered);
         }
 
-        // (3) Re-derive the per-cofre data key from the authenticated eph_pk, then AEAD-open (aad = &[]); a
-        // tamper / wrong-key failure dead-letters.
-        let data_key = open_key(&self.dest_x25519_secret, &cofre.etiqueta.eph_pk);
-        let Ok(batch) = aead_open(
+        // (3) Re-derive the per-cofre data key from the authenticated eph_pk, then AEAD-open with the header
+        // bound as AAD (AUDIT-02 F5); a tamper / wrong-key failure dead-letters.
+        let mut data_key = open_key(&self.dest_x25519_secret, &cofre.etiqueta.eph_pk);
+        let opened = aead_open(
             cofre.etiqueta.aead_alg,
             &data_key,
             &cofre.etiqueta.nonce,
-            AAD_V1,
+            &aead_aad(&cofre.etiqueta),
             &cofre.carga,
-        ) else {
+        );
+        data_key.zeroize(); // wipe the re-derived per-cofre key (AUDIT-02 F4).
+        let Ok(batch) = opened else {
             self.dead_letters
                 .push(cofre.clone(), DeadLetterReason::OpenFailed);
             return Ok(Disposition::DeadLettered);
