@@ -46,10 +46,11 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
 - 2026-06-21 — **MF-1 closed (passed-with-notes).** **H1 (ZK-completeness): CONFIRMED** — every rail function
   computes from the authenticated header + seal alone; none reassigned to the terminal (see
   `design/01-rail-surface.md`); conditioned on `INV-SEAL-COMPLETE` + the accepted metadata residual
-  (size/timing/idem-token). **AEAD decision (refined in design/03):** pluggable; **default = single-pass AES-256-GCM**, 256-bit, with a
-  **per-cofre fresh data key** → a random nonce is reuse-safe (no derived-nonce gymnastics). Dedup is the
-  **header HMAC `idempotency_key`**, so **no convergent encryption / no equality leak**. ChaCha20-Poly1305 for
-  non-AES-NI; GCM-SIV as a hardened option. **batch-many-records-per-cofre LOCKED** (one Ed25519 sig amortized per lote).
+  (size/timing/idem-token). **AEAD decision (refined AGAIN by AUDIT-01 — see design/03):** pluggable; **default = AES-256-GCM-SIV**
+  (nonce-misuse-resistant — closes the fork-reseed footgun + matches DECOMPOSITION A3). Per-cofre fresh key =
+  defense-in-depth; plain AES-256-GCM = opt-in perf mode **gated on key-uniqueness**; ChaCha20-Poly1305 (12-B)
+  for non-AES-NI. Dedup = header `idempotency_key = HMAC(tenant_secret, record_key)` (record-key); no convergent
+  encryption, no derived nonce. **batch-many-records-per-cofre LOCKED** (one Ed25519 sig amortized per lote).
   **`GATE-WARP` target = PENDING** a re-bench on representative VAES hardware (no representative box now;
   labeled, NOT blocking).
 
@@ -74,3 +75,22 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   adversarial audit (clone panel) → close blockers → freeze MF-2 (content-hash) → ROADMAP → MF-3 contract
   freeze → Kage-Bunshin fan-out build → test → AC-10 benchmark → final audit → deliver. Standing PENDING:
   GATE-WARP re-bench (VAES HW), AC-10 external engines, trio ratification (owner) — labeled, never faked.
+- 2026-06-21 — **6-lens audit complete (AUDIT-01): NOT freeze-ready — 8 blockers + 17 majors, all cold-verified
+  REAL** (the audit earned its keep — caught a self-contradicting AC-1 test, a signer-substitution forgery, missing
+  domain separation, a dedup-replay double-commit race, parse-before-verify). **Closed this pass (02/03/BUILD_LOG):**
+  BLK-1 (AEAD→GCM-SIV default), BLK-4 (verify-pinned-key MUST), BLK-5 (domain separation), MAJ-4 (sender-cert
+  issuer), MAJ-6 (cofre_id not a dedup key), BLK-7 (parse-before-verify in 02; 06 pending). **Remaining → task #14:**
+  BLK-2 (idempotency record_key propagate), BLK-3 (AC-1 — trio), BLK-6 (dedup watermark-reject, 05), BLK-8 (proof
+  binding, 04), MAJ-1/2/3/5/7/8 → then **re-audit** → freeze MF-2.
+
+## §6 — STOP-THE-LINE / owner-ratification log
+
+- 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
+  They do **not** change the demand intent — they fix an over-specified mechanism + a faulty test the audit caught.
+  (To be applied to the DRAFT next iteration; flagged here because the trio is owner-reserved.)
+  1. **A3** → "pluggable AEAD, default AES-256-GCM-SIV (misuse-resistant), per-cofre fresh key + random nonce;
+     ChaCha20/AES-GCM alternates" (was "GCM-SIV/XChaCha + derived nonce"). [BLK-1]
+  2. **AC-1 metamorphic** → opacity = independence from *plaintext* (swap payload for another validly-sealed
+     ciphertext of equal length, re-signed, routing fixed → identical rail behavior); was "zero payload →
+     byte-identical", which contradicts `cofre_id=BLAKE3(CARGA)`. [BLK-3]
+  3. **C1** → `idempotency_key` preimage = `record_key`, not `content`. [BLK-2]
