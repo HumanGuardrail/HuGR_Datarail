@@ -230,6 +230,23 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   DIRECTIONAL pending a re-confirm run; GATE-WARP still PENDING representative VAES HW (#13). **12 crates · 78
   tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no `#[allow]`.
 
+- 2026-06-22 — **P3 #25: `QuicSubstrate` — real cross-host QUIC (quinn) = AC-6 named substrate 2/3.** New
+  quarantined crate `datarail-substrate-quic` (keeps the heavy quinn/tokio/rustls tree out of the std-only rail
+  core — *leveza*). Empirically de-risked first: the full dep tree (quinn 0.11.11, ring 0.17.14, tokio 1.52.3,
+  rustls 0.23.41) **builds here** (cc+perl present → ring backend; sidesteps aws-lc-rs's missing nasm).
+  Implementation: owns a multi-thread Tokio runtime, drives quinn's async API via `block_on` behind the sync
+  `Substrate` trait; **one ordered uni-stream of length-prefixed cofres per connection** (a single QUIC stream
+  is reliable+ordered → FIFO matches the harness, same framing as TCP). Shapes: `loopback_pair()` (both ends,
+  conformance + same-host), `connect()` (source/send), `server()` (dest/recv, lazy connection+stream accept).
+  **Blind relay (SPEC 07):** the client deliberately does NOT verify the server cert — confidentiality is the
+  cofre's seal, not TLS; an embedded dev P-256 cert (non-secret, openssl-generated since rcgen isn't cached)
+  only satisfies QUIC's mandatory TLS-1.3 handshake. Holds no keys, does no cofre crypto (`INV-DUMB-PIPE`).
+  Passes `substrate_conformance` over a real QUIC handshake + a real **two-endpoint cross-thread** transfer
+  (byte-for-byte). **AC-6 now 2/3 named (object-store + QUIC = cross-cloud + cross-host); only shmem (#24,
+  blocked-on-owner) remains.** **13 crates · 80 tests** green · clippy deny(all+pedantic) · forbid(unsafe) · no
+  `#[allow]`. (Our crate stays unsafe-free; quinn/ring's unsafe is internal to those deps — no Charter issue,
+  unlike shmem where WE would need the unsafe.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

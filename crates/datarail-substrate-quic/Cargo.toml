@@ -1,0 +1,21 @@
+[package]
+name = "datarail-substrate-quic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail QUIC substrate — cross-host streams over quinn; transport only, the cofre stays sealed (SPEC 07)."
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-cofre = { path = "../datarail-cofre" }
+# QUIC for streams/flow/NAT only — NOT confidentiality (the cofre is already sealed; validates DERP blind-relay).
+# ring backend (cc+perl present); avoids aws-lc-rs (needs nasm, missing here). SPEC-07 names quinn (frozen scope).
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "sync"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+datarail-rail = { path = "../datarail-rail" }
