@@ -25,7 +25,6 @@ public class DatarailBenchmarkProducer implements BenchmarkProducer {
     private final DataInputStream in;
     private final ConcurrentLinkedQueue<CompletableFuture<Void>> pending = new ConcurrentLinkedQueue<>();
     private final Thread ackReader;
-    private final Thread flusher;
     private volatile boolean closed;
 
     DatarailBenchmarkProducer(String host, int port, String topic) throws IOException {
@@ -42,28 +41,21 @@ public class DatarailBenchmarkProducer implements BenchmarkProducer {
         this.ackReader = new Thread(this::readAcks, "datarail-ack-" + topic);
         this.ackReader.setDaemon(true);
         this.ackReader.start();
-        // Periodic flusher: sendAsync writes into the buffered stream WITHOUT flushing per message (a
-        // per-message flush is one syscall per message — it caps producer throughput exactly like the
-        // shim's old unbuffered path did). Flushing every ~1 ms coalesces a burst into few syscalls while
-        // bounding added latency to ~1 ms.
-        this.flusher = new Thread(this::flushLoop, "datarail-flush-" + topic);
-        this.flusher.setDaemon(true);
-        this.flusher.start();
+        // sendAsync writes into the buffered stream WITHOUT flushing per message (a per-message flush is one
+        // syscall per message — it caps producer throughput). A single process-wide SharedFlusher coalesces
+        // every producer's buffer every ~0.8 ms, bounding latency without a thread per producer.
+        SharedFlusher.register(this);
     }
 
-    private void flushLoop() {
+    /** Flush this producer's buffered writes; called by the shared flusher. Swallows errors after close. */
+    void flushBuffered() {
         try {
-            while (!closed) {
-                Thread.sleep(0, 800_000); // ~0.8 ms
-                synchronized (out) {
-                    out.flush();
-                }
+            synchronized (out) {
+                out.flush();
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
         } catch (IOException e) {
             if (!closed) {
-                log.debug("flush loop ended", e);
+                log.debug("flush", e);
             }
         }
     }
@@ -112,6 +104,7 @@ public class DatarailBenchmarkProducer implements BenchmarkProducer {
     @Override
     public void close() throws Exception {
         closed = true;
+        SharedFlusher.unregister(this);
         try {
             socket.close();
         } catch (IOException e) {
