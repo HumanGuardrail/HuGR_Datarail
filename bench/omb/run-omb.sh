@@ -11,8 +11,16 @@ set -uo pipefail
 
 SYS="$1"; WL="$2"; RESULTS="$3"
 SHIM_PID=""
-RUN_TIMEOUT="${RUN_TIMEOUT:-600}"   # hard cap per system (seconds)
-export HEAP_OPTS="-Xms1G -Xmx2G"    # OMB client heap — modest so it coexists with a colocated broker
+RUN_TIMEOUT="${RUN_TIMEOUT:-900}"   # hard cap per system (seconds)
+# Size the OMB client heap to the box: ~45% of total RAM (leaves room for the colocated broker + shim + OS).
+# A small 7 GB runner gets ~3 GB; a 64 GB larger-runner gets ~28 GB — enough headroom for rate-discovery,
+# which is what OOM'd the tiny runner. Overridable via HEAP_OPTS.
+if [ -z "${HEAP_OPTS:-}" ]; then
+  mem_kb=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 7000000)
+  heap_g=$(( mem_kb * 45 / 100 / 1024 / 1024 )); [ "$heap_g" -lt 1 ] && heap_g=1
+  export HEAP_OPTS="-Xms1G -Xmx${heap_g}G"
+fi
+echo "OMB client heap: $HEAP_OPTS"
 mkdir -p "$RESULTS"
 OUT="$RESULTS/$SYS.out"
 
