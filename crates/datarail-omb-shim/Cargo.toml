@@ -1,0 +1,20 @@
+[package]
+name = "datarail-omb-shim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-omb-shim — a mini-broker on datarail's real sealed terminals so the OpenMessaging Benchmark can drive datarail (see docs/design/OMB-PROTOCOL.md). Benchmark adapter, NOT a product component."
+
+[[bin]]
+name = "datarail-omb-shim"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
+datarail-rail = { path = "../datarail-rail" }
+datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
+datarail-terminal = { path = "../datarail-terminal" }

@@ -20,6 +20,7 @@ members = [
     "crates/datarail-bench",
     "crates/datarail-stress",
     "crates/datarail-metrics",
+    "crates/datarail-omb-shim",
 ]
 
 [workspace.package]
