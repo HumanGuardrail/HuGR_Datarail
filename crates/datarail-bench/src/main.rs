@@ -147,5 +147,53 @@ fn main() {
     }
     println!("  (a real WAN adds WanLink latency x hop + loss; AC-8 resume + dedup recover drops — see tests.)");
 
+    head_to_head(&cfg, &contract, src_seed, src_vk, dest_secret);
+
     fairness::report();
+}
+
+/// HEAD-TO-HEAD: datarail moving the SAME workload Kafka was measured on (256 B records), batched + SEALED,
+/// through the full board → loopback → offload pipe. Kafka (2 vCPU, 256 B, acks=1, PLAINTEXT) measured
+/// 90,661 rec/s / 22 MB/s; datarail seals every record AND is provider-blind. Apples-to-apples on record size;
+/// batching amortizes the per-cofre X25519 wrap (SPEC: batch-many-records-per-cofre).
+fn head_to_head(
+    cfg: &TerminalConfig,
+    contract: &ContentContract,
+    src_seed: [u8; 32],
+    src_vk: [u8; 32],
+    dest_secret: [u8; 32],
+) {
+    const REC: usize = 256;
+    const PER_COFRE: usize = 1024;
+    println!("\nhead-to-head workload (256 B records, 1024/cofre, full board->loopback->offload, SEALED):");
+    let mut payload = b"evt:".to_vec();
+    payload.resize(REC, b'x');
+    let recs: Vec<&[u8]> = (0..PER_COFRE).map(|_| payload.as_slice()).collect();
+    let iters: u32 = 1000;
+    let mut s = SourceTerminal::new(cfg.clone(), contract.clone(), src_seed);
+    let mut d = DestTerminal::new(cfg.clone(), contract.clone(), src_vk, [22; 32], dest_secret);
+    let mut sub = LoopbackSubstrate::new();
+    for _ in 0..(iters / 10).max(1) {
+        let c = s.board(&recs, b"warm").unwrap();
+        sub.send(&c).unwrap();
+        while sub.recv().ok().flatten().is_none() {}
+    }
+    let t = Instant::now();
+    for i in 0..iters {
+        let rk = u64::from(i).to_le_bytes(); // unique per cofre ⇒ Delivered (not deduped)
+        let c = s.board(&recs, &rk).unwrap();
+        sub.send(&c).unwrap();
+        loop {
+            if let Some(g) = sub.recv().ok().flatten() {
+                black_box(d.offload(&g).unwrap());
+                sub.ack(g.etiqueta.cofre_id).ok();
+                break;
+            }
+        }
+    }
+    let micros = u64::try_from(t.elapsed().as_micros()).unwrap_or(u64::MAX).max(1);
+    let total = u64::from(iters).saturating_mul(u64::try_from(PER_COFRE).unwrap_or(1));
+    let recs_per_s = total.saturating_mul(1_000_000) / micros;
+    let mb_per_s = total.saturating_mul(u64::try_from(REC).unwrap_or(1)) / micros;
+    println!("  datarail SEALED: {recs_per_s:>10} rec/s  ({mb_per_s} MB/s)   [Kafka ref 2vCPU: 90,661 rec/s / 22 MB/s, PLAINTEXT]");
 }
