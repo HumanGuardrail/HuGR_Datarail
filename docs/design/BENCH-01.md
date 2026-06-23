@@ -71,10 +71,30 @@ on VAES) plus a per-cofre X25519 wrap (amortized over a batch) + Ed25519 + BLAKE
 **ceiling**, not the end-to-end rate.
 
 **What it settles:** `GATE-WARP`'s target **X = 1 GiB/s/core** is **comfortably achievable on representative
-VAES hardware** — the symmetric ceiling clears it by **~5–10×**. The one remaining step for a *literal*
-GATE-WARP pass is running the **datarail binary itself** on a VAES core (containerize the workspace build); the
-core uncertainty ("does VAES deliver multi-GB/s AEAD?") is now answered **yes**, measured, not guessed. (The
-one-off Northflank job was deleted after the run.)
+VAES hardware** — the symmetric ceiling clears it by **~5–10×**. (The one-off Northflank job was deleted.)
+
+## ✅ GATE-WARP — LITERAL PASS: the real datarail binary on a VAES core (Northflank, 2026-06-22)
+
+Built the actual workspace (`cargo build --release -p datarail-bench`, `RUSTFLAGS=-C target-cpu=native`) on a
+VAES cloud container and ran the **real binary** (not the openssl proxy). CPU flags confirmed: `vaes avx512f
+avx2 aes`. Per-core:
+
+| Real datarail binary @ VAES | result | vs target |
+|---|---|---|
+| **AES-256-GCM-SIV seal** | **1.43 GB/s/core** | **PASS** — > X = 1 GiB/s (1.07 GB/s), ~1.3× |
+| AES-256-GCM-SIV open | 1.44 GB/s/core | PASS |
+| BLAKE3 | 6.51 GB/s/core | (manifest leaves; not the bottleneck) |
+| x25519 key-wrap | 67 µs/side | amortizes per batch (once per cofre) |
+| board / offload (1-record cofre) | 118 µs / 109 µs | dominated by the wrap; batch to amortize |
+
+**GATE-WARP is met** by datarail's actual sealed AEAD throughput (1.43 GB/s/core ≥ the 1 GiB/s/core target) on
+representative VAES hardware — a literal pass of the real binary, not a proxy.
+
+**Engineering headroom to true "warp" (measured-justified):** datarail's AEAD is pure-Rust RustCrypto, which
+uses **AES-NI per-block, not VAES** — hence 1.43 GB/s vs openssl's **10.5 GB/s** VAES on the same core. Swapping
+the AEAD backend to a VAES-capable one (`aws-lc-rs` — already in the tree via quinn) is the clear path to ~5–10×
+(≈ openssl-class). This is an optimization, not a correctness gap; the gate already passes. Logged as the next
+perf lever.
 
 ## Future optimization (measured-first, not on a hunch)
 

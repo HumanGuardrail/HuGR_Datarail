@@ -514,6 +514,15 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   REST API with the saved context token; trigger job runs via `POST /v1/projects/{p}/jobs/{j}/runs`, read
   output via `exec job --cmd` into a long-lived container — logs aren't fetchable by token, only via log-sinks.)
 
+- 2026-06-22 — **GATE-WARP LITERAL PASS — the real datarail binary on a VAES core.** Built the actual
+  workspace on a Northflank VAES container (uploaded source via `upload job file`, `setsid -f` detached build,
+  `RUSTFLAGS=-C target-cpu=native`, read results via `exec cat`). CPU flags `vaes avx512f avx2 aes` confirmed.
+  **Real datarail-bench: AES-256-GCM-SIV seal 1.43 GB/s/core, open 1.44 — ≥ X=1 GiB/s ⇒ GATE-WARP PASSES**
+  (literal binary, not the openssl proxy). BLAKE3 6.5 GB/s; x25519 wrap 67 µs/side (amortizes per batch);
+  board/offload 118/109 µs per 1-record cofre. **Engineering headroom logged:** RustCrypto AEAD uses AES-NI not
+  VAES (1.43 vs openssl 10.5 GB/s) → `aws-lc-rs` VAES backend = path to ~5–10× (perf lever, not a gap). BENCH-01
+  + DOD-01 updated (GATE-WARP → PROVEN). Container deleted after the run.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
