@@ -18,3 +18,10 @@ datarail-crypto = { path = "../datarail-crypto" }
 datarail-rail = { path = "../datarail-rail" }
 datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
 datarail-terminal = { path = "../datarail-terminal" }
+
+# tokio is QUARANTINED to this benchmark adapter. The shim is NOT a product / core / sealed-path crate; the
+# Charter *leveza* (zero-external-deps) rule binds those crates, not this OMB measurement harness. tokio is here
+# only to run async socket I/O so each connection is a task (not an OS thread) — killing the thread-per-conn
+# oversubscription that capped the old std-threaded shim at ~620 MB/s on a many-core box. The CPU-bound sealed
+# datapath still runs on a dedicated OS thread per topic, never on a runtime worker.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
