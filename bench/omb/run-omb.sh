@@ -46,9 +46,10 @@ case "$SYS" in
   rabbitmq)
     # Port-mapped (NOT --network host: that broke the erlang cookie). A non-`guest` user (guest is loopback-only,
     # which a -p gateway connection would reject) — the driver config authenticates as omb:omb over the URI.
-    # RABBITMQ_ERLANG_COOKIE makes the entrypoint write a fresh, correctly-permissioned cookie — without it the
-    # image hits "Error when reading /var/lib/rabbitmq/.erlang.cookie: eacces" on the GH runner's overlay fs.
-    docker run -d -p 5672:5672 \
+    # A tmpfs data dir gives a fresh, correctly-permissioned /var/lib/rabbitmq so the erlang cookie is readable
+    # by the rabbitmq user — the GH runner's overlay fs otherwise yields ".erlang.cookie: eacces" and the node
+    # never starts. (Verified locally: with tmpfs the broker reaches "Server startup complete".)
+    docker run -d -p 5672:5672 --tmpfs /var/lib/rabbitmq:rw,mode=1777 \
       -e RABBITMQ_ERLANG_COOKIE=omb-bench-cookie \
       -e RABBITMQ_DEFAULT_USER=omb -e RABBITMQ_DEFAULT_PASS=omb --name omb-rabbit rabbitmq:3.13 >/dev/null
     echo "waiting for rabbitmq node + :5672 ..."
