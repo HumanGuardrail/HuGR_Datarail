@@ -382,6 +382,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-omb-shim"
+version = "0.0.0"
+dependencies = [
+ "datarail-core",
+ "datarail-crypto",
+ "datarail-rail",
+ "datarail-substrate-shmem",
+ "datarail-terminal",
+]
+
+[[package]]
 name = "datarail-once"
 version = "0.0.0"
 dependencies = [
