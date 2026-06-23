@@ -47,7 +47,7 @@ case "$SYS" in
       # crypto from us → low bias). Certs land on the HOST (/tmp/kcerts) so the host-side OMB client can read the
       # truststore. NOTE: TLS encrypts client↔broker in transit; the BROKER still sees plaintext (NOT
       # provider-blind like datarail). This measures the throughput cost of "encrypted Kafka" as commonly run.
-      CERTS=/tmp/kcerts; rm -rf "$CERTS"; mkdir -p "$CERTS"
+      CERTS=/tmp/kcerts; rm -rf "$CERTS"; mkdir -p "$CERTS"; chmod 777 "$CERTS" # writable by the kafka image's non-root user
       docker run --rm -v "$CERTS":/certs apache/kafka:3.8.0 bash -c '
         keytool -genkeypair -alias broker -keyalg RSA -keysize 2048 -validity 3650 \
           -keystore /certs/server.keystore.jks -storepass changeit -keypass changeit \
