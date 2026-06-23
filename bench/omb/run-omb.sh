@@ -34,26 +34,29 @@ wait_port() {
 
 case "$SYS" in
   kafka)
-    docker run -d --name omb-kafka -p 9092:9092 -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" apache/kafka:3.8.0 >/dev/null
+    # --network host: kafka binds 9092 on the host; advertised localhost:9092 resolves for the colocated client.
+    docker run -d --network host --name omb-kafka -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" apache/kafka:3.8.0 >/dev/null
     echo "waiting for kafka :9092 ..."
-    if ! wait_port localhost 9092 90; then echo "::error::kafka never opened :9092"; exit 1; fi
+    if ! wait_port localhost 9092 150; then echo "::error::kafka never opened :9092"; docker logs --tail 40 omb-kafka || true; exit 1; fi
     for _ in $(seq 1 30); do
       docker exec omb-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && break
       sleep 2
     done
     DRIVER="driver-kafka-local.yaml" ;;
   rabbitmq)
-    docker run -d --name omb-rabbit -p 5672:5672 rabbitmq:3.13 >/dev/null
+    # --network host so the OMB client connects to rabbitmq over loopback — the default `guest` user is only
+    # permitted from loopback, which a -p port-map (gateway address) would break.
+    docker run -d --network host --name omb-rabbit rabbitmq:3.13 >/dev/null
     echo "waiting for rabbitmq node + :5672 ..."
-    for _ in $(seq 1 60); do docker exec omb-rabbit rabbitmqctl await_startup >/dev/null 2>&1 && break; sleep 2; done
-    if ! wait_port localhost 5672 60; then echo "::error::rabbitmq never opened :5672"; exit 1; fi
+    for _ in $(seq 1 90); do docker exec omb-rabbit rabbitmqctl await_startup >/dev/null 2>&1 && break; sleep 2; done
+    if ! wait_port localhost 5672 90; then echo "::error::rabbitmq never opened :5672"; docker logs --tail 40 omb-rabbit || true; exit 1; fi
     DRIVER="driver-rabbitmq-local.yaml" ;;
   pulsar)
-    docker run -d --name omb-pulsar -p 6650:6650 -p 8080:8080 \
+    docker run -d --network host --name omb-pulsar \
       -e PULSAR_MEM="-Xms512m -Xmx2g" apachepulsar/pulsar:3.3.1 bin/pulsar standalone >/dev/null
     echo "waiting for pulsar :6650 + admin ..."
-    if ! wait_port localhost 6650 120; then echo "::error::pulsar never opened :6650"; exit 1; fi
-    for _ in $(seq 1 30); do curl -sf localhost:8080/admin/v2/clusters >/dev/null 2>&1 && break; sleep 2; done
+    if ! wait_port localhost 6650 180; then echo "::error::pulsar never opened :6650"; docker logs --tail 40 omb-pulsar || true; exit 1; fi
+    for _ in $(seq 1 45); do curl -sf localhost:8080/admin/v2/clusters >/dev/null 2>&1 && break; sleep 2; done
     DRIVER="driver-pulsar-local.yaml" ;;
   datarail)
     ./datarail-omb-shim >"$RESULTS/datarail-shim.log" 2>&1 &
