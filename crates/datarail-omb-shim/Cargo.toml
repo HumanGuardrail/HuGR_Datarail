@@ -17,6 +17,11 @@ path = "src/main.rs"
 name = "datarail-loadgen"
 path = "src/bin/loadgen.rs"
 
+# datarail's pure sealed-engine throughput (board→offload in N threads, no sockets/driver) — the real ceiling.
+[[bin]]
+name = "datarail-engine-bench"
+path = "src/bin/engine_bench.rs"
+
 [lints]
 workspace = true
 

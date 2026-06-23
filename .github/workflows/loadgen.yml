@@ -75,3 +75,22 @@ jobs:
             done
           done
           cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Engine ceiling — pure sealed throughput (no sockets/driver)
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### datarail sealed-engine ceiling (board→offload, N threads, no sockets, vaes=${{ inputs.vaes }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "| threads | msg size | msg/s | MB/s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          CORES=$(nproc)
+          IFS=',' read -ra SIZES <<< "${{ inputs.msg_sizes }}"
+          for sz in "${SIZES[@]}"; do
+            for th in "$CORES" "$((CORES/2))"; do
+              OUT=$(./target/release/datarail-engine-bench "$th" "$sz" 128 15 2>&1 | grep RESULT)
+              echo "engine: $OUT"
+              ms=$(echo "$OUT" | sed -E 's/.*: ([0-9]+) msg\/s.*/\1/')
+              mb=$(echo "$OUT" | sed -E 's/.* ([0-9]+) MB\/s.*/\1/')
+              echo "| $th | ${sz} B | ${ms:-?} | ${mb:-?} |" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done
+          cat "$GITHUB_STEP_SUMMARY"
