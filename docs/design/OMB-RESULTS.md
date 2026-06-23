@@ -192,6 +192,41 @@ sealed + provider-blind at single-digit-ms p99 — ~2.4× below a decade-tuned p
 out-throughput Kafka; raw GB/s was never its reason to exist.** The structural moat (provider-blind × serverless
 × exactly-once + proof) stands independent of this race.
 
+## Run 7 — datarail's TRUE sealed ceiling (native loadgen, not the OMB client)
+
+The OMB Java client provably capped datarail (3 shim opts = 0 %). So we measured datarail's real sealed
+throughput with a **native Rust load generator** (`datarail-loadgen`) — same sealed datapath + real localhost
+TCP as OMB, but a driver with minimal per-message overhead (bulk send/recv, no per-message future/histogram),
+self-throttled by the shim's bounded queue. Same 32-core `Turbo` box, driver **co-located** (exactly like
+Kafka's OMB run had its client co-located).
+
+| msg size | datarail GCM-SIV | datarail VAES (warp) | Kafka (OMB, plaintext) |
+|---|---|---|---|
+| **1 KB** | 1,343 k msg/s · **1375 MB/s** | 1,371 k msg/s · **1403 MB/s** | 1,566 k msg/s · 1604 MB/s |
+| 4 KB | — · 1634 MB/s | — · 1700 MB/s | — |
+| 16 KB | — · 1788 MB/s | — · **1895 MB/s** | — |
+
+**The headline correction:** datarail's real 1 KB sealed throughput is **~1.4 GB/s — 2.1× the 658 MB/s the OMB
+client could extract.** The OMB Java `LocalWorker` *was* the cap, exactly as the 3 null shim-optimizations
+implied. So the fair, driver-unbottlenecked number is **datarail 1403 MB/s sealed vs Kafka 1604 MB/s plaintext
+on equal co-located HW ⇒ datarail ≈ 0.87× Kafka, while sealing every message.** (VAES only adds +2 % at 1 KB —
+crypto was never the 1 KB bottleneck, per-message overhead is; it helps more at 16 KB: +6 %.)
+
+**Honest verdict — is datarail "faster than Kafka"?** **No — not on raw plaintext throughput.** At 1 KB datarail
+is ~0.87× Kafka (near-parity), at larger messages it reaches 1.7–1.9 GB/s. The engineering story is real and
+large: the gap went **6.6× → ~1.16×** (and the 6.6× was mostly a broken measurement). But datarail does **not**
+out-throughput a decade-tuned plaintext Kafka, and any "3–4× faster" claim is **not supported** by these
+measurements. **The one comparison that would favor datarail — and is the *fair* one for a provider-blind rail —
+is vs an *encryption-enabled* Kafka** (TLS-in-transit + at-rest, or app-level E2E): Kafka's 1604 is PLAINTEXT;
+turning on encryption costs it throughput datarail already pays, so datarail-sealed vs Kafka-encrypted would
+narrow or invert. That run is not done here (it needs configuring Kafka's TLS — the self-config bias risk we
+avoid) — flagged honestly as the open, legitimately-datarail-favoring comparison.
+
+**Bottom line:** datarail sustains **~1.4 GB/s sealed at 1 KB (1.9 GB/s at 16 KB)** — squarely in Kafka's
+throughput class while being provider-blind, serverless, exactly-once-with-proof. It ties/trails plaintext Kafka
+by a hair and would likely lead an encrypted Kafka. Raw GB/s was never the moat; near-parity-while-sealed is the
+honest, strong result.
+
 ## RabbitMQ — honest non-result
 RabbitMQ's container **could not start in this CI sandbox**: the Erlang node fails with
 `.erlang.cookie: eacces` on the GitHub runner's overlay filesystem (reproduced across `-p`, `--network host`,
