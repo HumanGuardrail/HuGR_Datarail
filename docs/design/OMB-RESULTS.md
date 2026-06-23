@@ -107,6 +107,37 @@ is NOT a throughput-beats-Kafka story.** Anyone claiming otherwise is selling so
 moat (provider-blind × serverless × exactly-once + proof) at *respectable* sealed throughput (232 MB/s would
 saturate a 1.8 Gbps link) with the most predictable latency. Different tool, different job — measured honestly.
 
+## Run 4 — ENGINEERING closes the gap (2026-06-23)
+
+The Run 3 throughput gap was **not fundamental — it was unbuffered, per-message socket I/O on both sides.**
+Fixing it (pure engineering, same workload/HW: 16-topic rate-discovery, 32-core Turbo, sealed):
+
+| datarail config | throughput | note |
+|---|---|---|
+| 4 topics, unbuffered | 232 MB/s | Run 3 baseline |
+| 16 topics, unbuffered | 269 MB/s | +cores barely moved it ⇒ **not core-bound** |
+| 16 topics, **shim** I/O buffered | 278 MB/s | shim `BufReader`/`BufWriter` |
+| 16 topics, **both** sides buffered | **624 MB/s** | + Java producer batch-flush (was flushing per message) |
+
+**+2.7× from I/O buffering alone.** datarail now sustains **624 MB/s sealed at p99 7 ms** (tight: p50 4 /
+p99 7 / p99.9 8 ms). **The gap to Kafka (1,604 MB/s) fell from 6.6× to 2.6×** — and datarail is sealing every
+message while Kafka runs plaintext.
+
+**Root cause (both were the same classic bug):** the shim did ~4 syscalls/msg (unbuffered frame reads + acks +
+delivery writes); the OMB Java producer did `flush()` per `sendAsync`. At ~270k msg/s that is ~1 M syscalls/s —
+the ceiling. Coalescing I/O (BufReader/BufWriter on the shim, a ~0.8 ms background flusher on the producer)
+removed it. Kafka was never CPU-faster here; it just batched I/O and the adapter didn't.
+
+**Remaining gap (honest):** datarail is now ~38 k msg/s per topic-worker × 16 ≈ 609 k — the per-worker rate is
+capped by per-message processing overhead (Vec allocations + the fan-out payload clone + channel ops) and by
+thread oversubscription (16 shim workers + the OMB client's threads on 32 cores). Closing the last 2.6× needs
+hot-path allocation reduction + parallelism tuning — real work, not yet done. **Crypto is NOT the limit**
+(GCM-SIV seals 1 KB in ~0.7 µs, <6 % of the per-message cost — so the VAES backend wouldn't move this number).
+
+**Honest standing:** Kafka still leads raw throughput (1.6 GB/s vs 624 MB/s, 2.6×), but the "6.6× slower"
+verdict was an artifact of an unoptimized adapter, not datarail's design. With straightforward engineering
+datarail does **624 MB/s sealed + provider-blind at 7 ms p99** — and the path to closing the rest is identified.
+
 ## RabbitMQ — honest non-result
 RabbitMQ's container **could not start in this CI sandbox**: the Erlang node fails with
 `.erlang.cookie: eacces` on the GitHub runner's overlay filesystem (reproduced across `-p`, `--network host`,
