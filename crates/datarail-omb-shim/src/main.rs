@@ -25,7 +25,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -619,17 +619,30 @@ fn serve_ingress(stream: TcpStream, registry: &Registry, cfg: &Config) {
 
 /// The fallible body of [`serve_ingress`]; every framing/socket error bubbles up as `io::Error` to end the
 /// connection thread without panicking.
-fn serve_ingress_inner(mut stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
-    let topic = read_topic_header(&mut stream)?;
+fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
+    // Buffered I/O on BOTH directions: an unbuffered per-message read+ack is ~3 syscalls/msg, which caps
+    // throughput at the syscall rate (the real bottleneck, not the crypto). A BufReader coalesces frame reads
+    // and a BufWriter coalesces acks; acks flush when we have caught up to the socket (so a streaming producer
+    // still gets timely acks, but a burst is acked in one write).
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut acks = BufWriter::new(stream);
+    let topic = read_topic_header(&mut reader)?;
     let handle = topic_handle(registry, cfg, &topic)
         .ok_or_else(|| std::io::Error::other("topic registry unavailable"))?;
 
     let mut seq: u64 = 0;
     let mut hdr = [0u8; 12]; // [u32 payload_len][u64 publish_ts]
     loop {
-        // Read the 12-byte frame header; a clean EOF here ends the producer.
-        match read_exact_or_eof(&mut stream, &mut hdr)? {
-            ReadEnd::Eof => return Ok(()),
+        // Read the 12-byte frame header; a clean EOF here ends the producer. Flush any pending acks first so a
+        // producer that paused is not left waiting on buffered-but-unsent acks.
+        if reader.buffer().is_empty() {
+            acks.flush()?;
+        }
+        match read_exact_or_eof(&mut reader, &mut hdr)? {
+            ReadEnd::Eof => {
+                acks.flush()?;
+                return Ok(());
+            }
             ReadEnd::Full => {}
         }
         let payload_len = u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
@@ -644,14 +657,19 @@ fn serve_ingress_inner(mut stream: TcpStream, registry: &Registry, cfg: &Config)
         // Assemble the record `{publish_ts(8 BE) || payload}` directly, reading the payload into place.
         let mut record = vec![0u8; 8 + payload_len];
         record[0..8].copy_from_slice(&publish_ts.to_be_bytes());
-        stream.read_exact(&mut record[8..])?;
+        reader.read_exact(&mut record[8..])?;
 
-        // Hand to the worker (the accept point), then ack in receive order. A worker-gone error ends us.
+        // Hand to the worker (the accept point; the bounded queue applies backpressure here), then buffer the
+        // ack in receive order. A worker-gone error ends us. Flush pending acks before a send that may block so
+        // the producer is never stalled waiting on acks we are holding.
+        if reader.buffer().is_empty() {
+            acks.flush()?;
+        }
         handle
             .ingress_tx
             .send(Ingested { record })
             .map_err(|_| std::io::Error::other("topic worker gone"))?;
-        stream.write_all(&seq.to_be_bytes())?;
+        acks.write_all(&seq.to_be_bytes())?;
         seq += 1;
     }
 }
@@ -678,9 +696,10 @@ fn serve_egress(stream: TcpStream, registry: &Registry, cfg: &Config) {
 /// The fallible body of [`serve_egress`]: register a subscriber channel, then write each delivered frame to
 /// the socket. The `sub` name is read per the protocol and (intentionally) used only to model an independent
 /// delivery copy — every subscription receives every message (OMB consumer-group semantics, v1).
-fn serve_egress_inner(mut stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
-    let topic = read_topic_header(&mut stream)?;
-    let _sub = read_len_prefixed_string(&mut stream)?; // independent fan-out copy per subscription (v1).
+fn serve_egress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let topic = read_topic_header(&mut reader)?;
+    let _sub = read_len_prefixed_string(&mut reader)?; // independent fan-out copy per subscription (v1).
 
     let handle = topic_handle(registry, cfg, &topic)
         .ok_or_else(|| std::io::Error::other("topic registry unavailable"))?;
@@ -691,20 +710,32 @@ fn serve_egress_inner(mut stream: TcpStream, registry: &Registry, cfg: &Config) 
         .map_err(|_| std::io::Error::other("subscriber registry poisoned"))?
         .push(tx);
 
-    // Stream delivered frames until the worker drops the sender (topic done) or the socket breaks.
+    // Buffered writer: a per-message `write_all` is one syscall per message and caps egress throughput at the
+    // syscall rate. We coalesce a burst of delivered frames into the buffer and flush only when the delivery
+    // channel momentarily drains — full throughput under load, still low-latency when idle.
+    let mut out = BufWriter::new(stream);
     let mut frame = Vec::new();
-    loop {
-        // `recv` errs only when the worker drops the sender (topic finished) — end the stream cleanly.
-        let Ok(delivered) = rx.recv() else {
-            return Ok(());
-        };
-        let payload_len = u32::try_from(delivered.payload.len())
-            .map_err(|_| std::io::Error::other("delivered payload exceeds u32"))?;
+    let mut write_frame = |w: &mut BufWriter<TcpStream>, d: &Delivered| -> std::io::Result<()> {
+        let payload_len =
+            u32::try_from(d.payload.len()).map_err(|_| std::io::Error::other("delivered payload exceeds u32"))?;
         frame.clear();
         frame.extend_from_slice(&payload_len.to_be_bytes());
-        frame.extend_from_slice(&delivered.publish_ts.to_be_bytes());
-        frame.extend_from_slice(&delivered.payload);
-        stream.write_all(&frame)?;
+        frame.extend_from_slice(&d.publish_ts.to_be_bytes());
+        frame.extend_from_slice(&d.payload);
+        w.write_all(&frame)
+    };
+    loop {
+        // Block for the next delivery; `recv` errs only when the worker drops the sender (topic done).
+        let Ok(delivered) = rx.recv() else {
+            out.flush()?;
+            return Ok(());
+        };
+        write_frame(&mut out, &delivered)?;
+        // Drain whatever else is immediately ready into the same buffer, then flush once.
+        while let Ok(more) = rx.try_recv() {
+            write_frame(&mut out, &more)?;
+        }
+        out.flush()?;
     }
 }
 
@@ -723,7 +754,7 @@ enum ReadEnd {
 /// Read exactly `buf.len()` bytes, distinguishing a clean EOF at the start (no bytes yet) from a truncated
 /// frame mid-read (which is an error). A frame header read uses this so a producer closing between frames ends
 /// the connection cleanly rather than erroring.
-fn read_exact_or_eof(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<ReadEnd> {
+fn read_exact_or_eof(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<ReadEnd> {
     let mut filled = 0usize;
     while filled < buf.len() {
         match stream.read(&mut buf[filled..]) {
@@ -742,7 +773,7 @@ fn read_exact_or_eof(stream: &mut TcpStream, buf: &mut [u8]) -> std::io::Result<
 }
 
 /// Read a `[u16 len][utf8]` length-prefixed string (big-endian). Used for the topic and the subscription name.
-fn read_len_prefixed_string(stream: &mut TcpStream) -> std::io::Result<String> {
+fn read_len_prefixed_string(stream: &mut impl Read) -> std::io::Result<String> {
     let mut len_bytes = [0u8; 2];
     stream.read_exact(&mut len_bytes)?;
     let len = u16::from_be_bytes(len_bytes) as usize;
@@ -752,7 +783,7 @@ fn read_len_prefixed_string(stream: &mut TcpStream) -> std::io::Result<String> {
 }
 
 /// Read the leading `[u16 topic_len][topic_utf8]` header common to both ingress and egress connections.
-fn read_topic_header(stream: &mut TcpStream) -> std::io::Result<String> {
+fn read_topic_header(stream: &mut impl Read) -> std::io::Result<String> {
     read_len_prefixed_string(stream)
 }
 
