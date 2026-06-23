@@ -165,13 +165,32 @@ datarail shim has headroom the harness cannot feed at this topology. (Kafka reac
 driver is a decade-tuned batched/zero-copy client — the comparison at the top end is partly a contest of
 *driver* efficiency, not just broker vs rail.)
 
-**Honest bottom line:** straightforward engineering closed the Kafka gap from **6.6× to 2.6×** (232 → 624 MB/s
-sealed, p99 7 ms). Past that, this harness measures its own Java client, not datarail — so a fair "max
-throughput" number here is **apparatus-limited at ~620 MB/s**, and a higher figure would require optimizing the
-OMB **driver** (or a non-OMB Rust load generator), i.e. measuring the measurement tool. **datarail is a sealed,
-provider-blind rail that sustains 624 MB/s at 7 ms p99 — it does not out-throughput a decade-tuned plaintext
-Kafka, and raw GB/s was never its reason to exist.** The structural moat (provider-blind × serverless ×
-exactly-once + proof) stands independent of this race.
+### Run 6 — optimize the Java driver too (the other side of the harness)
+The OMB Java driver was then rewritten to **shared NIO selectors** (one ack loop + one consumer loop for ALL
+streams, vs one reader thread per connection → driver threads 32 → 3). Verified correct on the 32-core run:
+**Pub err 0.0/s, consume rate == publish rate (no loss), backlog ~1–2 k (drained), no hang.** Result:
+**643 k msg/s / 658 MB/s — +6 % over 620.**
+
+### Full engineering progression (all 32-core Turbo, 16-topic, sealed, same workload)
+| stage | MB/s | Δ |
+|---|---|---|
+| naive adapter (4 topics) | 232 | — |
+| both-sides I/O buffered | 624 | **+2.7×** |
+| + shim hot-path (Arc/zero-split) | 624 | 0 % |
+| + shim flusher consolidation | 622 | 0 % |
+| + shim full async (tokio) | 620 | 0 % |
+| + Java driver NIO selectors | **658** | +6 % |
+
+**Honest bottom line:** straightforward engineering closed the Kafka gap from **6.6× to 2.4×** (232 → **658 MB/s**
+sealed, single-digit-ms p99). Optimizing BOTH sides — the Rust shim (async) AND the Java driver (NIO) — the
+aggregate tops out at **~658 MB/s**: every shim change after I/O buffering moved it ~0 % and the driver
+consolidation only +6 %, which localizes the residual ceiling to the **OMB `LocalWorker` framework
+orchestration itself** (in-process rate limiter + payload gen + latency histograms driving 32 streams), not
+datarail. A number beyond this needs a **non-OMB load generator** (to measure the shim's true ceiling directly)
+— but that would be our own harness again. **The honest, harness-grounded verdict: datarail sustains 658 MB/s
+sealed + provider-blind at single-digit-ms p99 — ~2.4× below a decade-tuned plaintext Kafka. It does not
+out-throughput Kafka; raw GB/s was never its reason to exist.** The structural moat (provider-blind × serverless
+× exactly-once + proof) stands independent of this race.
 
 ## RabbitMQ — honest non-result
 RabbitMQ's container **could not start in this CI sandbox**: the Erlang node fails with
