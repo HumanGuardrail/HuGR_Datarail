@@ -1,0 +1,29 @@
+[package]
+name = "datarail-stress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-stress — violent resilience/stress suite proving 0-loss/0-dup/0-leak under assault across the 5 flagship use cases."
+
+[lints]
+workspace = true
+
+# This crate is a pure test harness: a tiny shared `lib` of fixtures/helpers, with the violent assault
+# scenarios living in `tests/` (one integration binary per flagship use case + the cross-cutting forgery flood).
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
+datarail-cofre = { path = "../datarail-cofre" }
+datarail-terminal = { path = "../datarail-terminal" }
+datarail-rail = { path = "../datarail-rail" }
+datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
+datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }
+
+[dev-dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
+datarail-cofre = { path = "../datarail-cofre" }
+datarail-terminal = { path = "../datarail-terminal" }
+datarail-rail = { path = "../datarail-rail" }
+datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
+datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }

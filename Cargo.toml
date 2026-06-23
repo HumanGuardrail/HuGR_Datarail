@@ -18,6 +18,7 @@ members = [
     "crates/datarail-identity",
     "crates/datarail-acceptance",
     "crates/datarail-bench",
+    "crates/datarail-stress",
 ]
 
 [workspace.package]
