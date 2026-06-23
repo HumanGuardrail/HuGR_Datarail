@@ -25,6 +25,7 @@ public class DatarailBenchmarkProducer implements BenchmarkProducer {
     private final DataInputStream in;
     private final ConcurrentLinkedQueue<CompletableFuture<Void>> pending = new ConcurrentLinkedQueue<>();
     private final Thread ackReader;
+    private final Thread flusher;
     private volatile boolean closed;
 
     DatarailBenchmarkProducer(String host, int port, String topic) throws IOException {
@@ -41,6 +42,30 @@ public class DatarailBenchmarkProducer implements BenchmarkProducer {
         this.ackReader = new Thread(this::readAcks, "datarail-ack-" + topic);
         this.ackReader.setDaemon(true);
         this.ackReader.start();
+        // Periodic flusher: sendAsync writes into the buffered stream WITHOUT flushing per message (a
+        // per-message flush is one syscall per message — it caps producer throughput exactly like the
+        // shim's old unbuffered path did). Flushing every ~1 ms coalesces a burst into few syscalls while
+        // bounding added latency to ~1 ms.
+        this.flusher = new Thread(this::flushLoop, "datarail-flush-" + topic);
+        this.flusher.setDaemon(true);
+        this.flusher.start();
+    }
+
+    private void flushLoop() {
+        try {
+            while (!closed) {
+                Thread.sleep(0, 800_000); // ~0.8 ms
+                synchronized (out) {
+                    out.flush();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException e) {
+            if (!closed) {
+                log.debug("flush loop ended", e);
+            }
+        }
     }
 
     private void readAcks() {
@@ -76,7 +101,7 @@ public class DatarailBenchmarkProducer implements BenchmarkProducer {
                 out.writeInt(payload.length);
                 out.writeLong(ts);
                 out.write(payload);
-                out.flush();
+                // No per-message flush: the background flusher (~0.8 ms) coalesces writes into few syscalls.
             }
         } catch (IOException e) {
             future.completeExceptionally(e);
