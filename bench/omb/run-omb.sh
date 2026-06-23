@@ -82,14 +82,32 @@ case "$SYS" in
     echo "unknown system: $SYS"; exit 2 ;;
 esac
 
-echo "running OMB: driver=$DRIVER workload=$WL (timeout ${RUN_TIMEOUT}s)"
+echo "running OMB: driver=$DRIVER workload=$WL (cap ${RUN_TIMEOUT}s)"
 # No workers.yaml present => OMB uses the in-process LocalWorker (single-node).
-timeout "$RUN_TIMEOUT" bin/benchmark -d "$DRIVER" "workloads/$WL" 2>&1 | tee "$OUT"
-rc="${PIPESTATUS[0]}"
+# OMB's bin/benchmark often does NOT exit after writing its result (lingering non-daemon driver threads),
+# which would waste the whole timeout per system. So: run it in the background, and as soon as it has written
+# the result JSON ("Writing test result into ..."), grant a short flush then stop it. A hard cap still bounds a
+# genuine hang.
+bin/benchmark -d "$DRIVER" "workloads/$WL" > "$OUT" 2>&1 &
+bench_pid=$!
+rc=0; done_ok=0
+for _ in $(seq 1 "$RUN_TIMEOUT"); do
+  if ! kill -0 "$bench_pid" 2>/dev/null; then wait "$bench_pid"; rc=$?; break; fi
+  if grep -q "Writing test result into" "$OUT" 2>/dev/null; then
+    done_ok=1; sleep 3            # let the JSON finish flushing to disk
+    kill "$bench_pid" 2>/dev/null; pkill -P "$bench_pid" 2>/dev/null || true
+    break
+  fi
+  sleep 1
+done
+if [ "$done_ok" -eq 0 ] && kill -0 "$bench_pid" 2>/dev/null; then
+  echo "::warning::$SYS hit the ${RUN_TIMEOUT}s cap with no result — killing"
+  kill -9 "$bench_pid" 2>/dev/null || true; rc=124
+fi
 
 mv ./*.json "$RESULTS/" 2>/dev/null || true
-if [ "$rc" -eq 124 ]; then
-  echo "::warning::$SYS TIMED OUT after ${RUN_TIMEOUT}s"
+if [ "$done_ok" -eq 1 ]; then
+  rc=0
 elif [ "$rc" -ne 0 ]; then
   echo "::warning::$SYS exited rc=$rc — last lines:"; tail -20 "$OUT"
 fi
