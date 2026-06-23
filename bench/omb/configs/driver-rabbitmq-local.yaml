@@ -5,6 +5,6 @@ producerCreationBatchSize: 5
 consumerCreationDelay: 100
 consumerCreationBatchSize: 5
 amqpUris:
-  - amqp://localhost
+  - amqp://omb:omb@localhost:5672
 messagePersistence: false
 queueType: CLASSIC

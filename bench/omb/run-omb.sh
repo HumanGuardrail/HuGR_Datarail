@@ -44,9 +44,9 @@ case "$SYS" in
     done
     DRIVER="driver-kafka-local.yaml" ;;
   rabbitmq)
-    # --network host so the OMB client connects to rabbitmq over loopback — the default `guest` user is only
-    # permitted from loopback, which a -p port-map (gateway address) would break.
-    docker run -d --network host --name omb-rabbit rabbitmq:3.13 >/dev/null
+    # Port-mapped (NOT --network host: that broke the erlang cookie). A non-`guest` user (guest is loopback-only,
+    # which a -p gateway connection would reject) — the driver config authenticates as omb:omb over the URI.
+    docker run -d -p 5672:5672 -e RABBITMQ_DEFAULT_USER=omb -e RABBITMQ_DEFAULT_PASS=omb --name omb-rabbit rabbitmq:3.13 >/dev/null
     echo "waiting for rabbitmq node + :5672 ..."
     for _ in $(seq 1 90); do docker exec omb-rabbit rabbitmqctl await_startup >/dev/null 2>&1 && break; sleep 2; done
     if ! wait_port localhost 5672 90; then echo "::error::rabbitmq never opened :5672"; docker logs --tail 40 omb-rabbit || true; exit 1; fi
