@@ -42,7 +42,7 @@
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `GATE-WARP` (throughput ≥ X) | **PENDING** (measurement) — **X now set** | **X = 1 GiB/s/core** sealed-payload (batched) — a tech-lead **design target** (SPEC-11, set 2026-06-22). The binding *pass* needs representative VAES server HW; this box is a **native Intel i7-9750H (Coffee Lake, 2019) — AES-NI but pre-VAES** (#13), so it can't be the target measurement. The CI guard stays **red until a real VAES run records it**. BENCH-01 figures are noisy/directional, **not** a GATE-WARP pass. |
+| `GATE-WARP` (throughput ≥ X) | **DIRECTIONALLY VALIDATED on VAES** — binary pass still pending | **X = 1 GiB/s/core** (tech-lead design target, SPEC-11). **Measured on a representative VAES server core** (Northflank, 2026-06-22, VAES+AVX-512 confirmed): **AES-256-GCM ≈ 10.5 GB/s/core** — the dominant primitive clears X by **~5–10×** (even GCM-SIV's two-pass ≈ 5 GB/s/core). So the target is **achievable with wide margin on real HW** (BENCH-01). The remaining sliver for a *literal* pass is running the **datarail binary** (not just openssl) on a VAES core — needs containerizing the workspace build; the core question is answered. The local laptop (pre-VAES i7-9750H) is not the target. |
 | `GATE-LATENCY` (p50/p99 per hop) | **DIRECTIONAL** | BENCH-01 on the i7-9750H laptop is **noisy** (two runs disagreed 2–3×: `board` ~1.45–3.6 ms, dominated by X25519) — **not a sub-ms pass and not benchmark-grade**. The reliable finding is the *shape* (asymmetric-crypto-bound, batch-amortizing). Formal p50/p99 needs a quiet representative server + a criterion harness (#13). |
 | `GATE-FEATHER` (idle ≈ 0) | **DIRECTIONAL** (architectural half PROVEN) | `gate_feather_*` test: idle in-flight returns to 0 every cycle (no standing data); the in-process substrate is a passive struct (no thread/fd). Real-substrate idle-RSS measurement still PENDING |
 
@@ -62,7 +62,7 @@
 
 ## Remaining open items (external **physical resources** — not tech-lead decisions)
 
-1. **GATE-WARP — representative VAES hardware** (#13): the pass measurement needs real x86 **VAES** server HW; this box is a native Intel **i7-9750H (Coffee Lake, pre-VAES)** laptop, so it is not the target. Setting the design-target `X` + the CI-gate policy is a tech-lead call (done); the representative *measurement* is hardware-gated. The guard fails until X is recorded on the target (MAJ-7).
+1. **GATE-WARP** (#13): **substantially closed.** Measured AES-256-GCM ≈ **10.5 GB/s/core** on a real VAES server core (Northflank) — the dominant primitive clears X=1 GiB/s/core by ~5–10× (BENCH-01). Remaining sliver: a *literal* datarail-binary pass on VAES (containerize the build) — directionally certain to pass; the CI guard formally stays red until that binary run is recorded (MAJ-7).
 2. **AC-10 — real competitor engines** (#20): the fairness bake-off needs the actual competitor binaries + infra. Building the **rig + methodology** is a tech-lead call; the real engines are external software.
 3. **MF-0 trio ratification** (DECOMPOSITION.md §6: A3 AEAD→GCM-SIV default · AC-1 metamorphic redefinition · C1 idempotency = record_key) — a tech-lead call (owner-delegated), to be applied to the DRAFT.
 

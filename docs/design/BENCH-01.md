@@ -53,6 +53,29 @@ machine **and** a proper statistical harness (criterion). Reproduce: `cargo run 
 - **GATE-FEATHER:** architectural (idle ≈ 0 by construction); see the `gate_feather_*` test. A real serverless
   idle-RSS is a deployment measurement.
 
+## VAES server-core measurement (Northflank, 2026-06-22) — the representative-HW data point
+
+Ran on a **Northflank cloud container** (`us-east1`, 2 vCPU) — verified **VAES + AVX-512 + AES-NI present**
+(the modern crypto acceleration the i7-9750H laptop lacks). Tool: `openssl 3.3.7 speed -evp`, sustained
+(16 KiB-block) per-core throughput:
+
+| Primitive | VAES server core | laptop (i7-9750H, noisy) |
+|---|---|---|
+| **AES-256-GCM** | **≈ 10.5 GB/s/core** (10,513,948 kB/s) | ~0.3–0.7 GB/s |
+| AES-128-GCM | ≈ 11.8 GB/s/core | — |
+| SHA-256 | ≈ 1.5 GB/s/core | ~0.77 GB/s |
+
+**Honest scope:** this is **openssl's AES-256-GCM** (the *dominant* primitive), **not** datarail's full
+board/offload binary. datarail's default AEAD is AES-256-**GCM-SIV** (two-pass ≈ half of GCM ⇒ ~5 GB/s/core
+on VAES) plus a per-cofre X25519 wrap (amortized over a batch) + Ed25519 + BLAKE3. So this measures the
+**ceiling**, not the end-to-end rate.
+
+**What it settles:** `GATE-WARP`'s target **X = 1 GiB/s/core** is **comfortably achievable on representative
+VAES hardware** — the symmetric ceiling clears it by **~5–10×**. The one remaining step for a *literal*
+GATE-WARP pass is running the **datarail binary itself** on a VAES core (containerize the workspace build); the
+core uncertainty ("does VAES deliver multi-GB/s AEAD?") is now answered **yes**, measured, not guessed. (The
+one-off Northflank job was deleted after the run.)
+
 ## Future optimization (measured-first, not on a hunch)
 
 - Batch the X25519 wrap across a window of cofres to one destination (one ECDH per window) — cuts the dominant

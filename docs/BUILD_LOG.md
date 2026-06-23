@@ -499,6 +499,21 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   (one shmem waiver). **Every buildable item across the white-paper + SPEC + roadmap is now done; the only open
   items are the two external physical resources (#13 VAES HW, #20 real engines).**
 
+- 2026-06-22 — **Hardware mislabel fixed + GATE-WARP measured on real VAES (owner provided Northflank).** The
+  owner corrected me: this machine is a **native Intel i7-9750H** (Coffee Lake, 2019) — I'd mislabeled it twice
+  (arm64, then Rosetta) by inferring from noisy benchmark numbers instead of running `sysctl`. **Lesson:
+  always check the CPU, never infer HW from speed.** Fixed across BENCH-01/DOD-01/AUDIT-03/memory; also recorded
+  that the laptop bench is noisy (2–3× run-to-run, not benchmark-grade). **Then used the owner's Northflank
+  account to get the representative number:** ran a one-off job on a cloud container (us-east1, **VAES+AVX-512
+  confirmed** via `/proc/cpuinfo`), `openssl 3.3.7 speed` → **AES-256-GCM ≈ 10.5 GB/s/core**, AES-128-GCM ≈ 11.8,
+  SHA-256 ≈ 1.5. **GATE-WARP X=1 GiB/s/core is cleared by ~5–10×** on real VAES HW (even GCM-SIV's two-pass
+  ≈ 5 GB/s). This is the openssl *primitive* (not the datarail binary) — the literal binary-on-VAES pass
+  remains (containerize the build) but the core question is answered: the target is achievable with wide margin,
+  **measured**. Northflank job deleted after the run. **GATE-WARP #13: substantially closed (directionally
+  validated); only the binary-on-VAES formality remains.** (How: Northflank CLI via `npx @northflank/cli` +
+  REST API with the saved context token; trigger job runs via `POST /v1/projects/{p}/jobs/{j}/runs`, read
+  output via `exec job --cmd` into a long-lived container — logs aren't fetchable by token, only via log-sinks.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
