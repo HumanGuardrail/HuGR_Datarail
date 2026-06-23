@@ -534,6 +534,22 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   ~6 GB/s/core — a bolt-on-encryption competitor pays that as overhead *on top of* its transport. **16 crates ·
   141 tests** green · clippy deny(all+pedantic) default AND `--features vaes` · forbid(unsafe). Container deleted.
 
+- 2026-06-22 — **#39 violent stress suite — delegated to an agent, COLD-VERIFIED + merged.** New crate
+  `datarail-stress`: 10 integration tests across the 5 flagship use cases, each a real assault asserting
+  **0-loss / 0-dup / 0-leak**: UC1 stream/CDC (volume storm 120k records, tiny-record storm over real TCP,
+  duplicate flood ×10 → sink-growth 0); UC2 shmem back-pressure saturation (998 back-pressure hits, 0 loss,
+  wraparound); UC3 untrusted object-store (forged/garbage/tampered/oversized injected → only legit delivered,
+  every bad object rejected by the substrate decode/size-guard + terminal verify, 0 forged in sink); UC4
+  store-and-forward (offline backlog drains once, replay → all Duplicate); UC5 WAN kill-mid-stream + loss
+  storm (re-drive + effectively-once → recovered exactly-once); + a forgery flood (900 wrong-signer →
+  all dead-lettered `SignerMismatch`). **Lead cold-verify (Rule 5):** re-ran clippy `--workspace` clean +
+  `cargo test --workspace` = **151 green** myself; read UC3/UC5 + the helpers — the agent did NOT weaken any
+  assertion (UC5 correctly asserts exactly-once as a **multiset** under packet loss, honestly documenting that
+  strict sink-order would be a false claim under loss; `forger_source` uses a real wrong Ed25519 seed). Merged
+  to main (`fa96193`), branch deleted. **17 crates · 151 tests** green · clippy deny(all+pedantic) ·
+  forbid(unsafe) (one shmem waiver). This is "humiliate the competition under fire" — proven the rail HOLDS
+  under every violent assault, not just at peak throughput.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
