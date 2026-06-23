@@ -262,6 +262,32 @@ engine clears Kafka.
 with `yield_now` wastes more CPU than kernel-parked blocking threads. Reverted. The efficient driver is the
 threaded one.)
 
+## Run 9 — Kafka-with-TLS (the fair encrypted comparison) — partial, honest impediment
+
+The fair comparison for a provider-blind rail is vs an **encryption-enabled** Kafka, not plaintext. Attempted it
+(stock Kafka SSL, self-signed cert via keytool — no custom crypto from us, to avoid bias). Five CI iterations
+got it **90 % working**: the OMB client connects over **SSL** and **producers send fine** (`security.protocol=SSL`,
+"Sent: 16"), but the OMB **consumer-readiness probe times out over SSL** ("Received: 0", no handshake error) — a
+subtle Kafka-SSL-consumer / KRaft-container interaction that works in plaintext. **It did not complete a clean
+TLS number in the CI sandbox**, and chasing it further is measurement-apparatus config, not a datarail question.
+Logged as a real impediment, not hidden.
+
+**Honest expectation (from known data, not measured here):** TLS-in-transit typically costs Kafka **~20–40 %**
+throughput (handshake + record-layer + extra copies, partly offset by JVM AES-NI). So Kafka-TLS would land
+roughly **~1.0–1.3 GB/s**, and datarail-sealed (engine 1.9 GB/s, full-TCP 1.5 GB/s) would lead **~1.2–1.9×** — a
+real edge, but **still not "3–4× faster."** A 3–4× gap would require Kafka with **end-to-end payload encryption**
+(app-level, the KIP-317 model datarail embodies and Kafka never shipped) — a bigger hit, but it needs custom
+encryption in the Kafka driver (the self-config bias we deliberately avoid).
+
+**Final honest verdict on throughput** (after every lever: I/O buffering, async, NIO driver, native loadgen,
+VAES warp, hot-path, engine bench, and a 5-iteration TLS attempt):
+- vs **plaintext Kafka**: datarail's sealed **engine wins ~1.2× @1KB / ~1.6× @16KB**; full end-to-end over TCP is
+  ~parity (~0.96×). **658 → ~1900 MB/s = ~2.9× extracted** by fixing the broken OMB measurement.
+- vs **encrypted Kafka**: datarail **likely leads ~1.2–1.9×** (estimated; the clean CI run didn't complete).
+- **"3–4× faster" is NOT supported by measurement.** The honest, defensible claim is: *datarail sustains ~1.9 GB/s
+  sealed and matches-to-beats Kafka's throughput while being provider-blind — something Kafka structurally is not,
+  at any speed.*
+
 ## RabbitMQ — honest non-result
 RabbitMQ's container **could not start in this CI sandbox**: the Erlang node fails with
 `.erlang.cookie: eacces` on the GitHub runner's overlay filesystem (reproduced across `-p`, `--network host`,
