@@ -90,11 +90,26 @@ avx2 aes`. Per-core:
 **GATE-WARP is met** by datarail's actual sealed AEAD throughput (1.43 GB/s/core ≥ the 1 GiB/s/core target) on
 representative VAES hardware — a literal pass of the real binary, not a proxy.
 
-**Engineering headroom to true "warp" (measured-justified):** datarail's AEAD is pure-Rust RustCrypto, which
-uses **AES-NI per-block, not VAES** — hence 1.43 GB/s vs openssl's **10.5 GB/s** VAES on the same core. Swapping
-the AEAD backend to a VAES-capable one (`aws-lc-rs` — already in the tree via quinn) is the clear path to ~5–10×
-(≈ openssl-class). This is an optimization, not a correctness gap; the gate already passes. Logged as the next
-perf lever.
+**Engineering headroom to true "warp":** datarail's *default* AEAD is pure-Rust RustCrypto (AES-NI per-block,
+1.43 GB/s) — and the headroom is now **realized** by the `vaes` backend below.
+
+## ⚡⚡ WARP backend SHIPPED — `--features vaes` (ring AES-256-GCM) on a VAES core (Northflank, 2026-06-22)
+
+Built `datarail-bench --features vaes` (routes `AeadAlg::Gcm256` through `ring`'s VAES/AVX-512 asm) on a VAES
+core and ran the **real binary**:
+
+| AEAD path (real datarail binary) | seal | open | vs target | vs default |
+|---|---|---|---|---|
+| default — RustCrypto GCM-SIV (AES-NI) | 1.25–1.43 GB/s/core | 1.44 | **PASS** (≥1 GiB/s) | 1× |
+| **`--features vaes` — ring AES-256-GCM (VAES)** | **5.92 GB/s/core** | **5.13** | **~6× target** | **~4.7×** |
+
+datarail seals at **~5.9 GB/s/core** with the VAES backend — **the moat**: provider-blind sealing at
+near-line-rate, which a bolt-on-encryption competitor pays as pure overhead on top of its transport.
+**Wire-compatible** with the default (the `gcm256_known_answer` KAT passes byte-identical on both backends) → a
+fleet may mix backends and cofres interchange. Default stays pure-Rust (`leveza`); `vaes` is opt-in for
+throughput-critical routes. (ring's 5.9 is a touch under openssl's 10.5 on the same core — ring's VAES path is
+slightly less aggressive than openssl 3.3.7; still ~6× the gate. Further lever if ever needed: `aws-lc-rs`.
+Not needed — the gate is crushed.)
 
 ## Future optimization (measured-first, not on a hunch)
 

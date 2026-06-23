@@ -2,7 +2,7 @@
 
 > Honest status of every Acceptance Criterion, gate, and invariant, labeled per the SPEC-11 taxonomy:
 > **PROVEN** (self-contained, gated, cold-verified) · **DIRECTIONAL** (measured-but-caveated) · **PENDING**
-> (needs absent resources). **16 crates · 140 tests** · clippy `deny(all+pedantic)` clean. `forbid(unsafe)`
+> (needs absent resources). **16 crates · 141 tests** · clippy `deny(all+pedantic)` clean. `forbid(unsafe)`
 > workspace-wide **except** the quarantined `datarail-substrate-shmem` crate (`deny(unsafe)` + **one** audited
 > `#[allow]` for the shared-memory atomic cursors — owner-delegated WAIVER, `BUILD_LOG` §6 / AUDIT-03).
 > Verified via the toolchain directly (see AUDIT-02 env note). **P3 re-open code audited — AUDIT-03 (F1/F2/F3
@@ -42,7 +42,7 @@
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `GATE-WARP` (throughput ≥ X) | **PROVEN** — real binary on VAES | **X = 1 GiB/s/core** (tech-lead target, SPEC-11). **The actual datarail binary, built + run on a representative VAES core** (Northflank, 2026-06-22, `vaes avx512f` confirmed): **AES-256-GCM-SIV seal = 1.43 GB/s/core**, open 1.44 — **≥ the 1 GiB/s target ⇒ PASS** (BENCH-01). BLAKE3 6.5 GB/s. **Headroom:** RustCrypto AEAD uses AES-NI not VAES (1.43 vs openssl's 10.5 GB/s) → a `aws-lc-rs` VAES backend is the logged path to ~5–10× (optimization, not a gap — the gate already passes). |
+| `GATE-WARP` (throughput ≥ X) | **PROVEN** — real binary on VAES | **X = 1 GiB/s/core** (tech-lead target, SPEC-11). **The actual datarail binary, built + run on a representative VAES core** (Northflank, 2026-06-22, `vaes avx512f` confirmed): **AES-256-GCM-SIV seal = 1.43 GB/s/core**, open 1.44 — **≥ the 1 GiB/s target ⇒ PASS** (BENCH-01). BLAKE3 6.5 GB/s. **WARP backend SHIPPED (#41):** `--features vaes` (ring AES-256-GCM, VAES) measures **5.92 GB/s/core seal** on the same core — **~6× the gate, ~4.7× the pure-Rust default**, wire-compatible (the `gcm256_known_answer` KAT passes byte-identical on both backends). Default stays pure-Rust (leveza); vaes is opt-in. |
 | `GATE-LATENCY` (p50/p99 per hop) | **DIRECTIONAL** | BENCH-01 on the i7-9750H laptop is **noisy** (two runs disagreed 2–3×: `board` ~1.45–3.6 ms, dominated by X25519) — **not a sub-ms pass and not benchmark-grade**. The reliable finding is the *shape* (asymmetric-crypto-bound, batch-amortizing). Formal p50/p99 needs a quiet representative server + a criterion harness (#13). |
 | `GATE-FEATHER` (idle ≈ 0) | **DIRECTIONAL** (architectural half PROVEN) | `gate_feather_*` test: idle in-flight returns to 0 every cycle (no standing data); the in-process substrate is a passive struct (no thread/fd). Real-substrate idle-RSS measurement still PENDING |
 

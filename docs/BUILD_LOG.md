@@ -523,6 +523,17 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   VAES (1.43 vs openssl 10.5 GB/s) → `aws-lc-rs` VAES backend = path to ~5–10× (perf lever, not a gap). BENCH-01
   + DOD-01 updated (GATE-WARP → PROVEN). Container deleted after the run.
 
+- 2026-06-22 — **#41 WARP backend SHIPPED — difficulty→moat.** The measured gap (RustCrypto AEAD = AES-NI
+  1.43 GB/s, not VAES) became a moat: a feature-gated `vaes` backend routes `AeadAlg::Gcm256` through `ring`'s
+  VAES/AVX-512 asm. **Measured on a VAES core (Northflank): 5.92 GB/s/core seal** (open 5.13) — **~6× the
+  GATE-WARP target, ~4.7× the pure-Rust default.** Sound under the per-cofre fresh-key invariant (the SPEC's
+  plain-GCM key-uniqueness gate). **Wire-compatible** — a known-answer test (`gcm256_known_answer`) pins
+  AES-256-GCM to one exact ciphertext that BOTH backends produce byte-identically (passes under default AND
+  `--features vaes`) ⇒ a cofre sealed by one opens on the other; fleets may mix. `ring` already in the tree via
+  QUIC ⇒ no new workspace dep; default stays pure-Rust (leveza). **The moat:** provider-blind sealing at
+  ~6 GB/s/core — a bolt-on-encryption competitor pays that as overhead *on top of* its transport. **16 crates ·
+  141 tests** green · clippy deny(all+pedantic) default AND `--features vaes` · forbid(unsafe). Container deleted.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
