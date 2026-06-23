@@ -71,52 +71,45 @@ fn topic_header(topic: &str, sub: Option<&str>) -> Vec<u8> {
     h
 }
 
-/// Producer: stream pre-built frames as fast as the shim will accept, draining acks INLINE on the same thread
-/// (non-blocking) — no separate ack-drainer thread, so the co-located loadgen steals far fewer cores from the
-/// shim (32 producer threads instead of 64). The shim's bounded queue self-throttles us via TCP back-pressure;
-/// we must keep reading acks or the shim would block writing them and stall its ingress, hence the inline drain.
+/// Producer: stream pre-built frames as fast as the shim will accept (its bounded queue self-throttles us).
 fn run_producer(addr: &str, topic: &str, msg_size: usize, stop: &Arc<AtomicBool>) -> std::io::Result<()> {
     let mut sock = TcpStream::connect(addr)?;
     sock.set_nodelay(true)?;
-    sock.write_all(&topic_header(topic, None))?; // header while still blocking
-    sock.set_nonblocking(true)?;
+    sock.write_all(&topic_header(topic, None))?;
 
+    // Drain acks on a side handle so the shim's ack writes never block (which would stall its ingress).
+    let ack_sock = sock.try_clone()?;
+    let ack_stop = Arc::clone(stop);
+    let ack_thread = thread::spawn(move || drain(ack_sock, &ack_stop));
+
+    // One reusable buffer of FRAMES_PER_WRITE identical frames: [u32 len][u64 ts=0][payload of 0x78].
     let frame_len = FRAME_HEADER + msg_size;
     let mut batch = vec![0u8; frame_len * FRAMES_PER_WRITE];
     for i in 0..FRAMES_PER_WRITE {
         let off = i * frame_len;
         batch[off..off + 4].copy_from_slice(&u32::try_from(msg_size).unwrap_or(0).to_be_bytes());
+        // ts stays 0 (loadgen measures throughput, not latency); payload stays 0x00 — content is opaque to the seal.
         for b in &mut batch[off + FRAME_HEADER..off + frame_len] {
             *b = 0x78;
         }
     }
-    let mut ackbuf = vec![0u8; READ_CHUNK];
-    let mut woff = 0usize; // write cursor into `batch` (handles non-blocking short writes)
     while !stop.load(Ordering::Relaxed) {
-        let mut progressed = false;
-        match sock.write(&batch[woff..]) {
-            Ok(0) => {}
-            Ok(n) => {
-                woff += n;
-                if woff == batch.len() {
-                    woff = 0;
-                }
-                progressed = true;
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
-        }
-        match sock.read(&mut ackbuf) {
-            Ok(0) => return Ok(()), // shim closed
-            Ok(_) => progressed = true,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return Ok(()),
-        }
-        if !progressed {
-            thread::yield_now(); // both would-block: don't busy-spin
+        sock.write_all(&batch)?;
+    }
+    drop(sock);
+    let _ = ack_thread.join();
+    Ok(())
+}
+
+/// Read-and-discard until `stop` (used to drain the ack stream so the shim never blocks writing acks).
+fn drain(mut sock: TcpStream, stop: &Arc<AtomicBool>) {
+    let mut buf = vec![0u8; READ_CHUNK];
+    while !stop.load(Ordering::Relaxed) {
+        match sock.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
         }
     }
-    Ok(())
 }
 
 /// Consumer: read delivered frames in bulk, count complete ones into `delivered` (no payload copy — just walk
