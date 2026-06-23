@@ -74,6 +74,39 @@ batched-log design may well lead (stated up front, not hidden).
 - **Single-node, 1 partition, 1 producer/consumer** — datarail's native point-to-point shape; a fair common
   denominator, not a broker's preferred fan-out topology.
 
+## Run 3 — THE headline: max-throughput (rate-discovery, 32-core Turbo, 2026-06-23)
+
+- **Runner:** GitHub-hosted **`Turbo` — 32 vCPU / 128 GB**. **Workload:** `discovery-1kb.yaml` —
+  `producerRate: 0` (OMB `findMaximumSustainableRate` ramps to each system's ceiling), 4 topics, 1 KB, 1 min
+  warmup + 4 min. datarail **sealed**; Kafka/Pulsar **plaintext** OMB defaults.
+
+| system | **max sustainable msg/s** | **MB/s** | p50 | p99 | p99.9 |
+|---|---|---|---|---|---|
+| **Kafka 3.8** | **1,498,609** | **1,534.6** | 3 ms | 177 ms | 590 ms |
+| Pulsar 3.3 | 430,440 | 440.8 | 8 ms | 49 ms | 100 ms |
+| **datarail** (sealed) | **226,776** | **232.2** | 58 ms | 72 ms | 86 ms |
+
+**Honest verdict — Kafka wins raw throughput, decisively.** Kafka sustained **1.5 GB/s (6.6× datarail)**, Pulsar
+**440 MB/s (1.9× datarail)**, datarail **232 MB/s** — the slowest of the three on bulk throughput. This is the
+brokers' home turf (batched, append-only logs built for exactly this) and the result is unambiguous: **datarail
+is NOT a throughput-beats-Kafka story.** Anyone claiming otherwise is selling something.
+
+**Honest context (not excuses):**
+- datarail moves **232 MB/s while AEAD-sealing + signing every message and staying provider-blind**; Kafka/Pulsar
+  moved plaintext the broker can read. Adding real end-to-end encryption to a broker costs throughput it didn't
+  pay here.
+- The OMB **shim runs one worker thread per topic**, so with 4 topics datarail used ~4 of the 32 cores
+  (~58 MB/s/core sealed); Kafka/Pulsar use many threads across the whole box. datarail's per-core sealed rate is
+  respectable, but the shim does not yet parallelize one topic across cores — a benchmark-adapter limit, honestly
+  noted, not benchmarked away (the measured number is 232 MB/s, full stop).
+- **Latency shape:** at each system's *own* max, datarail's distribution is the **tightest** (p50→p99.9 =
+  58→86 ms, a 1.5× spread), while Kafka runs hot at its ceiling (3→590 ms, ~200× spread) and Pulsar sits between.
+  datarail trades peak throughput for predictability.
+
+**So who's "the brabo"?** On throughput: **Kafka.** datarail's case was never raw GB/s — it's the structural
+moat (provider-blind × serverless × exactly-once + proof) at *respectable* sealed throughput (232 MB/s would
+saturate a 1.8 Gbps link) with the most predictable latency. Different tool, different job — measured honestly.
+
 ## RabbitMQ — honest non-result
 RabbitMQ's container **could not start in this CI sandbox**: the Erlang node fails with
 `.erlang.cookie: eacces` on the GitHub runner's overlay filesystem (reproduced across `-p`, `--network host`,
