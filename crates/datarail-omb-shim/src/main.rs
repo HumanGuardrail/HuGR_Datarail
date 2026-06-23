@@ -14,21 +14,41 @@
 //! The wire protocol, config, batching rules, and honesty labels are the frozen contract in
 //! `docs/design/OMB-PROTOCOL.md`; this binary implements it verbatim.
 //!
-//! ## Topology (std-only threading — Charter *leveza*, zero external deps)
-//! - One **ingress acceptor** thread and one **egress acceptor** thread.
-//! - One thread per accepted connection (producer or consumer).
-//! - One **topic worker** thread per topic, created lazily on first reference. It owns that topic's
-//!   `SourceTerminal` + `DestTerminal`, drains an [`std::sync::mpsc`] queue of ingested messages, boards them
-//!   in batches (flush at `batch_max_records` OR `batch_max_micros`, whichever first), offloads through the
-//!   real seal path, and fans the delivered records out to every subscriber's channel.
+//! ## Topology (async tokio I/O + per-topic blocking seal worker)
+//! Earlier this shim was thread-per-connection (std-only). On a many-core box that plateaued at ~620 MB/s
+//! because ~112 OS threads (one per producer/consumer + one per topic) oversubscribed the cores and thrashed;
+//! per-stream rate fell from 65k msg/s at 8 topics to 38k at 16. This rewrite breaks that ceiling:
+//! - A **tokio multi-thread runtime** (worker count = cores) owns ALL TCP socket I/O. Each accepted connection
+//!   — ingress producer or egress consumer — is a **tokio task**, not an OS thread, so N connections cost a
+//!   handful of runtime workers instead of N threads.
+//! - The CPU-bound seal/open work stays on a **dedicated OS thread PER TOPIC**: the datarail
+//!   `SourceTerminal`/`DestTerminal` are synchronous `&mut self` state machines and MUST NOT run on the async
+//!   runtime workers (they would block the event loop). The async side bridges to that blocking thread over
+//!   channels.
+//! - **Thread count is now `cores` runtime workers + one seal thread per topic** (e.g. ~32 + 16 ≈ 48 on a
+//!   32-core / 16-topic run), independent of connection count — versus ~112 before.
+//!
+//! ### Async ↔ blocking bridge (where backpressure lives)
+//! - An ingress task assembles each `{publish_ts(8 BE) || payload}` record and `send().await`s it into a
+//!   **bounded** [`tokio::sync::mpsc`] (capacity `batch_max_records * 16`, clamped `[256, 65536]`). That
+//!   bounded channel is the **single backpressure point**: when the seal worker lags, the channel fills, the
+//!   ingress task awaits on `send().await`, it stops reading the producer socket, the producer's TCP buffer
+//!   fills, and the producer slows — 0-loss, no unbounded backlog (exactly the discipline of the old
+//!   `SyncSender`).
+//! - The per-topic **`std::thread`** owns the topic's [`TopicEngine`] (`SourceTerminal` + `DestTerminal` +
+//!   `Transport`). It `blocking_recv()`s the first record of a batch, then fills the batch until it is full
+//!   (`batch_max_records`) OR the time window (`batch_max_micros`) elapses — whichever first — using the
+//!   runtime handle to drive a timed `recv` without busy-spinning. It runs the full real seal path
+//!   (`board` → `transport.relay` → `offload` → `dest.sink_mut().take_committed()`) and hands each committed
+//!   record (wrapped in `Arc<Vec<u8>>`) to the topic's subscriber set.
+//! - Egress: each consumer task awaits delivered records over a per-subscriber **bounded**
+//!   [`tokio::sync::mpsc`] (capacity `8192`) and async-writes `[u32 payload_len][record]` frames; the frame
+//!   body IS the record bytes (record == ts || payload), so there is no split or per-message payload copy.
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::io::{BufReader, BufWriter, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -37,6 +57,10 @@ use datarail_crypto::{verifying_key, x25519_public};
 use datarail_rail::TcpSubstrate;
 use datarail_substrate_shmem::ShmemRing;
 use datarail_terminal::{ContentContract, DestTerminal, SourceTerminal, TerminalConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 
 // ----------------------------------------------------------------------------------------------------------
 // Fixed, deterministic route keys — SAME-PROCESS BENCH SHIM ONLY (NOT a product component).
@@ -58,6 +82,10 @@ const DEST_SEED: [u8; 32] = [22u8; 32];
 const DEST_X25519_SECRET: [u8; 32] = [9u8; 32];
 /// Fixed per-tenant idempotency-MAC secret (bench shim — see module note).
 const TENANT_SECRET: [u8; 32] = [6u8; 32];
+
+/// Bounded capacity of each egress subscriber's delivery channel (frames awaiting async write). A burst beyond
+/// this back-pressures the seal worker's fan-out send, never grows unbounded.
+const EGRESS_CHANNEL_DEPTH: usize = 8192;
 
 // ----------------------------------------------------------------------------------------------------------
 // Config — TOML, all fields optional, defaults per OMB-PROTOCOL.md. Hand-rolled `key = value` parse (no deps).
@@ -185,14 +213,16 @@ fn parse_u64(key: &str, value: &str) -> Result<u64, ShimError> {
 // Errors.
 // ----------------------------------------------------------------------------------------------------------
 
-/// A fatal shim error (config or socket bind/accept). Per-connection I/O errors are handled locally and end
-/// only that connection's thread; they never reach here.
+/// A fatal shim error (config, runtime build, or socket bind/accept). Per-connection I/O errors are handled
+/// locally and end only that connection's task; they never reach here.
 #[derive(Debug)]
 enum ShimError {
     /// The config file could not be read or parsed.
     Config(String),
     /// An ingress/egress listener could not be bound.
     Bind(String),
+    /// The async runtime could not be built.
+    Runtime(String),
 }
 
 impl core::fmt::Display for ShimError {
@@ -200,6 +230,7 @@ impl core::fmt::Display for ShimError {
         match self {
             Self::Config(e) => write!(f, "config: {e}"),
             Self::Bind(e) => write!(f, "bind: {e}"),
+            Self::Runtime(e) => write!(f, "runtime: {e}"),
         }
     }
 }
@@ -230,16 +261,17 @@ struct Ingested {
 /// consumers). Created lazily on first reference and stored in the [`Registry`].
 #[derive(Clone)]
 struct TopicHandle {
-    /// Sink for ingested records → the topic worker. **Bounded** (`SyncSender`): when the seal/open worker is
-    /// the bottleneck, this fills and `send` blocks, so the ingress thread stops reading the producer socket →
-    /// the producer's TCP buffer fills → the producer slows. That is datarail's backpressure (0-loss, no
-    /// unbounded backlog), versus an unbounded queue that would grow until OOM under a firehose.
-    ingress_tx: SyncSender<Ingested>,
+    /// Sink for ingested records → the topic worker. **Bounded** ([`tokio::sync::mpsc::Sender`]): when the
+    /// seal/open worker is the bottleneck, this fills and `send().await` parks the ingress task, so it stops
+    /// reading the producer socket → the producer's TCP buffer fills → the producer slows. That is datarail's
+    /// backpressure (0-loss, no unbounded backlog), versus an unbounded queue that would grow until OOM under
+    /// a firehose.
+    ingress_tx: mpsc::Sender<Ingested>,
     /// Every egress subscriber's delivery channel. The worker fans each offloaded record out to all of them.
-    subscribers: Arc<Mutex<Vec<Sender<Delivered>>>>,
+    subscribers: Arc<Mutex<Vec<mpsc::Sender<Delivered>>>>,
 }
 
-/// The lazy topic registry: topic name → handle, behind a mutex. Cloned (`Arc`) into every connection thread.
+/// The lazy topic registry: topic name → handle, behind a mutex. Cloned (`Arc`) into every connection task.
 type Registry = Arc<Mutex<HashMap<String, TopicHandle>>>;
 
 // ----------------------------------------------------------------------------------------------------------
@@ -256,17 +288,33 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parse the optional config (argv[1]), bind both listeners, and serve forever. Returns only on a fatal bind
-/// error (the accept loops never terminate normally).
+/// Parse the optional config (argv[1]), build the multi-thread tokio runtime, bind both listeners, and serve
+/// forever. Returns only on a fatal config/runtime/bind error (the accept loops never terminate normally).
+///
+/// The runtime is built explicitly (not via `#[tokio::main]`) so the worker count is the default = number of
+/// cores and so a build failure is a typed [`ShimError`] rather than a panic.
 fn run() -> Result<(), ShimError> {
     let cfg = match std::env::args().nth(1) {
         Some(path) => Config::from_path(&path)?,
         None => Config::default(),
     };
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ShimError::Runtime(e.to_string()))?;
+
+    runtime.block_on(serve(cfg))
+}
+
+/// The async entry point: bind both listeners, announce the bound addresses, then run both accept loops
+/// concurrently forever. Returns only on a fatal bind error.
+async fn serve(cfg: Config) -> Result<(), ShimError> {
     let ingress = TcpListener::bind(&cfg.ingress_addr)
+        .await
         .map_err(|e| ShimError::Bind(format!("ingress {}: {e}", cfg.ingress_addr)))?;
     let egress = TcpListener::bind(&cfg.egress_addr)
+        .await
         .map_err(|e| ShimError::Bind(format!("egress {}: {e}", cfg.egress_addr)))?;
 
     // Report the actually-bound addresses (an OS-assigned `:0` port resolves here) so a test/orchestrator can
@@ -274,34 +322,55 @@ fn run() -> Result<(), ShimError> {
     let ingress_bound = ingress.local_addr().map_err(|e| ShimError::Bind(e.to_string()))?;
     let egress_bound = egress.local_addr().map_err(|e| ShimError::Bind(e.to_string()))?;
     println!("DATARAIL-OMB-SHIM ingress={ingress_bound} egress={egress_bound} substrate={:?}", cfg.substrate);
-    let _ = std::io::stdout().flush();
+    flush_stdout();
 
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
 
-    // Egress acceptor on its own thread; ingress acceptor on this (the main) thread. Both loop forever.
-    let egress_registry = Arc::clone(&registry);
-    let egress_cfg = cfg.clone();
-    std::thread::spawn(move || accept_loop(&egress, &egress_registry, &egress_cfg, serve_egress));
+    // Both accept loops run as concurrent tasks on the runtime; neither returns. `select` so that if either
+    // listener dies (a fatal accept error path that breaks its loop) the process surfaces it instead of
+    // silently serving on one port.
+    let ingress_registry = Arc::clone(&registry);
+    let ingress_cfg = cfg.clone();
+    let ingress_task =
+        tokio::spawn(async move { accept_loop(ingress, ingress_registry, ingress_cfg, ConnKind::Ingress).await });
+    let egress_task =
+        tokio::spawn(async move { accept_loop(egress, registry, cfg, ConnKind::Egress).await });
 
-    accept_loop(&ingress, &registry, &cfg, serve_ingress);
+    // Neither task returns under normal operation; join both so a panic/cancel in one is not lost.
+    let _ = tokio::join!(ingress_task, egress_task);
     Ok(())
 }
 
-/// Generic accept loop: for every accepted connection, spawn `handler(stream, &registry, &cfg)` on its own
-/// thread (each thread owns its own clones). A failed `accept` is logged and skipped (the listener stays up).
-/// Never returns.
-fn accept_loop(
-    listener: &TcpListener,
-    registry: &Registry,
-    cfg: &Config,
-    handler: fn(TcpStream, &Registry, &Config),
-) {
-    for conn in listener.incoming() {
-        match conn {
-            Ok(stream) => {
-                let registry = Arc::clone(registry);
+/// Flush stdout, ignoring the (unobservable here) error — the announce line is best-effort observability.
+fn flush_stdout() {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+}
+
+/// Which side a connection serves; selects the per-connection handler.
+#[derive(Clone, Copy)]
+enum ConnKind {
+    /// Producer side (ingress port).
+    Ingress,
+    /// Consumer side (egress port).
+    Egress,
+}
+
+/// Generic async accept loop: for every accepted connection, spawn a tokio task running the matching handler
+/// (each task owns its own clones). A failed `accept` is logged and skipped (the listener stays up). Never
+/// returns under normal operation.
+async fn accept_loop(listener: TcpListener, registry: Registry, cfg: Config, kind: ConnKind) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let registry = Arc::clone(&registry);
                 let cfg = cfg.clone();
-                std::thread::spawn(move || handler(stream, &registry, &cfg));
+                tokio::spawn(async move {
+                    match kind {
+                        ConnKind::Ingress => serve_ingress(stream, &registry, &cfg).await,
+                        ConnKind::Egress => serve_egress(stream, &registry, &cfg).await,
+                    }
+                });
             }
             Err(e) => eprintln!("datarail-omb-shim: accept failed: {e}"),
         }
@@ -315,6 +384,10 @@ fn accept_loop(
 /// Look up `topic`, creating its worker thread + handle on first reference (lazy topics — no control message).
 /// Returns a clone of the handle. A poisoned registry mutex is reported as `None` (the caller ends its
 /// connection); it cannot happen unless a worker panicked, which the no-unwrap datapath precludes.
+///
+/// The seal worker is a real `std::thread` (the `SourceTerminal`/`DestTerminal` are synchronous `&mut self`
+/// state machines that must not block a runtime worker). It is handed the runtime [`Handle`] so it can drive a
+/// timed batch `recv` on its [`tokio::sync::mpsc::Receiver`] without busy-spinning.
 fn topic_handle(registry: &Registry, cfg: &Config, topic: &str) -> Option<TopicHandle> {
     let mut map = registry.lock().ok()?;
     if let Some(handle) = map.get(topic) {
@@ -323,12 +396,16 @@ fn topic_handle(registry: &Registry, cfg: &Config, topic: &str) -> Option<TopicH
     // Bounded ingress queue → backpressure (see `TopicHandle::ingress_tx`). Depth scales with the batch size
     // (a handful of batches in flight) and is clamped so worst-case buffered memory stays bounded.
     let depth = cfg.batch_max_records.saturating_mul(16).clamp(256, 65_536);
-    let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Ingested>(depth);
-    let subscribers: Arc<Mutex<Vec<Sender<Delivered>>>> = Arc::new(Mutex::new(Vec::new()));
+    let (ingress_tx, ingress_rx) = mpsc::channel::<Ingested>(depth);
+    let subscribers: Arc<Mutex<Vec<mpsc::Sender<Delivered>>>> = Arc::new(Mutex::new(Vec::new()));
     let handle = TopicHandle { ingress_tx, subscribers: Arc::clone(&subscribers) };
     let worker_cfg = cfg.clone();
     let topic_name = topic.to_owned();
-    std::thread::spawn(move || topic_worker(&topic_name, &worker_cfg, &ingress_rx, &subscribers));
+    let runtime = Handle::current();
+    std::thread::Builder::new()
+        .name(format!("omb-topic-{topic}"))
+        .spawn(move || topic_worker(&topic_name, &worker_cfg, ingress_rx, &subscribers, &runtime))
+        .ok()?;
     map.insert(topic.to_owned(), handle.clone());
     Some(handle)
 }
@@ -395,7 +472,12 @@ impl TopicEngine {
     /// The seal-path calls are infallible in practice for our own well-formed records, but the code never
     /// unwraps: a board/offload error or a non-`Delivered` disposition is logged and the batch is skipped (a
     /// regression would surface as missing deliveries in the round-trip test, never a panic).
-    fn flush(&mut self, topic: &str, batch: &[Vec<u8>], subscribers: &Arc<Mutex<Vec<Sender<Delivered>>>>) {
+    fn flush(
+        &mut self,
+        topic: &str,
+        batch: &[Vec<u8>],
+        subscribers: &Arc<Mutex<Vec<mpsc::Sender<Delivered>>>>,
+    ) {
         if batch.is_empty() {
             return;
         }
@@ -446,39 +528,42 @@ impl TopicEngine {
     }
 }
 
-/// The per-topic worker: owns the topic's [`TopicEngine`], drains the ingress channel in **batches** (flush on
-/// `batch_max_records` OR `batch_max_micros`, whichever first), runs every batch through the full seal/open
-/// path, and fans the delivered records out to every subscriber. Exits when the registry (hence every
-/// producer) drops the sender.
+/// The per-topic worker (a dedicated **`std::thread`**): owns the topic's [`TopicEngine`], drains the bounded
+/// ingress channel in **batches** (flush on `batch_max_records` OR `batch_max_micros`, whichever first), runs
+/// every batch through the full seal/open path, and fans the delivered records out to every subscriber. Exits
+/// when the registry (hence every producer) drops the [`tokio::sync::mpsc::Sender`] and the channel closes.
+///
+/// It bridges async→blocking by holding the [`tokio::sync::mpsc::Receiver`] directly and driving its `recv`
+/// from this OS thread via the runtime `handle`: a synchronous `blocking_recv` for the first record of a
+/// batch, then `handle.block_on(timeout(..))` to fill the batch up to the time window. No CPU-bound terminal
+/// work ever runs on a runtime worker, so the async event loop is never blocked.
 fn topic_worker(
     topic: &str,
     cfg: &Config,
-    ingress_rx: &Receiver<Ingested>,
-    subscribers: &Arc<Mutex<Vec<Sender<Delivered>>>>,
+    mut ingress_rx: mpsc::Receiver<Ingested>,
+    subscribers: &Arc<Mutex<Vec<mpsc::Sender<Delivered>>>>,
+    handle: &Handle,
 ) {
     let mut engine = TopicEngine::new(cfg);
     let batch_window = Duration::from_micros(cfg.batch_max_micros);
 
     loop {
-        // Block for the first record of a batch; `None` means every producer hung up ⇒ the topic is done.
-        let Some(first) = recv_blocking(ingress_rx) else {
+        // Block for the first record of a batch; `None` means the channel closed (every producer hung up and
+        // the registry handle is gone) ⇒ the topic is done.
+        let Some(first) = ingress_rx.blocking_recv() else {
             return;
         };
         let mut batch: Vec<Vec<u8>> = Vec::with_capacity(cfg.batch_max_records);
         batch.push(first.record);
 
-        // Fill the batch until it is full OR the time window elapses, whichever first.
+        // Fill the batch until it is full OR the time window elapses, whichever first. `recv_until` drives the
+        // async receiver from this thread with a deadline; a closed channel ends the fill (then the next outer
+        // `blocking_recv` returns `None` and the worker exits).
         let deadline = Instant::now() + batch_window;
         while batch.len() < cfg.batch_max_records {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            match ingress_rx.recv_timeout(deadline - now) {
-                Ok(msg) => batch.push(msg.record),
-                // Timeout: window elapsed. Disconnected: every producer hung up — flush what we have; the
-                // next outer-loop `recv_blocking` then returns `None` and the worker exits.
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            match recv_until(handle, &mut ingress_rx, deadline) {
+                BatchRecv::Got(record) => batch.push(record),
+                BatchRecv::WindowElapsed | BatchRecv::Closed => break,
             }
         }
 
@@ -486,26 +571,45 @@ fn topic_worker(
     }
 }
 
-/// Block on the next ingested record. Returns `None` only when the channel is disconnected (all producers
-/// dropped). A periodic timeout keeps the worker responsive without busy-spinning.
-fn recv_blocking(ingress_rx: &Receiver<Ingested>) -> Option<Ingested> {
-    loop {
-        match ingress_rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(msg) => return Some(msg),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return None,
-        }
+/// The outcome of a timed batch-fill `recv` on the ingress channel.
+enum BatchRecv {
+    /// A record arrived before the deadline.
+    Got(Vec<u8>),
+    /// The batch time window elapsed before another record arrived.
+    WindowElapsed,
+    /// The channel closed (every producer + the registry handle dropped).
+    Closed,
+}
+
+/// Receive the next ingested record, waiting at most until `deadline`. Drives the async
+/// [`tokio::sync::mpsc::Receiver`] from the blocking worker thread via `handle.block_on(timeout(..))` — so the
+/// batch time window is honoured without busy-spinning and without blocking a runtime worker.
+fn recv_until(handle: &Handle, ingress_rx: &mut mpsc::Receiver<Ingested>, deadline: Instant) -> BatchRecv {
+    let now = Instant::now();
+    if now >= deadline {
+        return BatchRecv::WindowElapsed;
+    }
+    let remaining = deadline - now;
+    match handle.block_on(async { tokio::time::timeout(remaining, ingress_rx.recv()).await }) {
+        Ok(Some(msg)) => BatchRecv::Got(msg.record),
+        Ok(None) => BatchRecv::Closed,
+        Err(_elapsed) => BatchRecv::WindowElapsed,
     }
 }
 
 /// Fan `delivered` out to every live subscriber on the topic, dropping any whose consumer has disconnected
-/// (its egress thread closed the receiver). Each distinct subscription is an independent delivery copy, per
-/// OMB semantics ("each subscription gets all messages"). The clone is a cheap `Arc` bump — no payload copy.
-fn fan_out(subscribers: &Arc<Mutex<Vec<Sender<Delivered>>>>, delivered: &Delivered) {
+/// (its egress task closed the receiver). Each distinct subscription is an independent delivery copy, per OMB
+/// semantics ("each subscription gets all messages"). The clone is a cheap `Arc` bump — no payload copy.
+///
+/// A bounded subscriber channel that is momentarily full back-pressures here via `blocking_send` (this is a
+/// dedicated OS thread, so blocking it is correct — it parks the seal worker, which fills the ingress channel,
+/// which slows the producer; the same 0-loss chain as ingress). A closed receiver (consumer gone) drops the
+/// subscriber.
+fn fan_out(subscribers: &Arc<Mutex<Vec<mpsc::Sender<Delivered>>>>, delivered: &Delivered) {
     let Ok(mut subs) = subscribers.lock() else {
-        return; // poisoned only if an egress thread panicked; nothing to deliver to then.
+        return; // poisoned only if an egress task panicked; nothing to deliver to then.
     };
-    subs.retain(|tx| tx.send(delivered.clone()).is_ok());
+    subs.retain(|tx| tx.blocking_send(delivered.clone()).is_ok());
 }
 
 // ----------------------------------------------------------------------------------------------------------
@@ -592,14 +696,14 @@ where
 // Ingress connection — producer → shim. Header, then frames; one monotonic ack per accepted message.
 // ----------------------------------------------------------------------------------------------------------
 
-/// Serve one producer connection. Reads the `[u16 topic_len][topic]` header, resolves (lazily creates) the
-/// topic, then loops reading `[u32 payload_len][u64 publish_ts][payload]` frames: for each, assemble the
-/// `{publish_ts || payload}` record, hand it to the topic worker, and write back a monotonic `[u64 seq]` ack
-/// (from 0, in receive order). The handoff to the worker IS the ack point (acks=1: boarded + handed to the
-/// substrate, per the frozen contract) — the worker still seals every record on the real datapath. Ends the
-/// thread cleanly on EOF or any socket/parse error.
-fn serve_ingress(stream: TcpStream, registry: &Registry, cfg: &Config) {
-    if let Err(e) = serve_ingress_inner(stream, registry, cfg) {
+/// Serve one producer connection (a tokio task). Reads the `[u16 topic_len][topic]` header, resolves (lazily
+/// creates) the topic, then loops reading `[u32 payload_len][u64 publish_ts][payload]` frames: for each,
+/// assemble the `{publish_ts || payload}` record, `send().await` it to the topic worker, and write back a
+/// monotonic `[u64 seq]` ack (from 0, in receive order). The handoff to the worker IS the ack point (acks=1:
+/// boarded + handed to the substrate, per the frozen contract) — the worker still seals every record on the
+/// real datapath. Ends the task cleanly on EOF or any socket/parse error.
+async fn serve_ingress(stream: TcpStream, registry: &Registry, cfg: &Config) {
+    if let Err(e) = serve_ingress_inner(stream, registry, cfg).await {
         // EOF/peer-close is the normal end of a producer; only note genuinely unexpected errors.
         if e.kind() != std::io::ErrorKind::UnexpectedEof && e.kind() != std::io::ErrorKind::ConnectionReset {
             eprintln!("datarail-omb-shim: ingress connection ended: {e}");
@@ -608,15 +712,16 @@ fn serve_ingress(stream: TcpStream, registry: &Registry, cfg: &Config) {
 }
 
 /// The fallible body of [`serve_ingress`]; every framing/socket error bubbles up as `io::Error` to end the
-/// connection thread without panicking.
-fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
-    // Buffered I/O on BOTH directions: an unbuffered per-message read+ack is ~3 syscalls/msg, which caps
+/// connection task without panicking.
+async fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
+    // Buffered async I/O on BOTH directions: an unbuffered per-message read+ack is ~3 syscalls/msg, which caps
     // throughput at the syscall rate (the real bottleneck, not the crypto). A BufReader coalesces frame reads
     // and a BufWriter coalesces acks; acks flush when we have caught up to the socket (so a streaming producer
     // still gets timely acks, but a burst is acked in one write).
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut acks = BufWriter::new(stream);
-    let topic = read_topic_header(&mut reader)?;
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut acks = BufWriter::new(write_half);
+    let topic = read_topic_header(&mut reader).await?;
     let handle = topic_handle(registry, cfg, &topic)
         .ok_or_else(|| std::io::Error::other("topic registry unavailable"))?;
 
@@ -626,11 +731,11 @@ fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> 
         // Read the 12-byte frame header; a clean EOF here ends the producer. Flush any pending acks first so a
         // producer that paused is not left waiting on buffered-but-unsent acks.
         if reader.buffer().is_empty() {
-            acks.flush()?;
+            acks.flush().await?;
         }
-        match read_exact_or_eof(&mut reader, &mut hdr)? {
+        match read_exact_or_eof(&mut reader, &mut hdr).await? {
             ReadEnd::Eof => {
-                acks.flush()?;
+                acks.flush().await?;
                 return Ok(());
             }
             ReadEnd::Full => {}
@@ -647,19 +752,21 @@ fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> 
         // Assemble the record `{publish_ts(8 BE) || payload}` directly, reading the payload into place.
         let mut record = vec![0u8; 8 + payload_len];
         record[0..8].copy_from_slice(&publish_ts.to_be_bytes());
-        reader.read_exact(&mut record[8..])?;
+        reader.read_exact(&mut record[8..]).await?;
 
-        // Hand to the worker (the accept point; the bounded queue applies backpressure here), then buffer the
-        // ack in receive order. A worker-gone error ends us. Flush pending acks before a send that may block so
-        // the producer is never stalled waiting on acks we are holding.
+        // Hand to the worker (the accept point; the bounded channel applies backpressure here — when the seal
+        // worker lags, `send().await` parks this task, so we stop reading this socket and the producer's TCP
+        // buffer fills). Then buffer the ack in receive order. A worker-gone (closed channel) error ends us.
+        // Flush pending acks before a send that may park so the producer is never stalled on acks we are holding.
         if reader.buffer().is_empty() {
-            acks.flush()?;
+            acks.flush().await?;
         }
         handle
             .ingress_tx
             .send(Ingested { record })
+            .await
             .map_err(|_| std::io::Error::other("topic worker gone"))?;
-        acks.write_all(&seq.to_be_bytes())?;
+        acks.write_all(&seq.to_be_bytes()).await?;
         seq += 1;
     }
 }
@@ -668,12 +775,12 @@ fn serve_ingress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> 
 // Egress connection — consumer → shim. Header, then a stream of delivered frames.
 // ----------------------------------------------------------------------------------------------------------
 
-/// Serve one consumer connection. Reads the `[u16 topic_len][topic][u16 sub_len][sub]` header, registers a
-/// fresh delivery channel on the topic (each distinct subscription is its own fan-out copy), then streams
-/// `[u32 payload_len][u64 publish_ts][payload]` frames for every delivered message until the consumer
-/// disconnects. Ends the thread cleanly on any socket error.
-fn serve_egress(stream: TcpStream, registry: &Registry, cfg: &Config) {
-    if let Err(e) = serve_egress_inner(stream, registry, cfg) {
+/// Serve one consumer connection (a tokio task). Reads the `[u16 topic_len][topic][u16 sub_len][sub]` header,
+/// registers a fresh delivery channel on the topic (each distinct subscription is its own fan-out copy), then
+/// streams `[u32 payload_len][u64 publish_ts][payload]` frames for every delivered message until the consumer
+/// disconnects. Ends the task cleanly on any socket error.
+async fn serve_egress(stream: TcpStream, registry: &Registry, cfg: &Config) {
+    if let Err(e) = serve_egress_inner(stream, registry, cfg).await {
         if e.kind() != std::io::ErrorKind::UnexpectedEof
             && e.kind() != std::io::ErrorKind::ConnectionReset
             && e.kind() != std::io::ErrorKind::BrokenPipe
@@ -686,50 +793,54 @@ fn serve_egress(stream: TcpStream, registry: &Registry, cfg: &Config) {
 /// The fallible body of [`serve_egress`]: register a subscriber channel, then write each delivered frame to
 /// the socket. The `sub` name is read per the protocol and (intentionally) used only to model an independent
 /// delivery copy — every subscription receives every message (OMB consumer-group semantics, v1).
-fn serve_egress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let topic = read_topic_header(&mut reader)?;
-    let _sub = read_len_prefixed_string(&mut reader)?; // independent fan-out copy per subscription (v1).
+async fn serve_egress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> std::io::Result<()> {
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let topic = read_topic_header(&mut reader).await?;
+    let _sub = read_len_prefixed_string(&mut reader).await?; // independent fan-out copy per subscription (v1).
 
     let handle = topic_handle(registry, cfg, &topic)
         .ok_or_else(|| std::io::Error::other("topic registry unavailable"))?;
-    let (tx, rx) = mpsc::channel::<Delivered>();
+    // Bounded subscriber channel: a slow consumer back-pressures the seal worker's fan-out (`blocking_send`),
+    // never an unbounded backlog. Matches the old `mpsc::channel` delivery semantics with a hard cap.
+    let (tx, mut rx) = mpsc::channel::<Delivered>(EGRESS_CHANNEL_DEPTH);
     handle
         .subscribers
         .lock()
         .map_err(|_| std::io::Error::other("subscriber registry poisoned"))?
         .push(tx);
 
-    // Buffered writer: a per-message `write_all` is one syscall per message and caps egress throughput at the
-    // syscall rate. We coalesce a burst of delivered frames into the buffer and flush only when the delivery
+    // Buffered async writer: a per-message `write_all` is one syscall per message and caps egress throughput at
+    // the syscall rate. We coalesce a burst of delivered frames into the buffer and flush only when the delivery
     // channel momentarily drains — full throughput under load, still low-latency when idle.
-    let mut out = BufWriter::new(stream);
-    // The wire frame is `[u32 payload_len][u64 publish_ts][payload]`, and `record == publish_ts || payload`, so
-    // the frame body after the length prefix IS the record bytes — write the length then the record slice
-    // directly into the buffered writer. No split, no per-message payload copy.
-    let write_frame = |w: &mut BufWriter<TcpStream>, d: &Delivered| -> std::io::Result<()> {
-        let payload_len = u32::try_from(d.record.len() - 8)
-            .map_err(|_| std::io::Error::other("delivered payload exceeds u32"))?;
-        w.write_all(&payload_len.to_be_bytes())?;
-        w.write_all(&d.record)
-    };
+    let mut out = BufWriter::new(write_half);
     loop {
-        // Block for the next delivery; `recv` errs only when the worker drops the sender (topic done).
-        let Ok(delivered) = rx.recv() else {
-            out.flush()?;
+        // Block for the next delivery; `recv` returns `None` only when the worker drops the sender (topic done).
+        let Some(delivered) = rx.recv().await else {
+            out.flush().await?;
             return Ok(());
         };
-        write_frame(&mut out, &delivered)?;
+        write_egress_frame(&mut out, &delivered).await?;
         // Drain whatever else is immediately ready into the same buffer, then flush once.
         while let Ok(more) = rx.try_recv() {
-            write_frame(&mut out, &more)?;
+            write_egress_frame(&mut out, &more).await?;
         }
-        out.flush()?;
+        out.flush().await?;
     }
 }
 
+/// Write one egress frame `[u32 payload_len][u64 publish_ts][payload]` into the buffered writer. Because a
+/// committed record is exactly `publish_ts || payload`, the frame body after the length prefix IS the record
+/// bytes — write the length then the record slice directly. No split, no per-message payload copy.
+async fn write_egress_frame<W: AsyncWriteExt + Unpin>(out: &mut W, d: &Delivered) -> std::io::Result<()> {
+    let payload_len = u32::try_from(d.record.len() - 8)
+        .map_err(|_| std::io::Error::other("delivered payload exceeds u32"))?;
+    out.write_all(&payload_len.to_be_bytes()).await?;
+    out.write_all(&d.record).await
+}
+
 // ----------------------------------------------------------------------------------------------------------
-// Wire-reading helpers (big-endian, length-prefixed). std-only.
+// Wire-reading helpers (big-endian, length-prefixed). Async over `tokio::io`.
 // ----------------------------------------------------------------------------------------------------------
 
 /// Whether a read filled the buffer or hit a clean EOF at a frame boundary.
@@ -743,10 +854,13 @@ enum ReadEnd {
 /// Read exactly `buf.len()` bytes, distinguishing a clean EOF at the start (no bytes yet) from a truncated
 /// frame mid-read (which is an error). A frame header read uses this so a producer closing between frames ends
 /// the connection cleanly rather than erroring.
-fn read_exact_or_eof(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<ReadEnd> {
+async fn read_exact_or_eof<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    buf: &mut [u8],
+) -> std::io::Result<ReadEnd> {
     let mut filled = 0usize;
     while filled < buf.len() {
-        match stream.read(&mut buf[filled..]) {
+        match stream.read(&mut buf[filled..]).await {
             Ok(0) => {
                 if filled == 0 {
                     return Ok(ReadEnd::Eof);
@@ -762,18 +876,18 @@ fn read_exact_or_eof(stream: &mut impl Read, buf: &mut [u8]) -> std::io::Result<
 }
 
 /// Read a `[u16 len][utf8]` length-prefixed string (big-endian). Used for the topic and the subscription name.
-fn read_len_prefixed_string(stream: &mut impl Read) -> std::io::Result<String> {
+async fn read_len_prefixed_string<R: AsyncReadExt + Unpin>(stream: &mut R) -> std::io::Result<String> {
     let mut len_bytes = [0u8; 2];
-    stream.read_exact(&mut len_bytes)?;
+    stream.read_exact(&mut len_bytes).await?;
     let len = u16::from_be_bytes(len_bytes) as usize;
     let mut bytes = vec![0u8; len];
-    stream.read_exact(&mut bytes)?;
+    stream.read_exact(&mut bytes).await?;
     String::from_utf8(bytes).map_err(|_| std::io::Error::other("topic/sub name is not valid UTF-8"))
 }
 
 /// Read the leading `[u16 topic_len][topic_utf8]` header common to both ingress and egress connections.
-fn read_topic_header(stream: &mut impl Read) -> std::io::Result<String> {
-    read_len_prefixed_string(stream)
+async fn read_topic_header<R: AsyncReadExt + Unpin>(stream: &mut R) -> std::io::Result<String> {
+    read_len_prefixed_string(stream).await
 }
 
 #[cfg(test)]
