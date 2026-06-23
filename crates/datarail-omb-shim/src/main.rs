@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -231,8 +231,11 @@ struct Ingested {
 /// consumers). Created lazily on first reference and stored in the [`Registry`].
 #[derive(Clone)]
 struct TopicHandle {
-    /// Sink for ingested records → the topic worker.
-    ingress_tx: Sender<Ingested>,
+    /// Sink for ingested records → the topic worker. **Bounded** (`SyncSender`): when the seal/open worker is
+    /// the bottleneck, this fills and `send` blocks, so the ingress thread stops reading the producer socket →
+    /// the producer's TCP buffer fills → the producer slows. That is datarail's backpressure (0-loss, no
+    /// unbounded backlog), versus an unbounded queue that would grow until OOM under a firehose.
+    ingress_tx: SyncSender<Ingested>,
     /// Every egress subscriber's delivery channel. The worker fans each offloaded record out to all of them.
     subscribers: Arc<Mutex<Vec<Sender<Delivered>>>>,
 }
@@ -318,7 +321,10 @@ fn topic_handle(registry: &Registry, cfg: &Config, topic: &str) -> Option<TopicH
     if let Some(handle) = map.get(topic) {
         return Some(handle.clone());
     }
-    let (ingress_tx, ingress_rx) = mpsc::channel::<Ingested>();
+    // Bounded ingress queue → backpressure (see `TopicHandle::ingress_tx`). Depth scales with the batch size
+    // (a handful of batches in flight) and is clamped so worst-case buffered memory stays bounded.
+    let depth = cfg.batch_max_records.saturating_mul(16).clamp(256, 65_536);
+    let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Ingested>(depth);
     let subscribers: Arc<Mutex<Vec<Sender<Delivered>>>> = Arc::new(Mutex::new(Vec::new()));
     let handle = TopicHandle { ingress_tx, subscribers: Arc::clone(&subscribers) };
     let worker_cfg = cfg.clone();

@@ -1,5 +1,5 @@
-name: saturation 1topic/1part/1kb uncapped
-topics: 1
+name: saturation 4topic/1kb uncapped
+topics: 4
 partitionsPerTopic: 1
 keyDistributor: "NO_KEY"
 messageSize: 1024
@@ -7,7 +7,7 @@ payloadFile: "payload/payload-1Kb.data"
 subscriptionsPerTopic: 1
 consumerPerSubscription: 1
 producersPerTopic: 1
-producerRate: 1000000     # unreachable on a small box ⇒ producers saturate ⇒ achieved rate = the ceiling
+producerRate: 1000000     # unreachable ⇒ producers push max ⇒ achieved rate = the ceiling
 consumerBacklogSizeGB: 0
 warmupDurationMinutes: 1
-testDurationMinutes: 3
+testDurationMinutes: 2
