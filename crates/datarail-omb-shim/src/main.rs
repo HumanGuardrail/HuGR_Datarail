@@ -371,8 +371,6 @@ struct TopicEngine {
     /// Monotonic record-key counter: a unique key per cofre ⇒ the once-gate never false-dedups a distinct
     /// batch (the same discipline as `datarail-bench`'s `head_to_head`).
     cofre_seq: u64,
-    /// Cursor into `dest.sink().committed()` already drained and fanned out (the sink only ever grows).
-    delivered_cursor: usize,
 }
 
 impl TopicEngine {
@@ -388,7 +386,6 @@ impl TopicEngine {
             dest,
             transport: Transport::new(cfg.substrate),
             cofre_seq: 0,
-            delivered_cursor: 0,
         }
     }
 
@@ -436,13 +433,11 @@ impl TopicEngine {
             }
         }
 
-        // Drain only the records this offload newly committed, split each back into {publish_ts, payload}, and
-        // fan out. The sink grows monotonically, so the cursor advances past exactly this batch's records.
-        let committed = self.dest.sink().committed();
-        let fresh = &committed[self.delivered_cursor..];
-        self.delivered_cursor = committed.len();
-        for record in fresh {
-            if let Some(delivered) = split_record(record) {
+        // DRAIN the records this offload committed (take, not borrow): the sink must not retain them, else a
+        // long stream grows it until OOM. Each offload commits exactly this batch, and we drained last time, so
+        // the drain yields exactly the fresh records. Split each back into {publish_ts, payload} and fan out.
+        for record in self.dest.sink_mut().take_committed() {
+            if let Some(delivered) = split_record(&record) {
                 fan_out(subscribers, &delivered);
             } else {
                 eprintln!("datarail-omb-shim[{topic}]: committed record shorter than 8-byte ts header; skip");

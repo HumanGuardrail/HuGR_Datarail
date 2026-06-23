@@ -464,6 +464,14 @@ impl Sink {
         &self.committed
     }
 
+    /// Drain and return all committed records, leaving the sink empty. Lets a consumer that forwards delivered
+    /// records downstream (e.g. a relay) reclaim memory instead of retaining every record for the process
+    /// lifetime — without this an unbounded stream grows the sink until OOM.
+    #[must_use]
+    pub fn take_committed(&mut self) -> Vec<Vec<u8>> {
+        core::mem::take(&mut self.committed)
+    }
+
     /// Commit a batch of records (idempotency is decided upstream by [`datarail_once`]).
     fn commit(&mut self, records: Vec<Vec<u8>>) {
         self.committed.extend(records);
@@ -736,6 +744,12 @@ impl DestTerminal {
     #[must_use]
     pub fn sink(&self) -> &Sink {
         &self.sink
+    }
+
+    /// Mutable access to the commit sink — for a relay that drains delivered records downstream (see
+    /// [`Sink::take_committed`]) so the sink does not grow unbounded over a long stream.
+    pub fn sink_mut(&mut self) -> &mut Sink {
+        &mut self.sink
     }
 
     /// The reason-coded dead-letter siding.
