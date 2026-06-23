@@ -136,7 +136,25 @@ hot-path allocation reduction + parallelism tuning — real work, not yet done. 
 
 **Honest standing:** Kafka still leads raw throughput (1.6 GB/s vs 624 MB/s, 2.6×), but the "6.6× slower"
 verdict was an artifact of an unoptimized adapter, not datarail's design. With straightforward engineering
-datarail does **624 MB/s sealed + provider-blind at 7 ms p99** — and the path to closing the rest is identified.
+datarail does **624 MB/s sealed + provider-blind at 7 ms p99**.
+
+### How far further engineering got (and where it hit a wall — honest)
+After the I/O-buffering win, two more optimizations were tried and **measured on the 32-core box**:
+- **Hot-path allocation cut** (Arc record + zero-split egress: no per-message payload copy/clone): +28 % on a
+  single local worker, but **0 % on the 32-core aggregate** (still 624 MB/s). ⇒ at 16 topics datarail is **not
+  per-worker-CPU-bound**.
+- **Consolidating 16 per-producer flusher threads into one**: **0 % aggregate change** (622 MB/s).
+- Diagnosis: per-stream rate is **65 k msg/s at 8 topics but 38 k at 16** — i.e. the ceiling is **thread
+  oversubscription in the thread-per-connection model** (≈112 threads on 32 cores), not CPU and not crypto. The
+  aggregate plateaus at **~620 MB/s** regardless of CPU or thread-count tweaks.
+
+**Verdict on "can engineering beat Kafka here":** I/O buffering closed the gap from 6.6× to **2.6×** — real and
+measured. Breaking past ~620 MB/s would need a **different concurrency model** (async I/O / epoll-style event
+loop instead of thread-per-connection) — a genuine shim rewrite with **uncertain** payoff against Kafka's
+decade-tuned 1.6 GB/s plaintext log. **Honest bottom line: datarail is now 2.6× off the throughput king while
+sealing every message; closing the rest is a real async-rewrite project, not a quick win — and raw throughput
+was never datarail's reason to exist.** The structural moat (provider-blind × serverless × exactly-once+proof)
+stands independent of this race.
 
 ## RabbitMQ — honest non-result
 RabbitMQ's container **could not start in this CI sandbox**: the Erlang node fails with
