@@ -1,0 +1,4 @@
+name: datarail
+driverClass: io.openmessaging.benchmark.driver.datarail.DatarailBenchmarkDriver
+ingressAddr: "127.0.0.1:7701"
+egressAddr: "127.0.0.1:7702"

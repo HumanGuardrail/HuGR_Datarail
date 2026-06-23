@@ -1,0 +1,127 @@
+name: OMB Benchmark — datarail vs Kafka/Pulsar/RabbitMQ
+
+# Industry-standard OpenMessaging Benchmark, run on ONE runner (single-node), same HW + same workload + same
+# harness for every system. Honest scope: single-node, broker+client colocated, modest vs lab-grade multi-node.
+# datarail runs its FULL sealed (provider-blind) path; the brokers run their plaintext OMB defaults.
+# Reproducible by anyone: re-run this workflow and read the artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (use your larger-runner label, e.g. a 16/32-core, for the real run)"
+        default: "ubuntu-latest"
+      systems:
+        description: "comma-separated subset of: datarail,rabbitmq,kafka,pulsar"
+        default: "datarail,rabbitmq,kafka"
+      workload:
+        description: "workload file under bench/omb/workloads/"
+        default: "ci-smoke.yaml"
+      omb_ref:
+        description: "OpenMessaging Benchmark git ref (pinned for reproducibility)"
+        default: "master"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout datarail
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-omb-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build the datarail OMB shim (release)
+        run: cargo build --release -p datarail-omb-shim
+
+      - name: Clone OpenMessaging Benchmark + graft the datarail driver
+        run: |
+          git clone https://github.com/openmessaging/benchmark.git omb-src
+          cd omb-src
+          git checkout "${{ inputs.omb_ref }}"
+          cp -r "$GITHUB_WORKSPACE/bench/omb/driver-datarail" ./driver-datarail
+          # register the module (idempotent)
+          grep -q '<module>driver-datarail</module>' pom.xml || \
+            sed -i 's#<module>driver-redis</module>#<module>driver-redis</module>\n        <module>driver-datarail</module>#' pom.xml
+
+      - name: Build OMB distribution (framework + needed drivers + datarail)
+        working-directory: omb-src
+        run: |
+          mvn -q -B -DskipTests -Dspotless.check.skip=true -Dlicense.skip=true -Dcheckstyle.skip=true \
+            -pl driver-datarail,driver-kafka,driver-rabbitmq,driver-pulsar,package -am \
+            clean install
+          mkdir -p "$GITHUB_WORKSPACE/omb-dist"
+          tar xzf package/target/*-bin.tar.gz -C "$GITHUB_WORKSPACE/omb-dist"
+          echo "DISTRO=$(ls -d "$GITHUB_WORKSPACE"/omb-dist/*/ | head -1)" >> "$GITHUB_ENV"
+
+      - name: Stage configs, workloads + shim into the distro
+        run: |
+          cp bench/omb/configs/*.yaml "$DISTRO/"
+          cp bench/omb/workloads/*.yaml "$DISTRO/workloads/"
+          cp target/release/datarail-omb-shim "$DISTRO/datarail-omb-shim"
+          cp bench/omb/run-omb.sh "$DISTRO/run-omb.sh"
+          chmod +x "$DISTRO/run-omb.sh" "$DISTRO/datarail-omb-shim"
+          # remove any stray workers.yaml so OMB uses the in-process LocalWorker (single-node)
+          rm -f "$DISTRO/workers.yaml"
+
+      - name: Run OMB for each system (sequential — each gets the whole box)
+        working-directory: ${{ env.DISTRO }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/omb-results"
+          IFS=',' read -ra SYS <<< "${{ inputs.systems }}"
+          for s in "${SYS[@]}"; do
+            echo "::group::OMB run — $s"
+            ./run-omb.sh "$s" "${{ inputs.workload }}" "$GITHUB_WORKSPACE/omb-results" || echo "::warning::$s run failed"
+            echo "::endgroup::"
+          done
+
+      - name: Summarize results
+        if: always()
+        run: |
+          echo "## OMB results — workload \`${{ inputs.workload }}\` on \`${{ inputs.runner }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "| system | pub rate (msg/s) | pub MB/s | E2E p50 (ms) | E2E p99 (ms) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for f in "$GITHUB_WORKSPACE"/omb-results/*.json; do
+            [ -f "$f" ] || continue
+            python3 - "$f" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json,sys,statistics
+          d=json.load(open(sys.argv[1]))
+          rates=[v for v in (d.get("publishRate") or []) if v is not None]
+          pr=statistics.mean(rates) if rates else 0.0
+          ms=d.get("messageSize",0) or 0
+          mb=pr*ms/1e6
+          name=d.get("driver") or d.get("workload") or sys.argv[1].split("/")[-1]
+          p50=d.get("aggregatedEndToEndLatency50pct",0) or 0
+          p99=d.get("aggregatedEndToEndLatency99pct",0) or 0
+          print(f"| {name} | {pr:,.0f} | {mb:,.1f} | {p50:.2f} | {p99:.2f} |")
+          PY
+          done
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload raw OMB result JSONs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: omb-results-${{ inputs.workload }}
+          path: omb-results/*.json
+          if-no-files-found: warn
