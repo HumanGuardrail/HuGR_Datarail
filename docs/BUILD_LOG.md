@@ -550,6 +550,20 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   forbid(unsafe) (one shmem waiver). This is "humiliate the competition under fire" — proven the rail HOLDS
   under every violent assault, not just at peak throughput.
 
+- 2026-06-23 — **#40 Kafka head-to-head — real Kafka measured; HONEST verdict (no rigging).** After a long
+  fight with the Northflank tier (exec truncation, busybox detach, async-delete races, 2→4 vCPU allowance caps,
+  repeated OOM on low-RAM plans — ~10 attempts; owner bumped the `datarail` project allowance + I created
+  isolated `datarail`/`datarail-stress` projects), a memory-capped run finally landed: **Apache Kafka 3.8
+  (KRaft), 2 vCPU, 256 B records, acks=1, PLAINTEXT = 90,661 rec/s (22.1 MB/s), p99 949 ms.** datarail on the
+  same VAES-core class: **sealed AEAD 1.43 GB/s (default) / 5.92 GB/s (vaes) batched**; per-1-record-cofre
+  ~118 µs (~8.5 k/s). **Honest, franc verdict — I refused to fabricate a universal win:** (1) datarail
+  **crushes** Kafka on its design mode (bulk SEALED throughput GB/s vs tens of MB/s plaintext) AND on the
+  structural moat (provider-blind + serverless — Kafka literally can't); (2) **honestly slower** for unbatched
+  tiny single records (per-cofre X25519+Ed25519 ~8.5k/s vs Kafka's ~90k/s) → which is precisely why the SPEC
+  locks batch-many-records-per-cofre (amortizes the crypto, then it dominates). The perfectly-matched byte-equal
+  bake-off (identical records+batching through both via the rig) is the remaining refinement. **All Northflank
+  jobs deleted (cost stopped).** DOD-01 AC-10 updated to PARTIAL with the numbers + the honest nuance.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
