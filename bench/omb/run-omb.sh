@@ -42,15 +42,42 @@ wait_port() {
 
 case "$SYS" in
   kafka)
-    # --network host: kafka binds 9092 on the host; advertised localhost:9092 resolves for the colocated client.
-    docker run -d --network host --name omb-kafka -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" apache/kafka:3.8.0 >/dev/null
-    echo "waiting for kafka :9092 ..."
-    if ! wait_port localhost 9092 150; then echo "::error::kafka never opened :9092"; docker logs --tail 40 omb-kafka || true; exit 1; fi
-    for _ in $(seq 1 30); do
-      docker exec omb-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && break
-      sleep 2
-    done
-    DRIVER="driver-kafka-local.yaml" ;;
+    if [ "${KAFKA_TLS:-0}" = "1" ]; then
+      # Kafka WITH TLS (transport encryption). Self-signed cert via keytool (stock Kafka SSL config, no custom
+      # crypto from us → low bias). Certs land on the HOST (/tmp/kcerts) so the host-side OMB client can read the
+      # truststore. NOTE: TLS encrypts client↔broker in transit; the BROKER still sees plaintext (NOT
+      # provider-blind like datarail). This measures the throughput cost of "encrypted Kafka" as commonly run.
+      CERTS=/tmp/kcerts; rm -rf "$CERTS"; mkdir -p "$CERTS"
+      docker run --rm -v "$CERTS":/certs apache/kafka:3.8.0 bash -c '
+        keytool -genkeypair -alias broker -keyalg RSA -keysize 2048 -validity 3650 \
+          -keystore /certs/server.keystore.jks -storepass changeit -keypass changeit \
+          -dname "CN=localhost" -ext SAN=DNS:localhost,IP:127.0.0.1 &&
+        keytool -exportcert -alias broker -keystore /certs/server.keystore.jks -storepass changeit -rfc -file /certs/broker.crt &&
+        keytool -importcert -alias broker -keystore /certs/client.truststore.jks -storepass changeit -file /certs/broker.crt -noprompt &&
+        chmod 644 /certs/*' || { echo "::error::keytool cert gen failed"; exit 1; }
+      docker run -d --network host --name omb-kafka -v "$CERTS":/certs -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" \
+        -e KAFKA_LISTENERS="PLAINTEXT://:9092,CONTROLLER://:9093,SSL://:9094" \
+        -e KAFKA_ADVERTISED_LISTENERS="PLAINTEXT://localhost:9092,SSL://localhost:9094" \
+        -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP="PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,SSL:SSL" \
+        -e KAFKA_SSL_KEYSTORE_LOCATION=/certs/server.keystore.jks -e KAFKA_SSL_KEYSTORE_PASSWORD=changeit \
+        -e KAFKA_SSL_KEY_PASSWORD=changeit \
+        -e KAFKA_SSL_TRUSTSTORE_LOCATION=/certs/client.truststore.jks -e KAFKA_SSL_TRUSTSTORE_PASSWORD=changeit \
+        -e KAFKA_SSL_CLIENT_AUTH=none apache/kafka:3.8.0 >/dev/null
+      echo "waiting for kafka SSL :9094 ..."
+      if ! wait_port localhost 9094 150; then echo "::error::kafka never opened SSL :9094"; docker logs --tail 50 omb-kafka || true; exit 1; fi
+      sleep 8
+      DRIVER="driver-kafka-tls.yaml"
+    else
+      # --network host: kafka binds 9092 on the host; advertised localhost:9092 resolves for the colocated client.
+      docker run -d --network host --name omb-kafka -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" apache/kafka:3.8.0 >/dev/null
+      echo "waiting for kafka :9092 ..."
+      if ! wait_port localhost 9092 150; then echo "::error::kafka never opened :9092"; docker logs --tail 40 omb-kafka || true; exit 1; fi
+      for _ in $(seq 1 30); do
+        docker exec omb-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && break
+        sleep 2
+      done
+      DRIVER="driver-kafka-local.yaml"
+    fi ;;
   rabbitmq)
     # Port-mapped (NOT --network host: that broke the erlang cookie). A non-`guest` user (guest is loopback-only,
     # which a -p gateway connection would reject) — the driver config authenticates as omb:omb over the URI.

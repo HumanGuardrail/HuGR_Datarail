@@ -20,6 +20,10 @@ on:
       omb_ref:
         description: "OpenMessaging Benchmark git ref (pinned for reproducibility)"
         default: "master"
+      kafka_tls:
+        description: "Run Kafka with TLS (transport encryption) instead of plaintext"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -85,6 +89,8 @@ jobs:
 
       - name: Run OMB for each system (sequential — each gets the whole box)
         working-directory: ${{ env.DISTRO }}
+        env:
+          KAFKA_TLS: ${{ inputs.kafka_tls && '1' || '0' }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/omb-results"
           IFS=',' read -ra SYS <<< "${{ inputs.systems }}"
