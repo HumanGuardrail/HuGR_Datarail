@@ -37,6 +37,31 @@ be reported honestly.
 - **Not a max-throughput / saturation test.** Offered rate was capped at 20 k. The "make them sweat" run
   (`producerRate` uncapped, longer, bigger HW) is the next step — that finds each system's ceiling and its
   behavior at the limit, where the brokers' bulk-throughput design may shine.
+
+## Run 2 — saturation attempt + a real backpressure finding (2026-06-23)
+
+Pushing an **unreachable offered rate** (`producerRate: 1_000_000`, 4 topics) to find ceilings surfaced two
+honest things:
+
+1. **datarail backpressures gracefully — verified.** First the OMB shim's ingress was unbounded and acked
+   before sealing, so under a firehose the internal queue grew (backlog 1.1 M → 6.7 M msgs) until OOM — a real
+   bug that *violated* datarail's own 0-loss/backpressure claim. Fixed at the root: a **bounded ingress queue**
+   (the producer is throttled when the seal/open worker is the bottleneck) **+ draining the delivery sink each
+   batch** (the demo sink otherwise retains every record). **Local firehose test (533 k msgs, deliberately slow
+   consumer): shim RSS stays flat at ~64 MB, 0 loss** — datarail throttles instead of growing. On the runner,
+   the fair 4-topic run then held **backlog ≈ 5–8 k msgs, pub ≈ cons ≈ ~60 k msg/s (~60 MB/s) sealed, 0 errors**
+   — graceful degradation, exactly the claim.
+2. **The unreachable-rate method OOMs the OMB *client*, not datarail.** With offered ≫ capacity and datarail
+   backpressuring to ~60 k msg/s, the OMB Java producer buffers the ~940 k msg/s it can't send into its own
+   heap → the **OMB client** OOMs (verified: datarail's shim memory is flat under the same firehose). So a fair
+   **max-throughput** number needs OMB's **rate-discovery** (`tool/` ramps to each system's max sustainable
+   rate), not a fixed unreachable rate — and ideally a larger runner. That run is pending (it's the headline
+   throughput comparison; this CI proved the harness + datarail's backpressure, not the ceiling).
+
+**Honest status:** datarail's *latency-at-sustainable-load* win is measured (Run 1). datarail's *graceful
+backpressure / 0-loss under overload* is measured (Run 2, local + CI). The *max-throughput ceiling vs the
+brokers* is not yet a fair number — it needs rate-discovery on adequate HW, and on bulk throughput the brokers'
+batched-log design may well lead (stated up front, not hidden).
 - **Not lab-grade HW.** 2-vCPU shared runner; broker + client colocated; single partition (brokers like Kafka
   prefer many partitions — this identical-topology choice is fair-but-modest for them, and noted).
 - **Single-node, 1 partition, 1 producer/consumer** — datarail's native point-to-point shape; a fair common
