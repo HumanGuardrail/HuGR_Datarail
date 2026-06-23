@@ -586,6 +586,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
 
 - 2026-06-23 — **HONESTY CORRECTION — self-configured Kafka benchmark is NOT authoritative (owner challenged the bias).** Owner asked: isn't this benchmark biased / did you misconfigure Kafka? **They are right.** Every Kafka number I produced was a SINGLE broker I configured myself (KRaft, capped heap, 2-vCPU box, my producer settings) — I am not a Kafka tuning expert. A deliberate memory-capped "storm" with a fairer heap **did NOT reproduce** the OOMs seen earlier (broker stayed ALIVE, OOMKilled=false) — so the earlier "Kafka dies under load" was the tiny box + my config + Northflank flakiness, **not a fair Kafka limit.** **Corrected DOD-01 AC-10 + the HTML report:** the "~3.4× faster" delta is downgraded to DIRECTIONAL/possibly-biased (NOT cited as a fair win); datarail's OWN measured numbers stand (312k rec/s sealed loopback; 5.9 GB/s/core VAES). **The real, un-riggable differentiator is STRUCTURAL** — even a perfectly-tuned Kafka cannot be provider-blind (broker reads every byte) or serverless (standing cluster). **Credible path:** OpenMessaging Benchmark (industry standard) on equal tuned HW + Kafka's own published numbers. Lesson: don't present a self-configured competitor benchmark as authoritative. All cloud + local Kafka jobs deleted.
 
+- 2026-06-23 — **Honest competitive scorecard (datarail vs Kafka/Pulsar/RabbitMQ) — `COMPETITIVE-SCORECARD.md`.**
+  Replaced the self-run (biased) Kafka comparison with: datarail's MEASURED numbers vs the competitors' OWN
+  PUBLISHED best-case (vendor/OMB, cited, fat-cluster caveats flagged) — un-handicappable by us. Research
+  (web, sourced) confirmed: all three brokers are **plaintext-to-broker** (Kafka E2E "KIP-317" never shipped),
+  all are **always-on clusters** (no scale-to-zero), RabbitMQ has **no exactly-once**, and **provider-blind
+  messaging has NO head-on product competitor.** Honest verdict: **no throughput-win claim** (different HW/jobs/
+  durability — fat clusters vs per-core, log vs point-to-point); datarail wins the **structural** axes
+  decisively + un-riggably (provider-blind, serverless/idle≈0, exactly-once+crypto-proof, untrusted-pipe, FASP
+  16-42× under loss); the **brokers win durable multi-consumer fan-out + ecosystem** (stated, not hidden). The
+  moat = the intersection, not any single attribute. Next credible step offered: a datarail **OMB driver** so
+  anyone runs the industry-standard throughput fight independently on equal HW.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

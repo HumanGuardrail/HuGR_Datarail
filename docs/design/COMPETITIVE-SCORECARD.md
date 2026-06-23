@@ -1,0 +1,71 @@
+# COMPETITIVE SCORECARD — datarail vs Kafka / Pulsar / RabbitMQ
+
+> Honest head-to-head for the **streaming/messaging corner** (datarail also competes with MFT, service-mesh,
+> and CDC tools in other corners — out of scope here). **datarail numbers = MEASURED by us** (on a VAES core,
+> labelled). **Competitor numbers = their OWN PUBLISHED best-case** (vendor/OMB, configured by their experts on
+> fat clusters) — used precisely so we cannot be accused of handicapping them, after an earlier self-run
+> comparison was (correctly) called out as biased. Every competitor figure is cited + caveated below.
+
+## ⚠️ Read this before the numbers — why a raw "datarail is Nx faster" claim is NOT made here
+
+1. **Different hardware.** Every published broker number is a **fat 3-broker cluster** (Kafka/Pulsar: 3×
+   i3en.2xlarge–6xlarge = 24–72 vCPU total, NVMe, 25 Gbps). datarail's numbers are **per single core**. Cluster
+   totals ÷ cores ≈ tens of MB/s/core for the brokers; not directly comparable.
+2. **Different jobs.** The brokers do **durable, replicated, multi-consumer log** with retention + replay.
+   datarail is **point-to-point A→B sealed movement** — it does NOT replicate to a quorum, fan out to consumer
+   groups, or retain history. Comparing their throughput to datarail's is apples-to-oranges.
+3. **Disputed sources.** The canonical Kafka-vs-Pulsar numbers come from a **Confluent (2020) vs StreamNative
+   (2020/2022) vendor fight** that reached opposite conclusions due to an async-vs-sync **durability mismatch**.
+   Treat as marketing, not neutral.
+
+**So: we do NOT claim a throughput win.** datarail's per-core sealing rate is strong (below), but the honest,
+**un-riggable** verdict is on the **structural axes** — where the brokers cannot follow by construction.
+
+## The scorecard
+
+| Dimension | **datarail** (measured) | Kafka | Pulsar | RabbitMQ | Verdict |
+|---|---|---|---|---|---|
+| **Provider-blind** (operator structurally cannot read payloads) | ✅ **sealed E2E** (AEAD; the rail decodes only the cleartext header, never `carga`) | ❌ plaintext to broker; E2E (KIP-317) **never shipped** | ❌ plaintext default (client-side E2E optional, non-default) | ❌ plaintext; broker routes through a central exchange | **datarail — alone. No head-on competitor exists.** |
+| **Serverless / idle ≈ 0** | ✅ spawn → deliver → vanish; no standing state | ❌ always-on brokers + KRaft/ZK | ❌ always-on brokers + **BookKeeper** + ZK (heaviest) | ❌ always-on Erlang nodes (~256 MiB–1.5 GiB idle) | **datarail — the others bill 24/7** |
+| **Exactly-once** | ✅ effectively-once (1000-seed DST: 0-loss/0-dup) | ✅ EOS (txns, costs throughput) | ✅ txns (2.8+) | ❌ **at-most / at-least-once only** | datarail ✅ · Kafka/Pulsar ✅ · Rabbit ❌ |
+| **+ cryptographic delivery proof** | ✅ **Merkle receipt, independently verifiable** | ❌ | ❌ | ❌ | **datarail — alone** |
+| **Survives untrusted transport** (any dumb pipe / hostile S3 / peer) | ✅ seal makes the pipe untrusted-by-design | ❌ you operate the cluster (it IS the trust) | ❌ | ❌ | **datarail — alone** |
+| **Sealed throughput** | **5.9 GB/s/core** (VAES) / 1.43 (pure-Rust); 312 k rec/s/core @256 B (loopback) | ~600 MB/s **cluster** (1KB, 24-vCPU, plaintext) | 305–600 MB/s cluster (disputed) | ~38 MB/s cluster | **competitive — NOT claimed as a win** (different HW/job) |
+| **p99 latency** | board/offload ~110–138 µs/cofre (per hop, VAES) | ~5 ms @200 MB/s | ~25 ms (Confluent) / <10 ms (vendor) | ~1 ms but only ≤30 MB/s | datarail strong per-hop; not a like-for-like load test |
+| **Throughput under packet loss** (WAN) | ✅ FASP delay-CC: **16–42× loss-based TCP** as loss climbs 5→30% | loss-based TCP (collapses under loss) | loss-based TCP | loss-based TCP | **datarail — the FASP physics** |
+| **Durable multi-consumer fan-out / retention / replay-at-scale** | ❌ point-to-point A→B; not a log | ✅ **the brokers win** | ✅ **win** (tiered storage) | ⚠️ queues/streams | **brokers win — honest** |
+| **Ecosystem / maturity** | ❌ new | ✅ **huge** (Connect, ksqlDB) | ✅ growing | ✅ mature, rich routing | **brokers win — honest** |
+
+## The honest thesis
+
+datarail does **not** win the "better broker" fight — Kafka and Pulsar are mature, expert-tuned, GB/s durable
+logs with ecosystems datarail doesn't have, and for **durable multi-consumer fan-out + replay they beat it
+outright.** That's in the scorecard, not hidden.
+
+**datarail wins a fight the brokers structurally cannot enter:** a **provider-blind, serverless,
+point-to-point sealed rail with a cryptographic delivery receipt, that rides any untrusted pipe.** The research
+is explicit — *provider-blind messaging has no head-on product competitor*; all three brokers see plaintext by
+default, and Kafka's own end-to-end-encryption proposal (KIP-317) has sat "Under Discussion" for years, never
+shipped. The moat is the **intersection** (provider-blind × serverless × point-to-point × proof), not any
+single attribute.
+
+> One-liner: **"You don't pick datarail because it out-throughputs Kafka. You pick it when the pipe — even your
+> own broker, even a cloud bucket — is not allowed to see the data. No broker can do that without becoming a
+> different product."**
+
+## The credible throughput fight (offer)
+
+To put datarail on the **industry-standard scoreboard** without us configuring (and possibly handicapping)
+anyone's software: write a **datarail driver for the OpenMessaging Benchmark (OMB)** — the Linux-Foundation
+harness the vendors themselves use. Then anyone runs the identical workload against datarail + Kafka + Pulsar +
+RabbitMQ **on equal, well-tuned hardware**, independently. That's the only throughput comparison that can't be
+accused of bias. (Caveat: OMB models broker pub/sub; datarail's point-to-point shape maps to a single
+producer→consumer path — a fair-but-partial fit, documented.)
+
+## Sources (competitor numbers — all vendor/published, cited)
+
+- Confluent OMB (2020): Kafka 605 MB/s, Pulsar 305 MB/s, RabbitMQ 38 MB/s — `confluent.io/blog/kafka-fastest-messaging-system`
+- StreamNative rebuttal (2020) + re-run (2022): Pulsar ≈/> Kafka at equal durability — `streamnative.io/blog`
+- KIP-317 (Kafka E2E encryption) — **"Under Discussion", never adopted** — `cwiki.apache.org KIP-317`
+- Kafka EOS — `confluent.io/blog/exactly-once-semantics...`; Pulsar txns — `streamnative.io`; RabbitMQ guarantees (no EOS) — `rabbitmq.com/docs/reliability`; RabbitMQ memory — `rabbitmq.com/docs/memory`
+- (datarail numbers: `BENCH-01.md` + `DOD-01.md` — measured on a Northflank VAES core, 2026-06-23.)
