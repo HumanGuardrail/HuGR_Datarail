@@ -426,6 +426,12 @@ fn build_terminal_config() -> TerminalConfig {
     TerminalConfig {
         route_id: ROUTE_ID,
         stream_id: STREAM_ID,
+        // Default = AES-256-GCM-SIV (portable, two-pass). With `--features vaes` the route uses plain
+        // AES-256-GCM (single-pass) on datarail's VAES backend — the "warp" seal path. Plain GCM is sound here
+        // because every cofre carries a FRESH per-cofre data key (SPEC key-uniqueness gate ⇒ no nonce reuse).
+        #[cfg(feature = "vaes")]
+        aead_alg: AeadAlg::Gcm256,
+        #[cfg(not(feature = "vaes"))]
         aead_alg: AeadAlg::Gcmsiv256,
         // The destination X25519 *public* key matching `DEST_X25519_SECRET` — the same primitive
         // `head_to_head` uses, so `board`'s per-cofre key-wrap targets a key the dest can open.

@@ -20,6 +20,11 @@ path = "src/bin/loadgen.rs"
 [lints]
 workspace = true
 
+[features]
+# Route the sealed path through datarail's VAES AES-256-GCM backend (the "warp" seal path) instead of the
+# default portable GCM-SIV. Forwarded to datarail-crypto. See build_terminal_config.
+vaes = ["datarail-crypto/vaes"]
+
 [dependencies]
 datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
