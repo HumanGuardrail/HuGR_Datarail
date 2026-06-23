@@ -9,6 +9,14 @@ description = "datarail-omb-shim — a mini-broker on datarail's real sealed ter
 name = "datarail-omb-shim"
 path = "src/main.rs"
 
+# An efficient native load generator that drives the shim over TCP with minimal per-message overhead (bulk
+# send/recv, no per-message future or latency histogram). Its purpose: measure datarail's TRUE sealed
+# throughput ceiling, which the OMB Java client provably could not saturate (3 shim optimizations moved the
+# OMB number 0%). NOT a product component — a measurement tool, like the rest of this adapter crate.
+[[bin]]
+name = "datarail-loadgen"
+path = "src/bin/loadgen.rs"
+
 [lints]
 workspace = true
 

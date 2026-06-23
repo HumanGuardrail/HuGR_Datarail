@@ -1,0 +1,75 @@
+name: datarail loadgen — true sealed throughput ceiling
+
+# Measures datarail's REAL sustained sealed throughput with a native, minimal-overhead Rust load generator
+# (not the OMB Java client, which provably capped datarail at ~658 MB/s — 3 shim optimizations moved that 0%).
+# Same sealed datapath + real localhost TCP as OMB; just a driver that is not itself the bottleneck.
+# Honest scope: different driver than Kafka's OMB number — labeled as such (see OMB-RESULTS.md).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (use the larger runner, e.g. Turbo)"
+        default: "Turbo"
+      vaes:
+        description: "Build the shim with the VAES AEAD backend (datarail's warp seal path)?"
+        type: boolean
+        default: false
+      msg_sizes:
+        description: "comma-separated message sizes (bytes)"
+        default: "1024,4096,16384"
+      topic_counts:
+        description: "comma-separated topic counts (parallelism)"
+        default: "16,24,32"
+
+permissions:
+  contents: read
+
+jobs:
+  loadgen:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-loadgen-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build shim + loadgen (release${{ inputs.vaes && ', vaes' || '' }})
+        run: |
+          FEAT=""; [ "${{ inputs.vaes }}" = "true" ] && FEAT="--features vaes"
+          cargo build --release -p datarail-omb-shim $FEAT
+          echo "cores: $(nproc)"
+
+      - name: Sweep — datarail true sealed throughput
+        run: |
+          echo "## datarail loadgen — true sealed throughput (\`${{ inputs.runner }}\`, vaes=${{ inputs.vaes }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| topics | msg size | msg/s | MB/s |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          IFS=',' read -ra SIZES <<< "${{ inputs.msg_sizes }}"
+          IFS=',' read -ra TOPICS <<< "${{ inputs.topic_counts }}"
+          for sz in "${SIZES[@]}"; do
+            for tc in "${TOPICS[@]}"; do
+              ./target/release/datarail-omb-shim > shim.log 2>&1 &
+              SHIM=$!
+              sleep 2
+              # warmup 6s, measure 20s
+              OUT=$(./target/release/datarail-loadgen "$tc" "$sz" 6 20 2>&1 | grep RESULT)
+              kill $SHIM 2>/dev/null || true
+              sleep 1
+              echo "loadgen: $OUT"
+              ms=$(echo "$OUT" | sed -E 's/.*: ([0-9]+) msg\/s.*/\1/')
+              mb=$(echo "$OUT" | sed -E 's/.* ([0-9]+) MB\/s.*/\1/')
+              echo "| $tc | ${sz} B | ${ms:-?} | ${mb:-?} |" >> "$GITHUB_STEP_SUMMARY"
+              # surface any shim error honestly
+              if grep -qi error shim.log; then echo "::warning::shim logged errors at topics=$tc size=$sz"; tail -3 shim.log; fi
+            done
+          done
+          cat "$GITHUB_STEP_SUMMARY"
