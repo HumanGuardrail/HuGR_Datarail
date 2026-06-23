@@ -210,15 +210,14 @@ impl core::error::Error for ShimError {}
 // Internal messages.
 // ----------------------------------------------------------------------------------------------------------
 
-/// One delivered message handed to an egress subscriber: the original `publish_ts_millis` plus the payload
-/// (the `{publish_ts || payload}` record, split back apart after the seal round-trip).
+/// One delivered message handed to every egress subscriber, as the whole `{publish_ts(8B) || payload}` record
+/// behind an [`Arc`]. Fan-out is then an `Arc` clone (no payload copy), and egress writes the frame body
+/// straight from it — the wire frame is `[u32 payload_len][record]` because `record == publish_ts || payload`,
+/// so no split or re-assembly allocation is needed on the hot path.
 #[derive(Clone)]
 struct Delivered {
-    /// Epoch-millis the producer stamped at `sendAsync` time (full E2E latency anchor). Travels as opaque
-    /// record bytes through the sealed path.
-    publish_ts: u64,
-    /// The original message payload, byte-identical to what the producer sent.
-    payload: Vec<u8>,
+    /// The committed `{publish_ts(8 BE) || payload}` record; `record.len() >= 8` is guaranteed by the worker.
+    record: Arc<Vec<u8>>,
 }
 
 /// One ingested message queued to a topic worker: the assembled `{publish_ts(8B) || payload}` record bytes.
@@ -435,10 +434,11 @@ impl TopicEngine {
 
         // DRAIN the records this offload committed (take, not borrow): the sink must not retain them, else a
         // long stream grows it until OOM. Each offload commits exactly this batch, and we drained last time, so
-        // the drain yields exactly the fresh records. Split each back into {publish_ts, payload} and fan out.
+        // the drain yields exactly the fresh records. Wrap each owned record in an Arc (no copy) and fan it out;
+        // the egress writer emits `[len][record]` directly, so there is no per-message split/clone of the payload.
         for record in self.dest.sink_mut().take_committed() {
-            if let Some(delivered) = split_record(&record) {
-                fan_out(subscribers, &delivered);
+            if record.len() >= 8 {
+                fan_out(subscribers, &Delivered { record: Arc::new(record) });
             } else {
                 eprintln!("datarail-omb-shim[{topic}]: committed record shorter than 8-byte ts header; skip");
             }
@@ -498,19 +498,9 @@ fn recv_blocking(ingress_rx: &Receiver<Ingested>) -> Option<Ingested> {
     }
 }
 
-/// Split a committed record `{publish_ts(8 BE) || payload}` back into its [`Delivered`] parts. Returns `None`
-/// if the record is shorter than the 8-byte timestamp header (impossible for shim-boarded records).
-fn split_record(record: &[u8]) -> Option<Delivered> {
-    let ts_bytes: [u8; 8] = record.get(0..8)?.try_into().ok()?;
-    Some(Delivered {
-        publish_ts: u64::from_be_bytes(ts_bytes),
-        payload: record[8..].to_vec(),
-    })
-}
-
 /// Fan `delivered` out to every live subscriber on the topic, dropping any whose consumer has disconnected
 /// (its egress thread closed the receiver). Each distinct subscription is an independent delivery copy, per
-/// OMB semantics ("each subscription gets all messages").
+/// OMB semantics ("each subscription gets all messages"). The clone is a cheap `Arc` bump — no payload copy.
 fn fan_out(subscribers: &Arc<Mutex<Vec<Sender<Delivered>>>>, delivered: &Delivered) {
     let Ok(mut subs) = subscribers.lock() else {
         return; // poisoned only if an egress thread panicked; nothing to deliver to then.
@@ -714,15 +704,14 @@ fn serve_egress_inner(stream: TcpStream, registry: &Registry, cfg: &Config) -> s
     // syscall rate. We coalesce a burst of delivered frames into the buffer and flush only when the delivery
     // channel momentarily drains — full throughput under load, still low-latency when idle.
     let mut out = BufWriter::new(stream);
-    let mut frame = Vec::new();
-    let mut write_frame = |w: &mut BufWriter<TcpStream>, d: &Delivered| -> std::io::Result<()> {
-        let payload_len =
-            u32::try_from(d.payload.len()).map_err(|_| std::io::Error::other("delivered payload exceeds u32"))?;
-        frame.clear();
-        frame.extend_from_slice(&payload_len.to_be_bytes());
-        frame.extend_from_slice(&d.publish_ts.to_be_bytes());
-        frame.extend_from_slice(&d.payload);
-        w.write_all(&frame)
+    // The wire frame is `[u32 payload_len][u64 publish_ts][payload]`, and `record == publish_ts || payload`, so
+    // the frame body after the length prefix IS the record bytes — write the length then the record slice
+    // directly into the buffered writer. No split, no per-message payload copy.
+    let write_frame = |w: &mut BufWriter<TcpStream>, d: &Delivered| -> std::io::Result<()> {
+        let payload_len = u32::try_from(d.record.len() - 8)
+            .map_err(|_| std::io::Error::other("delivered payload exceeds u32"))?;
+        w.write_all(&payload_len.to_be_bytes())?;
+        w.write_all(&d.record)
     };
     loop {
         // Block for the next delivery; `recv` errs only when the worker drops the sender (topic done).
@@ -789,7 +778,7 @@ fn read_topic_header(stream: &mut impl Read) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_contract, split_record, unquote, Config, SubstrateKind};
+    use super::{build_contract, unquote, Config, SubstrateKind};
 
     #[test]
     fn config_defaults_match_the_frozen_contract() {
@@ -851,14 +840,16 @@ mod tests {
     }
 
     #[test]
-    fn split_record_recovers_ts_and_payload() {
+    fn egress_frame_body_is_the_record() {
+        // The egress wire frame is `[u32 payload_len][u64 publish_ts][payload]`. Because a committed record is
+        // exactly `publish_ts || payload`, the frame body after the length prefix IS the record bytes — this is
+        // what lets egress write `[len][record]` with no split/copy. Assert the relationship holds.
         let mut record = Vec::new();
         record.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
         record.extend_from_slice(b"hello");
-        let d = split_record(&record).unwrap();
-        assert_eq!(d.publish_ts, 0x0102_0304_0506_0708);
-        assert_eq!(d.payload, b"hello");
-        // A record shorter than the 8-byte header is rejected (no panic).
-        assert!(split_record(&[0u8; 4]).is_none());
+        let payload_len = record.len() - 8;
+        assert_eq!(payload_len, 5);
+        assert_eq!(&record[0..8], &0x0102_0304_0506_0708u64.to_be_bytes()); // ts
+        assert_eq!(&record[8..], b"hello"); // payload
     }
 }
