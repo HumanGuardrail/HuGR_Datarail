@@ -1,0 +1,13 @@
+name: rate-discovery 8topic/1kb
+topics: 8
+partitionsPerTopic: 1
+keyDistributor: "NO_KEY"
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+producerRate: 0
+consumerBacklogSizeGB: 0
+warmupDurationMinutes: 1
+testDurationMinutes: 3
