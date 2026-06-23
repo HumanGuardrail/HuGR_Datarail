@@ -584,6 +584,8 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   percentiles (GATE-LATENCY p50/p99). **17→18 crates? no — 18 crates** (datarail-metrics added). **153 tests**
   green, clippy clean, forbid(unsafe). Branch merged + deleted.
 
+- 2026-06-23 — **HONESTY CORRECTION — self-configured Kafka benchmark is NOT authoritative (owner challenged the bias).** Owner asked: isn't this benchmark biased / did you misconfigure Kafka? **They are right.** Every Kafka number I produced was a SINGLE broker I configured myself (KRaft, capped heap, 2-vCPU box, my producer settings) — I am not a Kafka tuning expert. A deliberate memory-capped "storm" with a fairer heap **did NOT reproduce** the OOMs seen earlier (broker stayed ALIVE, OOMKilled=false) — so the earlier "Kafka dies under load" was the tiny box + my config + Northflank flakiness, **not a fair Kafka limit.** **Corrected DOD-01 AC-10 + the HTML report:** the "~3.4× faster" delta is downgraded to DIRECTIONAL/possibly-biased (NOT cited as a fair win); datarail's OWN measured numbers stand (312k rec/s sealed loopback; 5.9 GB/s/core VAES). **The real, un-riggable differentiator is STRUCTURAL** — even a perfectly-tuned Kafka cannot be provider-blind (broker reads every byte) or serverless (standing cluster). **Credible path:** OpenMessaging Benchmark (industry standard) on equal tuned HW + Kafka's own published numbers. Lesson: don't present a self-configured competitor benchmark as authoritative. All cloud + local Kafka jobs deleted.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
