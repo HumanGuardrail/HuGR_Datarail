@@ -22,10 +22,17 @@
 | **datarail** (sealed) | 20 040 | 20.5 | 3 ms | **7 ms** | **30 ms** |
 
 **Honest reading:** at a fixed 20 k msg/s, 1 KB, single-node, all three keep up on throughput (that's the
-offered rate, not a ceiling). The standout is the **latency tail**: datarail's **p99 = 7 ms vs Kafka 197 ms /
-Pulsar 166 ms** (~24–28× tighter), and **p99.9 = 30 ms vs ~540–560 ms** (~18×). datarail does this **while
-sealing every message** — the brokers were in plaintext. datarail's run was clean (0 publish errors, consumer
-kept pace, backlog ≈ 0; shim log error-free).
+offered rate, not a ceiling). On this **2-core runner** datarail's tail was far tighter — **p99 7 ms vs Kafka
+197 ms / Pulsar 166 ms**.
+
+> ⚠️ **CORRECTION (Run 3, Turbo 32-core):** that huge gap was **largely resource contention on the starved
+> 2-core box, NOT a fundamental Kafka problem.** Re-run at the same fixed 20 k on a 32-core/128 GB runner:
+> **Kafka p99 = 2 ms, datarail p99 = 5 ms** — both excellent, Kafka slightly *lower*. So do **not** cite
+> "datarail's p99 is ~25× Kafka's" as a general claim; it holds only on a CPU-starved box (where Kafka's
+> GC/flush spikes balloon). The honest fixed-load statement is: **on adequate HW datarail's latency is
+> single-digit-ms and competitive with Kafka — while sealing every message (Kafka was plaintext).** The
+> durable structural wins (provider-blind, serverless, exactly-once+proof) stand regardless; raw latency at
+> moderate load is roughly a tie on real HW.
 
 **Why the brokers' tail is so much worse here:** Kafka/Pulsar are durable, batch-oriented logs tuned for bulk
 throughput; at a steady moderate rate on a small box their flush/replication/GC introduces periodic tail

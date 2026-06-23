@@ -31,7 +31,7 @@
 | **+ cryptographic delivery proof** | ✅ **Merkle receipt, independently verifiable** | ❌ | ❌ | ❌ | **datarail — alone** |
 | **Survives untrusted transport** (any dumb pipe / hostile S3 / peer) | ✅ seal makes the pipe untrusted-by-design | ❌ you operate the cluster (it IS the trust) | ❌ | ❌ | **datarail — alone** |
 | **Sealed throughput** | **5.9 GB/s/core** (VAES) / 1.43 (pure-Rust); 312 k rec/s/core @256 B (loopback) | ~600 MB/s **cluster** (1KB, 24-vCPU, plaintext) | 305–600 MB/s cluster (disputed) | ~38 MB/s cluster | **competitive — NOT claimed as a win** (different HW/job) |
-| **p99 latency** (OMB, measured) | **7 ms** E2E @20k msg/s, sealed | **197 ms** (same OMB run) | **166 ms** (same OMB run) | ~1 ms but only ≤30 MB/s (published) | **datarail — measured ~24-28× tighter tail on the SAME OMB harness/HW (`OMB-RESULTS.md`); brokers in plaintext** |
+| **p99 latency** (OMB, measured) | **5 ms** @20k, sealed (32-core) | **2 ms** (32-core) | ~10 ms | ~1 ms but only ≤30 MB/s (published) | **roughly a tie on adequate HW** — both single-digit ms; datarail does it sealed. (On a starved 2-core box datarail was ~25× tighter, but that was Kafka GC/flush contention, not fundamental — honest correction in `OMB-RESULTS.md`.) |
 | **Throughput under packet loss** (WAN) | ✅ FASP delay-CC: **16–42× loss-based TCP** as loss climbs 5→30% | loss-based TCP (collapses under loss) | loss-based TCP | loss-based TCP | **datarail — the FASP physics** |
 | **Durable multi-consumer fan-out / retention / replay-at-scale** | ❌ point-to-point A→B; not a log | ✅ **the brokers win** | ✅ **win** (tiered storage) | ⚠️ queues/streams | **brokers win — honest** |
 | **Ecosystem / maturity** | ❌ new | ✅ **huge** (Connect, ksqlDB) | ✅ growing | ✅ mature, rich routing | **brokers win — honest** |
@@ -53,7 +53,7 @@ single attribute.
 > own broker, even a cloud bucket — is not allowed to see the data. No broker can do that without becoming a
 > different product."**
 
-**Now partly MEASURED, not just published:** the OpenMessaging Benchmark (industry standard) runs in CI against datarail + Kafka + Pulsar on identical HW — see [`OMB-RESULTS.md`](OMB-RESULTS.md). First run (fixed 20k msg/s, single-node): datarail E2E p99 **7 ms** vs Kafka **197 ms** / Pulsar **166 ms**, while datarail seals every message. A max-throughput/saturation run on larger HW is the next step.
+**Now partly MEASURED, not just published:** the OpenMessaging Benchmark (industry standard) runs in CI against datarail + Kafka + Pulsar on identical HW — see [`OMB-RESULTS.md`](OMB-RESULTS.md). On a 32-core runner at fixed 20k msg/s both datarail and Kafka show single-digit-ms p99 (datarail 5 ms sealed, Kafka 2 ms plaintext) — a tie on latency, datarail doing it sealed. (The ~25× gap seen on a 2-core box was resource contention, not fundamental — corrected honestly.) Max-throughput rate-discovery on the 32-core box is the headline still landing; on bulk throughput the brokers' batched-log design may lead.
 
 ## The credible throughput fight (offer)
 
