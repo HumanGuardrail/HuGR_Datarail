@@ -67,7 +67,9 @@ jobs:
       - name: Build OMB distribution (framework + needed drivers + datarail)
         working-directory: omb-src
         run: |
-          mvn -q -B -DskipTests -Dspotless.check.skip=true -Dlicense.skip=true -Dcheckstyle.skip=true \
+          mvn -q -B -DskipTests \
+            -Dspotless.check.skip=true -Dlicense.skip=true -Dcheckstyle.skip=true \
+            -Dspotbugs.skip=true -Denforcer.skip=true -Drat.skip=true \
             -pl driver-datarail,driver-kafka,driver-rabbitmq,driver-pulsar,package -am \
             clean install
           mkdir -p "$GITHUB_WORKSPACE/omb-dist"
