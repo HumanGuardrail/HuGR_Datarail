@@ -2,11 +2,19 @@
 # Run the OMB workload against ONE system, single-node, then tear it down.
 # Usage: ./run-omb.sh <kafka|rabbitmq|pulsar|datarail> <workload-file> <results-dir>
 # CWD must be the OMB distribution dir (has bin/benchmark, workloads/, the local *.yaml driver configs, the shim).
+#
+# Hardening (learned from a 17-min hang): every broker has a REAL readiness gate (TCP listener actually
+# accepting), not just "node up"; the benchmark is wrapped in `timeout` so a stuck run cannot burn the budget;
+# per-system stdout + the shim log are captured into the results dir; the per-system rc is reported, not
+# silently swallowed.
 set -uo pipefail
 
 SYS="$1"; WL="$2"; RESULTS="$3"
 SHIM_PID=""
-export HEAP_OPTS="-Xms1G -Xmx2G"   # OMB client heap — modest so it coexists with a colocated broker
+RUN_TIMEOUT="${RUN_TIMEOUT:-600}"   # hard cap per system (seconds)
+export HEAP_OPTS="-Xms1G -Xmx2G"    # OMB client heap — modest so it coexists with a colocated broker
+mkdir -p "$RESULTS"
+OUT="$RESULTS/$SYS.out"
 
 cleanup() {
   [ -n "$SHIM_PID" ] && kill "$SHIM_PID" 2>/dev/null || true
@@ -14,49 +22,60 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Wait until a host TCP port actually accepts a connection (listener ready), or fail.
+wait_port() {
+  local host="$1" port="$2" tries="${3:-90}"
+  for _ in $(seq 1 "$tries"); do
+    if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then exec 3>&- 3<&-; return 0; fi
+    sleep 2
+  done
+  return 1
+}
+
 case "$SYS" in
   kafka)
-    docker run -d --name omb-kafka -p 9092:9092 \
-      -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" apache/kafka:3.8.0 >/dev/null
-    echo "waiting for kafka..."
-    for i in $(seq 1 60); do
+    docker run -d --name omb-kafka -p 9092:9092 -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" apache/kafka:3.8.0 >/dev/null
+    echo "waiting for kafka :9092 ..."
+    if ! wait_port localhost 9092 90; then echo "::error::kafka never opened :9092"; exit 1; fi
+    for _ in $(seq 1 30); do
       docker exec omb-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && break
       sleep 2
     done
     DRIVER="driver-kafka-local.yaml" ;;
   rabbitmq)
     docker run -d --name omb-rabbit -p 5672:5672 rabbitmq:3.13 >/dev/null
-    echo "waiting for rabbitmq..."
-    for i in $(seq 1 60); do
-      docker exec omb-rabbit rabbitmq-diagnostics -q ping >/dev/null 2>&1 && break
-      sleep 2
-    done
+    echo "waiting for rabbitmq node + :5672 ..."
+    for _ in $(seq 1 60); do docker exec omb-rabbit rabbitmqctl await_startup >/dev/null 2>&1 && break; sleep 2; done
+    if ! wait_port localhost 5672 60; then echo "::error::rabbitmq never opened :5672"; exit 1; fi
     DRIVER="driver-rabbitmq-local.yaml" ;;
   pulsar)
     docker run -d --name omb-pulsar -p 6650:6650 -p 8080:8080 \
       -e PULSAR_MEM="-Xms512m -Xmx2g" apachepulsar/pulsar:3.3.1 bin/pulsar standalone >/dev/null
-    echo "waiting for pulsar..."
-    for i in $(seq 1 90); do
-      curl -sf localhost:8080/admin/v2/clusters >/dev/null 2>&1 && break
-      sleep 2
-    done
+    echo "waiting for pulsar :6650 + admin ..."
+    if ! wait_port localhost 6650 120; then echo "::error::pulsar never opened :6650"; exit 1; fi
+    for _ in $(seq 1 30); do curl -sf localhost:8080/admin/v2/clusters >/dev/null 2>&1 && break; sleep 2; done
     DRIVER="driver-pulsar-local.yaml" ;;
   datarail)
-    ./datarail-omb-shim >shim.log 2>&1 &
+    ./datarail-omb-shim >"$RESULTS/datarail-shim.log" 2>&1 &
     SHIM_PID=$!
     sleep 3
-    if ! kill -0 "$SHIM_PID" 2>/dev/null; then echo "shim failed to start:"; cat shim.log; exit 1; fi
+    if ! kill -0 "$SHIM_PID" 2>/dev/null; then echo "::error::shim failed to start"; cat "$RESULTS/datarail-shim.log"; exit 1; fi
+    if ! wait_port 127.0.0.1 7701 15; then echo "::error::shim ingress :7701 not accepting"; cat "$RESULTS/datarail-shim.log"; exit 1; fi
     DRIVER="datarail.yaml" ;;
   *)
     echo "unknown system: $SYS"; exit 2 ;;
 esac
 
-echo "running OMB: driver=$DRIVER workload=$WL"
+echo "running OMB: driver=$DRIVER workload=$WL (timeout ${RUN_TIMEOUT}s)"
 # No workers.yaml present => OMB uses the in-process LocalWorker (single-node).
-bin/benchmark -d "$DRIVER" "workloads/$WL"
-rc=$?
+timeout "$RUN_TIMEOUT" bin/benchmark -d "$DRIVER" "workloads/$WL" 2>&1 | tee "$OUT"
+rc="${PIPESTATUS[0]}"
 
-mkdir -p "$RESULTS"
 mv ./*.json "$RESULTS/" 2>/dev/null || true
+if [ "$rc" -eq 124 ]; then
+  echo "::warning::$SYS TIMED OUT after ${RUN_TIMEOUT}s"
+elif [ "$rc" -ne 0 ]; then
+  echo "::warning::$SYS exited rc=$rc — last lines:"; tail -20 "$OUT"
+fi
 echo "$SYS done (rc=$rc)"
-exit 0
+exit "$rc"

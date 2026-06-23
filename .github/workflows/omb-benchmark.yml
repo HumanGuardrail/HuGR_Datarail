@@ -59,10 +59,7 @@ jobs:
           git clone https://github.com/openmessaging/benchmark.git omb-src
           cd omb-src
           git checkout "${{ inputs.omb_ref }}"
-          cp -r "$GITHUB_WORKSPACE/bench/omb/driver-datarail" ./driver-datarail
-          # register the module (idempotent)
-          grep -q '<module>driver-datarail</module>' pom.xml || \
-            sed -i 's#<module>driver-redis</module>#<module>driver-redis</module>\n        <module>driver-datarail</module>#' pom.xml
+          bash "$GITHUB_WORKSPACE/bench/omb/graft-driver.sh" "$PWD" "$GITHUB_WORKSPACE/bench/omb/driver-datarail"
 
       - name: Build OMB distribution (framework + needed drivers + datarail)
         working-directory: omb-src
@@ -100,30 +97,23 @@ jobs:
       - name: Summarize results
         if: always()
         run: |
-          echo "## OMB results — workload \`${{ inputs.workload }}\` on \`${{ inputs.runner }}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "| system | pub rate (msg/s) | pub MB/s | E2E p50 (ms) | E2E p99 (ms) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          for f in "$GITHUB_WORKSPACE"/omb-results/*.json; do
-            [ -f "$f" ] || continue
-            python3 - "$f" >> "$GITHUB_STEP_SUMMARY" <<'PY'
-          import json,sys,statistics
-          d=json.load(open(sys.argv[1]))
-          rates=[v for v in (d.get("publishRate") or []) if v is not None]
-          pr=statistics.mean(rates) if rates else 0.0
-          ms=d.get("messageSize",0) or 0
-          mb=pr*ms/1e6
-          name=d.get("driver") or d.get("workload") or sys.argv[1].split("/")[-1]
-          p50=d.get("aggregatedEndToEndLatency50pct",0) or 0
-          p99=d.get("aggregatedEndToEndLatency99pct",0) or 0
-          print(f"| {name} | {pr:,.0f} | {mb:,.1f} | {p50:.2f} | {p99:.2f} |")
-          PY
-          done
+          {
+            echo "## OMB results — workload \`${{ inputs.workload }}\` on \`${{ inputs.runner }}\`"
+            echo ""
+            echo "_Single-node (broker+client colocated). datarail runs its FULL sealed/provider-blind path;"
+            echo "the brokers run their plaintext OMB defaults. Raw JSON + per-system logs in the artifact._"
+            echo ""
+            python3 bench/omb/summarize.py "$GITHUB_WORKSPACE/omb-results"
+          } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload raw OMB result JSONs
+      - name: Upload raw OMB results + per-system logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: omb-results-${{ inputs.workload }}
-          path: omb-results/*.json
+          path: |
+            omb-results/*.json
+            omb-results/*.out
+            omb-results/*.log
           if-no-files-found: warn
