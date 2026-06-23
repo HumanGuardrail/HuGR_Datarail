@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Datarail — what we've actually proven</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#121823; --panel2:#0f1420; --ink:#e6edf3; --dim:#9fb0c3;
+    --line:#1e2a3a; --proven:#3fb950; --dir:#d29922; --pend:#8b949e; --warp:#58a6ff; --moat:#bc8cff;
+    --accent:#2dd4bf;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#15233a 0,var(--bg) 55%) fixed;color:var(--ink);
+    font:16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial}
+  .wrap{max-width:980px;margin:0 auto;padding:40px 22px 80px}
+  h1{font-size:40px;line-height:1.1;margin:.2em 0 .1em;letter-spacing:-.5px}
+  h2{font-size:24px;margin:2.2em 0 .6em;letter-spacing:-.3px}
+  h3{font-size:17px;margin:1.4em 0 .3em}
+  .sub{color:var(--dim);font-size:18px;margin:0 0 8px}
+  .rail{height:3px;background:linear-gradient(90deg,var(--warp),var(--moat),var(--accent));border-radius:3px;margin:18px 0 6px;
+    box-shadow:0 0 24px rgba(88,166,255,.4)}
+  code{background:#0c121c;border:1px solid var(--line);border-radius:5px;padding:1px 6px;font-size:13.5px;color:#cdd9e5}
+  .panel{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:16px 0}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13.5px;color:var(--dim);margin:10px 0 0}
+  .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.5px;padding:2px 8px;border-radius:20px;vertical-align:middle}
+  .b-proven{background:rgba(63,185,80,.16);color:var(--proven);border:1px solid rgba(63,185,80,.4)}
+  .b-dir{background:rgba(210,153,34,.16);color:var(--dir);border:1px solid rgba(210,153,34,.4)}
+  .b-pend{background:rgba(139,148,158,.16);color:var(--pend);border:1px solid rgba(139,148,158,.4)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:14px 0}
+  .stat{background:#0d1420;border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+  .stat .n{font-size:30px;font-weight:800;letter-spacing:-1px}
+  .stat .l{color:var(--dim);font-size:13px;margin-top:2px}
+  .warpn .n{color:var(--warp)}
+  ul.clean{list-style:none;padding:0;margin:10px 0}
+  ul.clean li{padding:9px 0;border-bottom:1px solid var(--line);display:flex;gap:10px;align-items:flex-start}
+  ul.clean li:last-child{border-bottom:0}
+  ul.clean .t{flex:1}
+  .muted{color:var(--dim)}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14.5px}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.5px}
+  td.num{font-variant-numeric:tabular-nums;font-weight:700}
+  .moatcard{border-left:3px solid var(--moat)}
+  .frank{border-left:3px solid var(--dir);background:#15120a}
+  .foot{color:var(--dim);font-size:13px;margin-top:30px;border-top:1px solid var(--line);padding-top:16px}
+  .kicker{color:var(--accent);font-weight:700;font-size:13px;letter-spacing:1.5px;text-transform:uppercase}
+  .big{font-size:19px}
+  em{color:#fff;font-style:normal;font-weight:600}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="kicker">HuGR · Datarail</div>
+  <h1>The sealed rail.<br>What we've actually <span style="color:var(--warp)">proven</span>.</h1>
+  <p class="sub">A zero-knowledge, serverless data rail in Rust — <em>smart sealed endpoints, dumb cheap pipes.</em></p>
+  <div class="rail"></div>
+  <p class="muted">Honest status report — generated 2026-06-22. Every claim below is labelled by how strongly it's
+  backed, in the project's own taxonomy. No fabricated greens; no number before its artifact.</p>
+
+  <div class="legend">
+    <span><span class="badge b-proven">PROVEN</span> tested / measured / cold-verified</span>
+    <span><span class="badge b-dir">DIRECTIONAL</span> measured but caveated</span>
+    <span><span class="badge b-pend">PENDING</span> not done yet — honest gap</span>
+  </div>
+
+  <div class="grid">
+    <div class="stat"><div class="n">16</div><div class="l">Rust crates</div></div>
+    <div class="stat"><div class="n">141</div><div class="l">tests green</div></div>
+    <div class="stat warpn"><div class="n">5.9 <span style="font-size:16px">GB/s</span></div><div class="l">sealed throughput / core (VAES)</div></div>
+    <div class="stat"><div class="n">0</div><div class="l"><code>unsafe</code> (1 audited waiver)</div></div>
+  </div>
+
+  <h2>⚡ The warp number — measured on real hardware</h2>
+  <div class="panel">
+    <p>The headline claim was "warp speed." We didn't assert it — we <em>measured the real binary on a
+    representative VAES server core</em> (a cloud box with the modern AES vector instructions), because the dev
+    laptop is a pre-VAES 2019 chip and its numbers are noise.</p>
+    <table>
+      <tr><th>Sealing path (real <code>datarail</code> binary)</th><th>per core</th><th>verdict</th></tr>
+      <tr><td>Default — pure-Rust AES-256-GCM-SIV (AES-NI)</td><td class="num">1.43 GB/s</td><td><span class="badge b-proven">PROVEN</span> clears the 1 GiB/s gate</td></tr>
+      <tr><td><code>--features vaes</code> — ring AES-256-GCM (VAES/AVX-512)</td><td class="num" style="color:var(--warp)">5.92 GB/s</td><td><span class="badge b-proven">PROVEN</span> ~6× the gate · ~4.7× the default</td></tr>
+      <tr><td class="muted">BLAKE3 (content-address + delivery proof)</td><td class="num muted">6.5 GB/s</td><td class="muted">not the bottleneck</td></tr>
+    </table>
+    <p class="muted">The two backends are <em>wire-compatible</em> — a known-answer test pins AES-256-GCM to one
+    exact ciphertext that both produce byte-for-byte, so a cofre sealed by one opens on the other. Default stays
+    pure-Rust (lightweight); the VAES backend is opt-in for throughput-critical routes. <code>ring</code> was
+    already in the tree, so it added zero new dependency weight.</p>
+  </div>
+
+  <h2>🔒 What the rail provably does</h2>
+  <div class="panel">
+    <ul class="clean">
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>The pipe can't read your data.</strong>
+        Every payload is sealed end-to-end (AEAD + Ed25519 signature + per-cofre X25519 key-wrap). A metamorphic
+        test swaps the plaintext under a fixed header and the substrate's byte-trace is <em>identical</em> — the
+        rail provably never sees content. <span class="muted">(AC-1 opaque-cargo.)</span></div></li>
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Tamper is impossible to sneak through.</strong>
+        <em>Every single byte</em> of a sealed cofre is flipped in a test and every flip is rejected — exhaustive,
+        not sampled. Forged or wrong-key seals are rejected against the route-pinned key.
+        <span class="muted">(AC-2 / AC-3.)</span></div></li>
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Exactly-once, even through chaos.</strong>
+        1000 randomized runs of drop / reorder / duplicate / kill-and-respawn → <em>0 loss, 0 duplicates</em>. And
+        over a <em>real TCP socket</em> partitioned mid-stream: reconnect, re-drive, dedup → still 0/0.
+        <span class="muted">(AC-4 / AC-8.)</span></div></li>
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Delivery comes with a receipt.</strong>
+        A Merkle manifest whose root an independent verifier re-derives; any tamper breaks it.
+        <span class="muted">(AC-5.)</span></div></li>
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>One rail, many pipes.</strong>
+        The same conformance harness passes over all three spec-named substrates — shared-memory (µs same-host),
+        QUIC (cross-host blind relay), object-store/S3 (cross-cloud) — plus TCP/Unix-socket. The endpoints don't
+        know or care which pipe carries them. <span class="muted">(AC-6, 3/3 named.)</span></div></li>
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>It runs as real, separate processes.</strong>
+        <code>datarail send</code> and <code>datarail recv</code> move a sealed shipment between two distinct OS
+        processes over a real socket — optionally inside a mutually-authenticated <em>Noise_KK</em> encrypted hop,
+        and two hosts can bootstrap trust from a short code via <em>SPAKE2</em> pairing (wrong code → burns).</div></li>
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>It refuses bad data at the door.</strong>
+        Content-contract enforced on both ends; violations dead-letter with a reason, never silently corrupt.
+        Backed by property-based testing. <span class="muted">(AC-9.)</span></div></li>
+    </ul>
+  </div>
+
+  <h2 style="color:var(--moat)">🏰 Why it's genuinely awesome — the moat</h2>
+  <div class="panel moatcard">
+    <p class="big">Three things are true <em>at the same time</em>, and that intersection is the moat:</p>
+    <ul class="clean">
+      <li>🛡️<div class="t"><strong>Provider-blind by construction.</strong> The infrastructure — even ours, even an
+        S3 bucket, even a hostile peer — physically cannot open the vault. A broker like Kafka <em>reads your
+        messages</em>; datarail structurally can't. That's not a setting, it's the architecture.</div></li>
+      <li>⚡<div class="t"><strong>Sealed at near-line-rate.</strong> ~6 GB/s/core sealing means encryption isn't a
+        tax you pay <em>on top of</em> the pipe — the seal <em>is</em> the path. A competitor that bolts encryption
+        onto a plaintext transport pays it as pure overhead.</div></li>
+      <li>🪶<div class="t"><strong>Featherweight & serverless.</strong> No broker, no cluster humming 24/7. The rail
+        spawns, carries, proves delivery, and vanishes — idle cost ≈ 0 by construction.</div></li>
+    </ul>
+    <p class="muted">Each piece exists somewhere (Kafka has durability; service meshes have reach; Signal has
+    sealing). <em>Nobody ships all of them as one rail.</em> That synthesis — plus exactly-once and cross-substrate
+    portability — is what doesn't exist off the shelf.</p>
+  </div>
+
+  <h2>🧭 Are we trailblazing? — the frank take</h2>
+  <div class="panel frank">
+    <p><strong>Yes, on the architecture.</strong> A provider-blind, serverless, sealed-at-line-rate, exactly-once
+    rail that runs over any dumb pipe is genuinely not a thing you can buy as one product. The synthesis is novel,
+    and the engineering discipline behind it (spec frozen by content-hash, 6-lens adversarial audits, every gate
+    measured not claimed) is the real edge.</p>
+    <p><strong>No, we did not reinvent cryptography — and that's correct.</strong> We compose audited primitives
+    (ring, dalek, SPAKE2, Noise) the right way. Inventing crypto would be a red flag, not a badge.</p>
+    <p><strong>And here's the honest part:</strong> the warp number is real and measured, but the "obliterate Kafka"
+    head-to-head <em>has not been run yet</em>. We've proven the <em>foundation</em> that should win on the moat
+    dimensions — we have not yet put datarail and Kafka on the same hardware with the same workload. Until we do,
+    "we beat Kafka" is a hypothesis with strong priors, not a result. We don't claim measured wins we haven't run.</p>
+  </div>
+
+  <h2>🚧 What we have <span style="color:var(--dir)">NOT</span> proven yet</h2>
+  <div class="panel">
+    <ul class="clean">
+      <li><span class="badge b-pend">PENDING</span><div class="t"><strong>Head-to-head vs Kafka</strong> (throughput /
+        latency / footprint / cost, same hardware, byte-equal, anti-cheat). Designed; not run. <em>This is the next
+        build.</em></div></li>
+      <li><span class="badge b-pend">PENDING</span><div class="t"><strong>The violent stress suite</strong> across the
+        5 flagship use cases (monstrous volumes, kill-mid-stream, duplicate/forged floods, backpressure saturation).
+        Designed; not built yet.</div></li>
+      <li><span class="badge b-dir">DIRECTIONAL</span><div class="t"><strong>Latency & idle-footprint as formal gates.</strong>
+        Per-cofre seal ~110–130 µs on a VAES core (amortizes per batch); idle-state ≈ 0 is architectural. Formal
+        p50/p99 + real serverless idle-RSS still need a clean measurement rig.</div></li>
+      <li><span class="badge b-dir">DIRECTIONAL</span><div class="t"><strong>FASP-beats-lossy-TCP on a real WAN.</strong>
+        The delay-based congestion-control algorithm is proven in unit tests; the throughput-under-loss win needs a
+        real lossy link to measure.</div></li>
+      <li><span class="badge b-pend">PENDING</span><div class="t"><strong>Owner ratification of the trio (MF-0)</strong> —
+        a human sign-off, not an engineering task.</div></li>
+    </ul>
+  </div>
+
+  <h2>🛠️ How it's built (the part that makes the above trustworthy)</h2>
+  <div class="panel">
+    <ul class="clean">
+      <li>🦀<div class="t"><strong>Rust, <code>#![forbid(unsafe_code)]</code> workspace-wide</strong> — with exactly
+        one contained, audited <code>unsafe</code> waiver (the lock-free shared-memory ring), reviewed line by line.</div></li>
+      <li>✅<div class="t"><strong>clippy <code>deny(all + pedantic)</code>, zero <code>#[allow]</code></strong> — the
+        gates are real teeth, not decoration. Green on both the default and the <code>vaes</code> build.</div></li>
+      <li>🧊<div class="t"><strong>Spec frozen by content-hash</strong> before any code; the cross-crate contract
+        re-freezes with a logged ritual whenever the sealed-envelope seam changes.</div></li>
+      <li>🔬<div class="t"><strong>Adversarial audits + cold verification</strong> — findings are verified in the
+        cited code before action; self-reported "greens" are never trusted (a sub-agent's wrong test count and a
+        hardware mislabel were both caught this way).</div></li>
+    </ul>
+  </div>
+
+  <div class="foot">
+    <p><strong>Bottom line.</strong> The rail is built, tested (141 green), audited, and — on representative VAES
+    hardware — <em>seals data at ~6 GB/s/core while remaining provider-blind</em>. That combination is the moat,
+    and it's measured, not promised. The thing left to <em>prove</em> (not build) is the head-to-head that turns
+    "should win" into "did win." That's the next round.</p>
+    <p class="muted">Status taxonomy and every figure here trace to <code>docs/design/DOD-01.md</code>,
+    <code>docs/design/BENCH-01.md</code>, and <code>docs/BUILD_LOG.md</code> in the repo. Generated honestly —
+    if it isn't proven, it says so.</p>
+  </div>
+
+</div>
+</body>
+</html>
