@@ -158,11 +158,31 @@ pub fn aead_seal(
             .map_err(|_| AeadError)?
             .encrypt(chacha20poly1305::Nonce::from_slice(nonce), payload)
             .map_err(|_| AeadError),
-        AeadAlg::Gcm256 => aes_gcm::Aes256Gcm::new_from_slice(key)
-            .map_err(|_| AeadError)?
-            .encrypt(aes_gcm::Nonce::from_slice(nonce), payload)
-            .map_err(|_| AeadError),
+        AeadAlg::Gcm256 => gcm256_seal(key, nonce, aad, plaintext),
     }
+}
+
+/// `AES-256-GCM` seal. With `--features vaes` this runs `ring`'s `VAES`/`AVX-512` asm (line-rate on capable
+/// cores); otherwise `RustCrypto`'s portable `AES-NI`. **Wire-identical** either way (ciphertext ‖ 16-byte tag),
+/// so a cofre is interchangeable across the two backends. Plain `GCM` is sound here only under the per-cofre
+/// fresh-key invariant (no nonce reuse); see the `vaes` feature note in `Cargo.toml`.
+#[cfg(feature = "vaes")]
+fn gcm256_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AeadError> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+    let sealing = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| AeadError)?);
+    let mut buf = plaintext.to_vec();
+    sealing
+        .seal_in_place_append_tag(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut buf)
+        .map_err(|_| AeadError)?;
+    Ok(buf)
+}
+
+#[cfg(not(feature = "vaes"))]
+fn gcm256_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, AeadError> {
+    aes_gcm::Aes256Gcm::new_from_slice(key)
+        .map_err(|_| AeadError)?
+        .encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .map_err(|_| AeadError)
 }
 
 /// AEAD-**open** `ciphertext` with associated data `aad` under `key` (32 B) and `nonce` (12 B) using `alg`.
@@ -189,11 +209,29 @@ pub fn aead_open(
             .map_err(|_| AeadError)?
             .decrypt(chacha20poly1305::Nonce::from_slice(nonce), payload)
             .map_err(|_| AeadError),
-        AeadAlg::Gcm256 => aes_gcm::Aes256Gcm::new_from_slice(key)
-            .map_err(|_| AeadError)?
-            .decrypt(aes_gcm::Nonce::from_slice(nonce), payload)
-            .map_err(|_| AeadError),
+        AeadAlg::Gcm256 => gcm256_open(key, nonce, aad, ciphertext),
     }
+}
+
+/// `AES-256-GCM` open — `ring` `VAES` asm under `--features vaes`, else `RustCrypto` `AES-NI`. Wire-identical
+/// to [`gcm256_seal`].
+#[cfg(feature = "vaes")]
+fn gcm256_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, AeadError> {
+    use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+    let opening = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).map_err(|_| AeadError)?);
+    let mut buf = ciphertext.to_vec();
+    let plaintext = opening
+        .open_in_place(Nonce::assume_unique_for_key(*nonce), Aad::from(aad), &mut buf)
+        .map_err(|_| AeadError)?;
+    Ok(plaintext.to_vec())
+}
+
+#[cfg(not(feature = "vaes"))]
+fn gcm256_open(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, AeadError> {
+    aes_gcm::Aes256Gcm::new_from_slice(key)
+        .map_err(|_| AeadError)?
+        .decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .map_err(|_| AeadError)
 }
 
 #[cfg(test)]
@@ -269,5 +307,25 @@ mod tests {
         // AAD mismatch (e.g. a mutated etiqueta) must fail open.
         let good = aead_seal(alg, &KEY, &NONCE, b"aad", b"plaintext").unwrap();
         assert!(aead_open(alg, &KEY, &NONCE, b"different-aad", &good).is_err());
+    }
+
+    /// `AES-256-GCM` **known-answer test** — pins one fixed (key, nonce, aad, plaintext) → exact ciphertext.
+    /// This same vector runs under BOTH the default (`RustCrypto` `AES-NI`) and `--features vaes` (`ring`
+    /// `VAES`) builds; if the two backends ever disagreed by a byte, one of the two CI runs would fail here. So
+    /// it is the proof that the `vaes` backend is **wire-compatible** — a cofre sealed by one backend opens on
+    /// the other (and across a mixed-backend fleet).
+    #[test]
+    fn gcm256_known_answer_is_backend_independent() {
+        use core::fmt::Write as _;
+        const EXPECT: &str = "b5f59f1327dd02c0f6d4ce109f15b993cd7a617020b77006a50b3352b6de70df5d";
+        let ct = aead_seal(AeadAlg::Gcm256, &KEY, &NONCE, b"aad", b"datarail-vaes-kat").unwrap();
+        let mut hex = String::with_capacity(ct.len() * 2);
+        for b in &ct {
+            let _ = write!(hex, "{b:02x}");
+        }
+        assert_eq!(hex, EXPECT, "AES-256-GCM ciphertext must match the canonical vector on every backend");
+        // And it round-trips back to the plaintext.
+        let pt = aead_open(AeadAlg::Gcm256, &KEY, &NONCE, b"aad", &ct).unwrap();
+        assert_eq!(pt, b"datarail-vaes-kat");
     }
 }

@@ -82,6 +82,16 @@ fn main() {
     tput("aes-256-gcm-siv open", 3000, buf.len(), || {
         black_box(aead_open(AeadAlg::Gcmsiv256, &key, &nonce, &[], black_box(&ct)).unwrap());
     });
+    // Single-pass AES-256-GCM (AeadAlg::Gcm256). With `--features vaes` this is ring's VAES asm (line-rate);
+    // default is RustCrypto AES-NI. Sound here under the per-cofre fresh-key invariant (no nonce reuse).
+    let backend = if cfg!(feature = "vaes") { "ring/VAES" } else { "RustCrypto/AES-NI" };
+    tput(&format!("aes-256-gcm   seal [{backend}]"), 3000, buf.len(), || {
+        black_box(aead_seal(AeadAlg::Gcm256, &key, &nonce, &[], black_box(&buf)).unwrap());
+    });
+    let ctg = aead_seal(AeadAlg::Gcm256, &key, &nonce, &[], &buf).unwrap();
+    tput(&format!("aes-256-gcm   open [{backend}]"), 3000, buf.len(), || {
+        black_box(aead_open(AeadAlg::Gcm256, &key, &nonce, &[], black_box(&ctg)).unwrap());
+    });
 
     // ---- key-wrap + wire-codec latency ----
     println!("\nkey-wrap + wire-codec latency:");

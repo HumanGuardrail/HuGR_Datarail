@@ -12,6 +12,10 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Forward to datarail-crypto's VAES backend (ring AES-256-GCM) so the bench measures line-rate sealing.
+vaes = ["datarail-crypto/vaes"]
+
 [dependencies]
 datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }

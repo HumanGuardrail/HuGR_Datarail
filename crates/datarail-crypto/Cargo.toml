@@ -8,6 +8,15 @@ description = "datarail-crypto — BLAKE3, domain-separated Ed25519, pluggable A
 [lints]
 workspace = true
 
+[features]
+# `vaes` — route the single-pass AES-256-GCM path (`AeadAlg::Gcm256`) through `ring`'s BoringSSL-derived asm,
+# which uses VAES/AVX-512 on capable cores (≈ line-rate, ~10 GB/s/core measured) instead of RustCrypto's
+# per-block AES-NI (~1.4 GB/s). Safe here because datarail seals each cofre under a FRESH per-cofre data key
+# (one message per key ⇒ no nonce reuse) — exactly the key-uniqueness gate the SPEC requires for the plain-GCM
+# perf mode. Default build stays pure-Rust (Charter *leveza*); `ring` is already in the tree via the QUIC
+# substrate, so this adds no new workspace dependency weight.
+vaes = ["dep:ring"]
+
 [dependencies]
 datarail-core = { path = "../datarail-core" }
 blake3 = "1"
@@ -16,3 +25,4 @@ aes-gcm-siv = "0.11"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+ring = { version = "0.17", optional = true }
