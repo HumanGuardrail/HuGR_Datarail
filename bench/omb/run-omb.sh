@@ -54,19 +54,21 @@ case "$SYS" in
           -dname "CN=localhost" -ext SAN=DNS:localhost,IP:127.0.0.1 &&
         keytool -exportcert -alias broker -keystore /certs/server.keystore.jks -storepass changeit -rfc -file /certs/broker.crt &&
         keytool -importcert -alias broker -keystore /certs/client.truststore.jks -storepass changeit -file /certs/broker.crt -noprompt &&
+        printf changeit > /certs/keystore_creds && printf changeit > /certs/key_creds && printf changeit > /certs/truststore_creds &&
         chmod 644 /certs/*' || { echo "::error::keytool cert gen failed"; exit 1; }
       # confluentinc/cp-kafka 7.8 == Kafka 3.8 (same version as the plaintext apache/kafka:3.8.0 baseline — fair),
       # but with the robust env-var config the apache image's `configure` script botches on SSL.
-      docker run -d --network host --name omb-kafka -v "$CERTS":/certs -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" \
+      # cp-kafka uses the secrets-dir convention: mount certs at /etc/kafka/secrets + *_FILENAME/*_CREDENTIALS.
+      docker run -d --network host --name omb-kafka -v "$CERTS":/etc/kafka/secrets -e KAFKA_HEAP_OPTS="-Xmx2g -Xms512m" \
         -e CLUSTER_ID="4L6g3nShT-eMCtK--X86sw" -e KAFKA_NODE_ID=1 -e KAFKA_PROCESS_ROLES="broker,controller" \
         -e KAFKA_CONTROLLER_QUORUM_VOTERS="1@localhost:9093" \
         -e KAFKA_LISTENERS="CONTROLLER://:9093,SSL://:9094" \
         -e KAFKA_ADVERTISED_LISTENERS="SSL://localhost:9094" \
         -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP="CONTROLLER:PLAINTEXT,SSL:SSL" \
         -e KAFKA_CONTROLLER_LISTENER_NAMES="CONTROLLER" -e KAFKA_INTER_BROKER_LISTENER_NAME="SSL" \
-        -e KAFKA_SSL_KEYSTORE_LOCATION=/certs/server.keystore.jks -e KAFKA_SSL_KEYSTORE_PASSWORD=changeit \
-        -e KAFKA_SSL_KEY_PASSWORD=changeit \
-        -e KAFKA_SSL_TRUSTSTORE_LOCATION=/certs/client.truststore.jks -e KAFKA_SSL_TRUSTSTORE_PASSWORD=changeit \
+        -e KAFKA_SSL_KEYSTORE_FILENAME=server.keystore.jks -e KAFKA_SSL_KEYSTORE_CREDENTIALS=keystore_creds \
+        -e KAFKA_SSL_KEY_CREDENTIALS=key_creds \
+        -e KAFKA_SSL_TRUSTSTORE_FILENAME=client.truststore.jks -e KAFKA_SSL_TRUSTSTORE_CREDENTIALS=truststore_creds \
         -e KAFKA_SSL_CLIENT_AUTH=none -e KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM="" \
         confluentinc/cp-kafka:7.8.0 >/dev/null
       echo "waiting for kafka SSL :9094 ..."
