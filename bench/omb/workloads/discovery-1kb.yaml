@@ -1,0 +1,14 @@
+name: rate-discovery 4topic/1kb
+topics: 4
+partitionsPerTopic: 1
+keyDistributor: "NO_KEY"
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+producerRate: 0          # 0 ⇒ OMB findMaximumSustainableRate: ramps to each system's max sustainable rate
+                         # (adjusts the ACTUAL publish rate, so no unreachable-rate client buffering/OOM)
+consumerBacklogSizeGB: 0
+warmupDurationMinutes: 1
+testDurationMinutes: 4
