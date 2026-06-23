@@ -1,0 +1,19 @@
+[package]
+name = "datarail-metrics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-metrics — idle-footprint (GATE-FEATHER) + board/offload latency percentiles (GATE-LATENCY) measurement binary."
+
+[[bin]]
+name = "datarail-metrics"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datarail-core = { path = "../datarail-core" }
+datarail-crypto = { path = "../datarail-crypto" }
+datarail-terminal = { path = "../datarail-terminal" }
+datarail-rail = { path = "../datarail-rail" }
