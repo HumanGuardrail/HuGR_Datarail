@@ -372,6 +372,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-metrics"
+version = "0.0.0"
+dependencies = [
+ "datarail-core",
+ "datarail-crypto",
+ "datarail-rail",
+ "datarail-terminal",
+]
+
+[[package]]
 name = "datarail-once"
 version = "0.0.0"
 dependencies = [
