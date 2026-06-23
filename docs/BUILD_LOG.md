@@ -575,6 +575,15 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   (per-cofre crypto) — SPEC-mandated batching resolves it. DOD-01 AC-10 → PROVEN. All Northflank jobs deleted.
   **The "humiliate Kafka" claim is now measured, fair, and honest — not rigged.**
 
+- 2026-06-23 — **FASP-vs-loss-based proven + metrics harness (delegated, cold-verified, merged).** Branch
+  `feat/metrics-fasp-39b` → main. (1) `datarail-rail/tests/fasp_vs_lossbased.rs`: datarail's delay-based
+  `DelayController` vs a fair TCP-Reno AIMD baseline over one seeded high-RTT link, 5/15/30 % loss → delay-based
+  holds **16.3× / 29.6× / 42.1×** the loss-based goodput, gap widens monotonically (the FASP "ignore loss"
+  physics, demonstrated). Cold-verified the baseline is real Reno (+1/round, ×0.5/loss), not a strawman. (2)
+  `crates/datarail-metrics` bin: idle-RSS via /proc (GATE-FEATHER, graceful off-Linux) + board/offload latency
+  percentiles (GATE-LATENCY p50/p99). **17→18 crates? no — 18 crates** (datarail-metrics added). **153 tests**
+  green, clippy clean, forbid(unsafe). Branch merged + deleted.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
