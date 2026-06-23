@@ -346,6 +346,7 @@ dependencies = [
  "chacha20poly1305",
  "datarail-core",
  "ed25519-dalek",
+ "ring",
  "x25519-dalek",
 ]
 
@@ -393,6 +394,19 @@ version = "0.0.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
+ "datarail-terminal",
+]
+
+[[package]]
+name = "datarail-stress"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-crypto",
+ "datarail-rail",
+ "datarail-substrate-objectstore",
+ "datarail-substrate-shmem",
  "datarail-terminal",
 ]
 
