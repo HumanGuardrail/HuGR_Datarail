@@ -1,0 +1,13 @@
+name: efficiency-lite 4topic/1kb fixed 40k/s
+topics: 4
+partitionsPerTopic: 1
+keyDistributor: "NO_KEY"
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+producerRate: 10000        # 4 x 10k = 40k msg/s ≈ 40 MB/s — a 2-core free runner sustains both; RSS footprint is the point
+consumerBacklogSizeGB: 0
+warmupDurationMinutes: 1
+testDurationMinutes: 3
