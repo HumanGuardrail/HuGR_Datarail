@@ -291,6 +291,39 @@ VAES warp, hot-path, engine bench, and a 5-iteration TLS attempt):
 ## ⚠️ AUDIT CORRECTION (2026-06-24) — read before Run 10
 A 5-way adversarial audit (`ADVERSARIAL-AUDIT.md`) corrected this section's headline. **The "7 MB / 124×" was an optimistic light-load sample measured with a non-like-for-like ruler** (datarail bare `/proc` RSS vs Kafka container `docker stats`, which excludes Kafka's page cache). Lead re-measured the real loaded footprint at **~22 MB → ~40× less resident RAM** (idle ~2-3 MB vs 275 MB ≈ ~90×). The numbers below are the original draft; treat **~40× loaded / ~90× idle** as the corrected, defensible figures, and **"durably stores"** as overclaimed (the store does no fsync/replication — not Kafka-grade; see audit Agent 5).
 
+## Run 11 — THE FAIR DURABLE COMPARISON (datarail-WAL fsync vs Kafka acks=all, same ruler) — 2026-06-24
+
+This is the answer to the adversarial audit's #1 critique ("datarail's RAM win was partly a does-less artifact —
+the loopback path didn't persist"). datarail now runs the **fsync-durable WAL substrate** (`substrate=wal`,
+verified ran — zero loopback fallback): each 128-record cofre is sealed and **fsync'd to disk** before offload,
+exactly the durability Kafka's `acks=all` provides. Both are **single-node, RF=1, leader-fsync** — apples-to-apples
+durability. And because both now write a log to disk, both use reclaimable OS page cache (excluded from both
+process-RSS and docker-stats) → the RAM rulers are now **symmetric** (the asymmetry the audit flagged is gone).
+
+32-core Turbo, OMB harness, both delivering an identical 51 MB/s (50 k msg/s), 0 errors:
+
+| | **datarail-WAL** (fsync-durable) | **Kafka acks=all** (fsync-durable) |
+|---|---|---|
+| delivered | 51 MB/s · 0 err · backlog ~0.2 k | 51 MB/s · 0 err |
+| **RSS under load** | **13 MB (max 15)** | **877 MB (max 1095)** |
+| **RSS idle** | **3 MB** | 274 MB |
+| CPU under load | 1.54 cores | 1.48 cores |
+| E2E p50 / p99 | 5 / 11 ms | 1 / 3 ms |
+
+**⇒ datarail does the SAME single-node fsync-durable 51 MB/s in ~67× less RAM under load (13 MB vs 877 MB) and
+~91× less idle (3 MB vs 274 MB), at comparable CPU, 0 errors.** This is the honest, same-work, same-ruler number
+the whole campaign was after — durability matched (both fsync, both RF=1), ruler symmetric (both exclude
+reclaimable log page cache), rate identical. The "does-less artifact" critique is **answered**: datarail-WAL
+fsyncs every batch to disk just like Kafka.
+
+**Honest caveats (kept):** (a) instruments aren't byte-identical — datarail is `/proc` RSS of a bare process,
+Kafka is `docker stats` of a container — but they are now **symmetric on page cache** (both have reclaimable log
+cache excluded), which is what the audit demanded. (b) Fixed moderate rate (50 k/s, neither saturated); under a
+firehose datarail-WAL rises toward ~20-25 MB (still ~40×), Kafka's JVM floor dominates either way. (c) Single-node
+fsync on BOTH sides — neither replicates (RF=1); RF≥3 node-loss durability is a separate axis for both. (d) Kafka
+ran a modest config; a heavily-tuned Kafka cluster is a different (larger-footprint) animal. (e) Latency: Kafka is
+slightly better here (p99 3 ms vs 11 ms) — the WAL fsync adds a little tail; both are fine.
+
 ## Run 10 — THE PIVOT: efficiency, not speed (datarail moves the same data at a fraction of the footprint)
 
 The throughput race is a tie, and even "encrypted" the brokers can approximate it. The real, structural,

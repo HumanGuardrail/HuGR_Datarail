@@ -38,3 +38,6 @@ To make the durability/efficiency claim defensible — **same work, same ruler**
 > Bottom line: the engineering is real and the lean-process win is real (~40–90×). The benchmark's sin was
 > **framing** — comparing non-equivalent work with non-equivalent rulers and labeling batched/optimistic numbers
 > as more than they were. Every such claim is now corrected. The adversarial audit did exactly its job.
+
+## UPDATE 2026-06-24 — critique #1 (does-less) ANSWERED
+The WAL substrate (`datarail-substrate-wal`, fsync-durable, O(1) RAM) was built + measured same-work vs Kafka `acks=all` (Run 11 in `OMB-RESULTS.md`): both single-node RF=1 leader-fsync, both 51 MB/s, 0 errors → datarail **13 MB vs Kafka 877 MB under load (~67×), 3 vs 274 MB idle (~91×)**. The 'datarail's RAM win is partly because it doesn't persist' finding no longer applies to the WAL path — it fsyncs every batch to disk, and the page-cache ruler asymmetry is gone (both write logs). The lean-process win is now demonstrated on **matched durable work**.
