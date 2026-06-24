@@ -1,0 +1,13 @@
+name: efficiency 4topic/1kb fixed 200k/s
+topics: 4
+partitionsPerTopic: 1
+keyDistributor: "NO_KEY"
+messageSize: 1024
+payloadFile: "payload/payload-1Kb.data"
+subscriptionsPerTopic: 1
+consumerPerSubscription: 1
+producersPerTopic: 1
+producerRate: 50000        # 4 topics x 50k = 200k msg/s ≈ 200 MB/s — a realistic moderate load both sustain
+consumerBacklogSizeGB: 0
+warmupDurationMinutes: 1
+testDurationMinutes: 4

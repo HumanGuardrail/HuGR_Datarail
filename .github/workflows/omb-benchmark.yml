@@ -24,6 +24,10 @@ on:
         description: "Run Kafka with TLS (transport encryption) instead of plaintext"
         type: boolean
         default: false
+      measure_resources:
+        description: "Measure server RSS/CPU footprint (efficiency benchmark)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -91,6 +95,7 @@ jobs:
         working-directory: ${{ env.DISTRO }}
         env:
           KAFKA_TLS: ${{ inputs.kafka_tls && '1' || '0' }}
+          MEASURE_RESOURCES: ${{ inputs.measure_resources && '1' || '0' }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/omb-results"
           IFS=',' read -ra SYS <<< "${{ inputs.systems }}"
@@ -110,6 +115,14 @@ jobs:
             echo "the brokers run their plaintext OMB defaults. Raw JSON + per-system logs in the artifact._"
             echo ""
             python3 bench/omb/summarize.py "$GITHUB_WORKSPACE/omb-results"
+            if ls "$GITHUB_WORKSPACE"/omb-results/*.resources >/dev/null 2>&1; then
+              echo ""
+              echo "### Efficiency — server footprint at the SAME delivered throughput (the disruption metric)"
+              echo "_The OMB client is identical across systems; this is the broker/shim's OWN RSS+CPU. Kafka heap"
+              echo "was a modest -Xmx2g (Confluent recommends 6g+ → this is conservative FOR Kafka)._"
+              echo ""
+              python3 bench/omb/summarize-resources.py "$GITHUB_WORKSPACE/omb-results"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
@@ -122,4 +135,5 @@ jobs:
             omb-results/*.json
             omb-results/*.out
             omb-results/*.log
+            omb-results/*.resources
           if-no-files-found: warn

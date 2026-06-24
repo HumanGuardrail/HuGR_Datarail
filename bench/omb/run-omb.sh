@@ -85,7 +85,8 @@ case "$SYS" in
         sleep 2
       done
       DRIVER="driver-kafka-local.yaml"
-    fi ;;
+    fi
+    SERVER_TARGET="docker:omb-kafka" ;;
   rabbitmq)
     # Port-mapped (NOT --network host: that broke the erlang cookie). A non-`guest` user (guest is loopback-only,
     # which a -p gateway connection would reject) — the driver config authenticates as omb:omb over the URI.
@@ -98,24 +99,52 @@ case "$SYS" in
     echo "waiting for rabbitmq node + :5672 ..."
     for _ in $(seq 1 90); do docker exec omb-rabbit rabbitmqctl await_startup >/dev/null 2>&1 && break; sleep 2; done
     if ! wait_port localhost 5672 90; then echo "::error::rabbitmq never opened :5672"; docker logs --tail 40 omb-rabbit || true; exit 1; fi
-    DRIVER="driver-rabbitmq-local.yaml" ;;
+    DRIVER="driver-rabbitmq-local.yaml"; SERVER_TARGET="docker:omb-rabbit" ;;
   pulsar)
     docker run -d --network host --name omb-pulsar \
       -e PULSAR_MEM="-Xms512m -Xmx2g" apachepulsar/pulsar:3.3.1 bin/pulsar standalone >/dev/null
     echo "waiting for pulsar :6650 + admin ..."
     if ! wait_port localhost 6650 180; then echo "::error::pulsar never opened :6650"; docker logs --tail 40 omb-pulsar || true; exit 1; fi
     for _ in $(seq 1 45); do curl -sf localhost:8080/admin/v2/clusters >/dev/null 2>&1 && break; sleep 2; done
-    DRIVER="driver-pulsar-local.yaml" ;;
+    DRIVER="driver-pulsar-local.yaml"; SERVER_TARGET="docker:omb-pulsar" ;;
   datarail)
     ./datarail-omb-shim >"$RESULTS/datarail-shim.log" 2>&1 &
     SHIM_PID=$!
     sleep 3
     if ! kill -0 "$SHIM_PID" 2>/dev/null; then echo "::error::shim failed to start"; cat "$RESULTS/datarail-shim.log"; exit 1; fi
     if ! wait_port 127.0.0.1 7701 15; then echo "::error::shim ingress :7701 not accepting"; cat "$RESULTS/datarail-shim.log"; exit 1; fi
-    DRIVER="datarail.yaml" ;;
+    DRIVER="datarail.yaml"; SERVER_TARGET="pid:$SHIM_PID" ;;
   *)
     echo "unknown system: $SYS"; exit 2 ;;
 esac
+
+# ---- Resource sampling (efficiency benchmark): measure the SERVER process's RSS + CPU. The OMB CLIENT
+# (bin/benchmark) is identical for every system, so comparing the broker/shim's own footprint is fair. The
+# disruption metric is throughput-PER-RESOURCE, not absolute throughput. Enabled with MEASURE_RESOURCES=1.
+# RSS in MB; CPU in % of one core (docker stats already aggregates across the container's threads).
+server_rss_mb() {
+  case "${SERVER_TARGET:-}" in
+    pid:*) awk '/VmRSS/{printf "%d", $2/1024}' "/proc/${SERVER_TARGET#pid:}/status" 2>/dev/null ;;
+    docker:*) docker stats --no-stream --format '{{.MemUsage}}' "${SERVER_TARGET#docker:}" 2>/dev/null \
+        | awk '{v=$1; u=v; sub(/[0-9.]+/,"",u); sub(/[A-Za-z]+/,"",v);
+                if(u=="GiB")printf "%d",v*1024; else if(u=="MiB")printf "%d",v; else if(u=="KiB")printf "%d",v/1024; else printf "%d",v/1048576}' ;;
+  esac
+}
+server_cpu_pct() {
+  case "${SERVER_TARGET:-}" in
+    pid:*) p=${SERVER_TARGET#pid:}
+      a=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null); sleep 1
+      b=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null)
+      [ -n "$a" ] && [ -n "$b" ] && echo $(( (b - a) * 100 / $(getconf CLK_TCK) )) || echo 0 ;;
+    docker:*) docker stats --no-stream --format '{{.CPUPercent}}' "${SERVER_TARGET#docker:}" 2>/dev/null | tr -d '%' | cut -d. -f1 ;;
+  esac
+}
+
+if [ "${MEASURE_RESOURCES:-0}" = "1" ]; then
+  sleep 5  # let the freshly-started server settle to a real idle baseline
+  IDLE_RSS=$(server_rss_mb); IDLE_CPU=$(server_cpu_pct)
+  echo "idle footprint ($SYS): RSS=${IDLE_RSS}MB CPU=${IDLE_CPU}%"
+fi
 
 echo "running OMB: driver=$DRIVER workload=$WL (cap ${RUN_TIMEOUT}s)"
 # No workers.yaml present => OMB uses the in-process LocalWorker (single-node).
@@ -125,13 +154,22 @@ echo "running OMB: driver=$DRIVER workload=$WL (cap ${RUN_TIMEOUT}s)"
 # genuine hang.
 bin/benchmark -d "$DRIVER" "workloads/$WL" > "$OUT" 2>&1 &
 bench_pid=$!
-rc=0; done_ok=0
+rc=0; done_ok=0; rss_sum=0; rss_max=0; cpu_sum=0; samples=0; tick=0
 for _ in $(seq 1 "$RUN_TIMEOUT"); do
   if ! kill -0 "$bench_pid" 2>/dev/null; then wait "$bench_pid"; rc=$?; break; fi
   if grep -q "Writing test result into" "$OUT" 2>/dev/null; then
     done_ok=1; sleep 3            # let the JSON finish flushing to disk
     kill "$bench_pid" 2>/dev/null; pkill -P "$bench_pid" 2>/dev/null || true
     break
+  fi
+  # Sample server resources ~every 12s once past warm-up (skip the first 30s).
+  tick=$((tick + 1))
+  if [ "${MEASURE_RESOURCES:-0}" = "1" ] && [ "$tick" -ge 30 ] && [ $((tick % 12)) -eq 0 ]; then
+    r=$(server_rss_mb); c=$(server_cpu_pct)
+    if [ -n "$r" ] && [ "$r" -gt 0 ] 2>/dev/null; then
+      rss_sum=$((rss_sum + r)); [ "$r" -gt "$rss_max" ] && rss_max=$r
+      cpu_sum=$((cpu_sum + ${c:-0})); samples=$((samples + 1))
+    fi
   fi
   sleep 1
 done
@@ -141,6 +179,23 @@ if [ "$done_ok" -eq 0 ] && kill -0 "$bench_pid" 2>/dev/null; then
 fi
 
 mv ./*.json "$RESULTS/" 2>/dev/null || true
+
+# Write the efficiency record: idle + steady-state server RSS/CPU (the throughput-per-resource story).
+if [ "${MEASURE_RESOURCES:-0}" = "1" ]; then
+  avg_rss=0; avg_cpu=0
+  [ "$samples" -gt 0 ] && { avg_rss=$((rss_sum / samples)); avg_cpu=$((cpu_sum / samples)); }
+  {
+    echo "system=$SYS"
+    echo "idle_rss_mb=${IDLE_RSS:-NA}"
+    echo "idle_cpu_pct=${IDLE_CPU:-NA}"
+    echo "load_rss_mb_avg=$avg_rss"
+    echo "load_rss_mb_max=$rss_max"
+    echo "load_cpu_pct_avg=$avg_cpu"
+    echo "samples=$samples"
+  } > "$RESULTS/$SYS.resources"
+  echo "resources ($SYS): idle ${IDLE_RSS:-NA}MB | load avg ${avg_rss}MB / max ${rss_max}MB / ${avg_cpu}% CPU (n=$samples)"
+fi
+
 if [ "$done_ok" -eq 1 ]; then
   rc=0
 elif [ "$rc" -ne 0 ]; then
