@@ -288,6 +288,9 @@ VAES warp, hot-path, engine bench, and a 5-iteration TLS attempt):
   sealed and matches-to-beats Kafka's throughput while being provider-blind — something Kafka structurally is not,
   at any speed.*
 
+## ⚠️ AUDIT CORRECTION (2026-06-24) — read before Run 10
+A 5-way adversarial audit (`ADVERSARIAL-AUDIT.md`) corrected this section's headline. **The "7 MB / 124×" was an optimistic light-load sample measured with a non-like-for-like ruler** (datarail bare `/proc` RSS vs Kafka container `docker stats`, which excludes Kafka's page cache). Lead re-measured the real loaded footprint at **~22 MB → ~40× less resident RAM** (idle ~2-3 MB vs 275 MB ≈ ~90×). The numbers below are the original draft; treat **~40× loaded / ~90× idle** as the corrected, defensible figures, and **"durably stores"** as overclaimed (the store does no fsync/replication — not Kafka-grade; see audit Agent 5).
+
 ## Run 10 — THE PIVOT: efficiency, not speed (datarail moves the same data at a fraction of the footprint)
 
 The throughput race is a tie, and even "encrypted" the brokers can approximate it. The real, structural,

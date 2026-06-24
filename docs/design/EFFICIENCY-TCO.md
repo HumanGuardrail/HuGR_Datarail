@@ -1,5 +1,8 @@
 # EFFICIENCY-TCO — what datarail's footprint means in dollars
 
+> **⚠️ AUDIT CORRECTION (2026-06-24):** a 5-way adversarial audit (`ADVERSARIAL-AUDIT.md`) found this doc's headline over-claimed. Corrected: datarail loaded RAM is **~22 MB (re-measured), not 7 MB** → **~40× less than Kafka, not 124×** (and the rulers are not perfectly like-for-like). **"Durably stores" is overclaimed** — the store does NO fsync and NO replication (page-cache-only, single copy → not Kafka-grade durability; real durability is delegated to S3, not yet measured). The lean-RAM property and idle ~90× are real; the durable-at-1/Nth-RAM claim needs the fsync + same-ruler build to be honest.
+
+
 > The disruption thesis, grounded in **measured** numbers (see `OMB-RESULTS.md` Run 10): datarail moves the same
 > data at a footprint 100–250× smaller. Here we translate that into instance sizing + TCO — with explicit
 > assumptions, labeled DERIVED (illustrative), not measured. Cloud prices are rough, ~2026, US regions; verify
@@ -96,8 +99,12 @@ And when both endpoints are online, datarail uses **no store at all** — direct
 
 ## The one-line thesis (measured, honest)
 
-> **datarail moves AND durably stores the same data as Kafka using ~1/124th the RAM under load and ~1/92nd at
-> rest, at comparable CPU, scaling to $0 when idle — because it spends the abundant resources (disk, object
-> storage) where Kafka spends the scarce one (RAM). Same throughput class, full durability; a footprint and cost
-> from another category, and the gap WIDENS with data volume.** That is the disruption: not faster — it moves
-> the cost off the scarce axis (RAM) onto the abundant one (storage), which Kafka architecturally cannot do.
+> **datarail moves the same data as Kafka using ~1/40th the resident RAM under load (~22 MB vs ~870 MB,
+> re-measured) and ~1/90th at rest (~2-3 MB vs 275 MB), at comparable CPU, scaling to $0 when idle — because it
+> is a lean stateless Rust mover, not an always-on JVM cluster. Same throughput class; a footprint and cost from
+> another category.** That is the disruption: not faster — radically leaner on the scarce resource (RAM).
+>
+> **What is NOT yet proven (audit, 2026-06-24):** that datarail matches Kafka's *durability* (fsync + replication)
+> at that RAM advantage. The store today is un-fsync'd + un-replicated (page-cache-only, single copy). The
+> "durably stores at 1/Nth the RAM" claim awaits the fsync + same-ruler build. The lean-RAM win is real; the
+> durable-AND-lean win is the next thing to measure, not assert.

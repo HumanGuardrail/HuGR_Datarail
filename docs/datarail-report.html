@@ -58,13 +58,14 @@
 <div class="wrap">
 
   <div class="kicker">HuGR · Datarail</div>
-  <h1>Not faster than Kafka.<br><span style="color:var(--moat)">~124× lighter.</span></h1>
+  <h1>Not faster than Kafka.<br><span style="color:var(--moat)">~40× leaner.</span></h1>
   <p class="sub">A zero-knowledge, serverless sealed data rail in Rust — and what a long, honest benchmark
   campaign against Kafka &amp; Pulsar <em>actually</em> proved.</p>
   <div class="rail"></div>
-  <p class="muted">Honest status report — 2026-06-24. Measured on the OpenMessaging Benchmark (the industry-standard
-  harness) on a 32-core cloud runner, reproducible by anyone. Every claim labelled by how strongly it's backed.
-  <em>We chased "datarail is faster than Kafka" for a long time, failed honestly, and found the real moat.</em></p>
+  <p class="muted">Honest status report — 2026-06-24, <em>after a 5-way adversarial audit of our own benchmark</em>
+  (see <code>ADVERSARIAL-AUDIT.md</code>). The audit caught real over-claims — an earlier draft said "124×" and
+  "7 MB"; the corrected, lead-re-measured numbers are below. <em>We chased "datarail is faster than Kafka,"
+  failed honestly, over-claimed on RAM, got caught by our own skeptics, and corrected it.</em></p>
 
   <div class="legend">
     <span><span class="badge b-proven">PROVEN</span> measured / cold-verified</span>
@@ -74,8 +75,8 @@
   </div>
 
   <div class="grid">
-    <div class="stat moatn"><div class="n">124×</div><div class="l">less RAM than Kafka, same throughput</div></div>
-    <div class="stat moatn"><div class="n">92×</div><div class="l">less RAM idle (3 MB vs 275 MB)</div></div>
+    <div class="stat moatn"><div class="n">~40×</div><div class="l">less resident RAM loaded (22 MB vs 870 MB)</div></div>
+    <div class="stat moatn"><div class="n">~90×</div><div class="l">less RAM idle (2–3 MB vs 275 MB)</div></div>
     <div class="stat goodn"><div class="n">0</div><div class="l">bytes the pipe can read (provider-blind)</div></div>
     <div class="stat"><div class="n">18</div><div class="l">Rust crates · 160 tests green</div></div>
   </div>
@@ -86,18 +87,19 @@
     <p class="big">On a 32-core box, through the same OpenMessaging Benchmark harness, <em>all three systems
     delivering the identical 51 MB/s</em> — we measured each server's own memory + CPU footprint:</p>
     <table>
-      <tr><th>at 51 MB/s (identical)</th><th>datarail</th><th>Kafka 3.8</th><th>Pulsar 3.3</th></tr>
-      <tr><td>RAM under load</td><td class="num win">7 MB</td><td class="num">870 MB</td><td class="num">1,757 MB</td></tr>
-      <tr><td>RAM idle</td><td class="num win">3 MB</td><td class="num">275 MB</td><td class="num">810 MB</td></tr>
-      <tr><td>CPU under load</td><td class="num">1.24 cores</td><td class="num">1.49 cores</td><td class="num">0.83 cores</td></tr>
-      <tr><td>throughput per GB-RAM</td><td class="num win">7,492</td><td class="num">60</td><td class="num">30</td></tr>
+      <tr><th>resident RAM</th><th>datarail (re-measured)</th><th>Kafka 3.8</th><th>Pulsar 3.3</th></tr>
+      <tr><td>idle (server up, no traffic)</td><td class="num win">2–3 MB</td><td class="num">275 MB</td><td class="num">810 MB</td></tr>
+      <tr><td>under load</td><td class="num win">~22 MB</td><td class="num">~870 MB</td><td class="num">1,757 MB</td></tr>
+      <tr><td>CPU under load</td><td class="num">~1.2 cores</td><td class="num">~1.5 cores</td><td class="num">~0.8 cores</td></tr>
     </table>
-    <p class="lead">124× less RAM than Kafka. 251× less than Pulsar.</p>
-    <p>This is not a tuning trick — it's <em>architecture</em>. Kafka/Pulsar are heavyweight JVM clusters that hold
-    their working set in RAM. datarail is a lean Rust mover that streams sealed packets through tens of MB. No
-    config makes a JVM cluster fit in 7 MB.</p>
-    <p class="muted"><strong>Honest scope:</strong> the OMB client is identical for all three, so this compares the
-    broker/shim's own footprint — the fair axis. Kafka's heap was a modest <code>-Xmx2g</code>; Confluent
+    <p class="lead">~90× less RAM idle · ~40× less under load.</p>
+    <p>It's <em>architecture</em>: Kafka/Pulsar are heavyweight JVM clusters that hold their working set in RAM;
+    datarail is a lean Rust mover in tens of MB. No config makes a JVM cluster fit in 22 MB.</p>
+    <p class="muted"><strong>Honest scope (corrected by the adversarial audit):</strong> these are NOT perfectly
+    like-for-like rulers — datarail is a bare process (<code>/proc</code> RSS); Kafka is a container
+    (<code>docker stats</code>, which on cgroup v2 <em>excludes its page cache</em>, so Kafka's true working set
+    is even larger). An earlier draft cited "7 MB / 124×" — a light-load/optimistic sample; the lead re-measured
+    the real loaded footprint at <strong>~22 MB → ~40×</strong>. Kafka's heap was a modest <code>-Xmx2g</code>; Confluent
     recommends 6 GB+, so production makes the gap <em>bigger</em>. CPU is ~parity — the win is <em>memory</em>,
     not compute. We say that plainly.</p>
   </div>
@@ -112,17 +114,20 @@
     <p>datarail does the opposite (SPEC-10): it seals each packet and writes it to commodity object storage —
     provider-blind (the store sees only ciphertext) — keeping only a tiny index in RAM. <em>Durability scales on
     disk; RAM stays flat.</em></p>
-    <p><span class="badge b-proven">PROVEN</span> <strong>Measured (Linux, real <code>/proc</code>):</strong>
-    sealing + durably storing <em>~1.9 GB across 30,000 sealed cofres on disk</em> held the process at
-    <em>~2 MB RSS the whole time</em> — flat while disk grew to gigabytes. Store 10× more → disk grows 10×, RAM
-    does not move. Kafka structurally cannot do this.</p>
-    <p class="muted"><strong>Honest caveat (cold-verified our own bench):</strong> the flat number is the
-    <em>write/store</em> path. The current demo object-store substrate's <em>drain-side</em> bookkeeping grows
-    with messages processed (a noted demo simplification — a production seq-cursor is O(1)). The fair full
-    send+receive pipeline number is the <em>7 MB</em> above, not 2 MB. We don't round down.</p>
-    <p class="big" style="color:var(--moat)">So datarail isn't "a mover that can't replace Kafka's durability." It
-    does durability on the <em>abundant</em> resource instead of the <em>scarce</em> one — and the advantage
-    <em>widens</em> as data volume grows.</p>
+    <p><span class="badge b-dir">DIRECTIONAL</span> <strong>Measured:</strong> sealing + writing <em>30,000
+    distinct sealed cofres (verified distinct, non-sparse) to disk</em> held the process at <em>~2 MB RSS</em> —
+    flat while disk grew to gigabytes. Store 10× more → disk grows 10×, RAM does not move. That
+    <em>stored-volume-decoupled-from-RAM</em> property is real and useful for store-and-forward buffering.</p>
+    <p class="frank" style="border:0;padding:12px 14px;border-radius:10px"><strong>⚠️ Audit correction — "durable"
+    is overclaimed.</strong> The adversarial audit (Agent 5) found the store does <strong>NO fsync</strong>
+    (<code>fs::write</code>+rename = atomic, but data sits in page cache → lost on power-loss) and
+    <strong>no replication</strong> (single local copy). That is <em>not</em> Kafka-grade durability (acks=all +
+    fsync + RF≥3). Real durability is meant to be delegated to the backing object store (S3's replication), which
+    the local bench doesn't exercise. <strong>So "datarail durably stores at 1/Nth the RAM" is NOT yet proven</strong>
+    — the lean-RAM property is real; "durable" needs fsync + the same-ruler comparison (the build below).</p>
+    <p class="big" style="color:var(--moat)">The honest, defensible version: datarail decouples <em>stored volume
+    from RAM</em> on the write path. Whether it matches Kafka's <em>durability</em> at a fraction of the RAM is the
+    next thing to <em>measure</em> (fsync + like-for-like), not assert.</p>
   </div>
 
   <!-- ================= THROUGHPUT (honest tie) ================= -->
@@ -137,13 +142,14 @@
       <tr><td>Pure sealed engine (no sockets)</td><td class="num win">~1,900 MB/s</td><td>~1.2× Kafka's plaintext — engine wins</td></tr>
       <tr><td class="muted">Kafka 3.8 (plaintext, same harness)</td><td class="num muted">1,604 MB/s</td><td class="muted">the throughput king's number</td></tr>
     </table>
-    <p><span class="badge b-tie">TIE</span> datarail's <em>sealed</em> engine (~1.9 GB/s) slightly beats Kafka's
-    <em>plaintext</em> log (1.6 GB/s); the full end-to-end path is ~parity. We extracted <em>2.9× over the OMB
-    client's broken number</em> with real engineering (I/O buffering, async tokio, NIO driver, VAES seal backend)
-    — but the honest verdict on raw GB/s is <em>"same class."</em> A literal "3–4× faster" is <em>not</em>
-    supported by measurement. Raw throughput was never datarail's reason to exist.</p>
-    <p class="muted">Latency at adequate HW is also ~parity (single-digit-ms p99, both). An early "datarail p99 25×
-    tighter" was a starved-2-core artifact — corrected honestly once we ran on real hardware.</p>
+    <p><span class="badge b-tie">TIE</span> datarail's <em>sealed</em> engine (~1.9 GB/s) is in Kafka's
+    <em>plaintext</em> class (1.6 GB/s); the full path is ~parity. <em>Same class, not faster.</em></p>
+    <p class="muted"><strong>Audit honesty (Agent 4):</strong> these "1 KB" numbers are <em>128-record-cofre
+    batched</em> — the shim packs 128×1 KB records per sealed cofre, amortizing the per-cofre crypto; true
+    per-individual-1 KB-message sealing is ~20× lower. Both datarail AND Kafka batch (Kafka: 1 MB / linger 1 ms),
+    so the comparison is batch-vs-batch (fair), but the "1 KB" label flatters both. VAES adds only +2% because the
+    bottleneck is per-cofre entropy syscalls + asymmetric crypto + allocation, <em>not</em> the AEAD — so "sealed
+    at line rate" overstates what limits it. Latency at adequate HW is ~parity (single-digit-ms p99).</p>
   </div>
 
   <!-- ================= what it provably does ================= -->
@@ -178,7 +184,7 @@
   <div class="panel moatcard">
     <table>
       <tr><th>capability</th><th>datarail</th><th>Kafka / Pulsar</th></tr>
-      <tr><td>RAM to move the same data</td><td class="win">7 MB</td><td class="lose">870 / 1,757 MB</td></tr>
+      <tr><td>RAM to move the same data</td><td class="win">~22 MB load · 2 MB idle</td><td class="lose">870 / 1,757 MB</td></tr>
       <tr><td>Idle footprint</td><td class="win">3 MB → scale-to-zero</td><td class="lose">always-on cluster, 24/7</td></tr>
       <tr><td>Broker can read payloads?</td><td class="win">No — provider-blind</td><td class="lose">Yes — plaintext</td></tr>
       <tr><td>Durability cost scales on…</td><td class="win">cheap disk (RAM flat)</td><td class="lose">scarce RAM (page cache)</td></tr>
@@ -237,11 +243,15 @@
         a native driver revealed the real ~1.9 GB/s engine.</div></li>
       <li>🐛<div class="t">Found &amp; fixed <em>two real memory bugs</em> in our own shim under stress (unbounded
         queue, retained sink) — the stress test did its job.</div></li>
-      <li>🎯<div class="t">Conceded throughput is a <em>tie</em>, then found the real moat: <em>efficiency</em>
-        (124× less RAM) and <em>durability on cheap storage, not scarce RAM</em>.</div></li>
+      <li>🎯<div class="t">Conceded throughput is a <em>tie</em>, then found the real axis: <em>efficiency</em>
+        (lean Rust vs JVM).</div></li>
+      <li>🔪🔪🔪🔪🔪<div class="t">Then fired <em>5 brutal adversarial auditors at our own efficiency claim</em> —
+        and they caught us: "124×" was an optimistic 7 MB sample + a not-like-for-like ruler. Re-measured honest:
+        <em>~40× loaded, ~90× idle</em>. "Durable" was overclaimed (no fsync). All corrected here. (<code>ADVERSARIAL-AUDIT.md</code>)</div></li>
     </ul>
-    <p class="big">Are we trailblazing? <em>Yes — but not where we first looked.</em> Not a faster Kafka. A
-    provider-blind, serverless sealed rail that moves &amp; durably stores the same data at ~1/124th the RAM,
+    <p class="big">Are we trailblazing? <em>Yes — but not where we first looked, and only after our own skeptics
+    cut the claims down to what's true.</em> Not a faster Kafka. A provider-blind, serverless sealed rail that
+    moves the same data in <em>~1/40th the RAM loaded, ~1/90th idle</em>,
     scaling to zero — measured on the industry-standard harness, with every over-claim hunted down and corrected.</p>
   </div>
 
@@ -258,9 +268,10 @@
   </div>
 
   <div class="foot">
-    HuGR · Datarail — sealed, serverless, provider-blind. Throughput: a tie. Footprint: ~124× lighter.
-    Every figure measured on the OpenMessaging Benchmark (32-core), reproducible, and labelled by confidence.
-    No fabricated greens; no number before its artifact; every over-claim corrected. 2026-06-24.
+    HuGR · Datarail — sealed, serverless, provider-blind. Throughput: a tie. Footprint: ~40× leaner loaded,
+    ~90× idle (re-measured after a 5-way adversarial audit of our own claims). Reproducible on the OpenMessaging
+    Benchmark (32-core). No fabricated greens; no number before its artifact; every over-claim hunted down by our
+    own skeptics and corrected. 2026-06-24.
   </div>
 
 </div>
