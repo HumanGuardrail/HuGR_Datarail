@@ -64,10 +64,19 @@ commodity object storage / disk** (S3 / GCS / R2 / MinIO — cheap, abundant, pr
 ciphertext), keeping **only a tiny index in RAM**. So **durability scales on the cheap/abundant axis (disk),
 and RAM stays FLAT regardless of how much you store.**
 
-**Measured proof** (`datarail-store-bench`, local): sealing + storing **50,000 cofres = 3,151 MB of durable,
-sealed, provider-blind data on disk** held the process at **RSS ≈ 1 MB the whole time** — flat while disk grew
-to gigabytes. Store 10× more → disk grows 10×, **RAM does not move.** Kafka cannot do this: more durable data
-in its hot set means more page-cache RAM.
+**Measured proof** (`datarail-store-bench`, Linux real `/proc`): sealing + durably storing **30,000 sealed
+cofres = ~1.9 GB of provider-blind data on disk** held the process at **RSS ≈ 2 MB the whole time** — flat while
+disk grew to gigabytes. Store 10× more → disk grows 10×, **RAM does not move.** Kafka cannot do this: more
+durable data in its hot set means more page-cache RAM.
+
+> **Cold-verify note (we checked our own number — it looked too good):** the ~2 MB flat figure is the
+> **write/store** path (the source seals → writes to disk → forgets; it accumulates nothing in RAM). The
+> *drain/read* side of the current **demo** object-store substrate keeps per-message bookkeeping that grows with
+> messages processed — a noted demo simplification (a production seq-cursor is O(1)), not a property of the
+> architecture. The fair **full send+receive** footprint is the **7 MB** from Run 10 (loopback substrate), not
+> 2 MB. We report 7 MB as the pipeline number and ~2 MB as the proven *durability-decouples-from-RAM* number —
+> no rounding down. (An earlier draft said "1 MB"; that was an imprecise macOS `ps` reading — the real Linux
+> figure is ~2 MB.)
 
 > **So datarail is NOT "a mover that can't replace Kafka's durability." It is durability done on the abundant
 > resource (cheap object storage) instead of the scarce one (RAM) — which is why it competes with Kafka on
