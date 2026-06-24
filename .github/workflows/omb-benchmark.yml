@@ -28,6 +28,9 @@ on:
         description: "Measure server RSS/CPU footprint (efficiency benchmark)"
         type: boolean
         default: false
+      datarail_substrate:
+        description: "datarail in-shim transport: loopback (non-durable) or wal (fsync-durable)"
+        default: "loopback"
 
 permissions:
   contents: read
@@ -96,6 +99,7 @@ jobs:
         env:
           KAFKA_TLS: ${{ inputs.kafka_tls && '1' || '0' }}
           MEASURE_RESOURCES: ${{ inputs.measure_resources && '1' || '0' }}
+          DATARAIL_SUBSTRATE: ${{ inputs.datarail_substrate }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/omb-results"
           IFS=',' read -ra SYS <<< "${{ inputs.systems }}"

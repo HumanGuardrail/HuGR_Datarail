@@ -108,11 +108,17 @@ case "$SYS" in
     for _ in $(seq 1 45); do curl -sf localhost:8080/admin/v2/clusters >/dev/null 2>&1 && break; sleep 2; done
     DRIVER="driver-pulsar-local.yaml"; SERVER_TARGET="docker:omb-pulsar" ;;
   datarail)
-    ./datarail-omb-shim >"$RESULTS/datarail-shim.log" 2>&1 &
+    # DATARAIL_SUBSTRATE selects the in-shim transport: loopback (default, non-durable) or wal (fsync-durable).
+    # With wal, datarail does the SAME durable work as Kafka acks=all, and both then use OS page cache for their
+    # logs (reclaimable, excluded from both process-RSS and docker-stats) → a like-for-like RAM comparison.
+    SUB="${DATARAIL_SUBSTRATE:-loopback}"
+    printf 'substrate = %s\n' "$SUB" > datarail-shim.toml
+    DATARAIL_WAL_DIR="$RESULTS/wal" ./datarail-omb-shim datarail-shim.toml >"$RESULTS/datarail-shim.log" 2>&1 &
     SHIM_PID=$!
     sleep 3
     if ! kill -0 "$SHIM_PID" 2>/dev/null; then echo "::error::shim failed to start"; cat "$RESULTS/datarail-shim.log"; exit 1; fi
     if ! wait_port 127.0.0.1 7701 15; then echo "::error::shim ingress :7701 not accepting"; cat "$RESULTS/datarail-shim.log"; exit 1; fi
+    echo "datarail substrate = $SUB"
     DRIVER="datarail.yaml"; SERVER_TARGET="pid:$SHIM_PID" ;;
   *)
     echo "unknown system: $SYS"; exit 2 ;;
