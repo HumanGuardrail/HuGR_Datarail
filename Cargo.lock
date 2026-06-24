@@ -388,6 +388,7 @@ dependencies = [
  "datarail-core",
  "datarail-crypto",
  "datarail-rail",
+ "datarail-substrate-objectstore",
  "datarail-substrate-shmem",
  "datarail-terminal",
  "tokio",
@@ -461,6 +462,15 @@ dependencies = [
  "datarail-core",
  "datarail-rail",
  "memmap2",
+]
+
+[[package]]
+name = "datarail-substrate-wal"
+version = "0.0.0"
+dependencies = [
+ "datarail-cofre",
+ "datarail-core",
+ "datarail-rail",
 ]
 
 [[package]]
