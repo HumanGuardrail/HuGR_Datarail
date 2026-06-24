@@ -136,7 +136,7 @@ server_cpu_pct() {
       a=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null); sleep 1
       b=$(awk '{print $14+$15}' "/proc/$p/stat" 2>/dev/null)
       [ -n "$a" ] && [ -n "$b" ] && echo $(( (b - a) * 100 / $(getconf CLK_TCK) )) || echo 0 ;;
-    docker:*) docker stats --no-stream --format '{{.CPUPercent}}' "${SERVER_TARGET#docker:}" 2>/dev/null | tr -d '%' | cut -d. -f1 ;;
+    docker:*) docker stats --no-stream --format '{{.CPUPerc}}' "${SERVER_TARGET#docker:}" 2>/dev/null | tr -d '%' | cut -d. -f1 ;;
   esac
 }
 

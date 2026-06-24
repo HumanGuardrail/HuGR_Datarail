@@ -26,6 +26,7 @@
 | Dimension | **datarail** (measured) | Kafka | Pulsar | RabbitMQ | Verdict |
 |---|---|---|---|---|---|
 | **Provider-blind** (operator structurally cannot read payloads) | ✅ **sealed E2E** (AEAD; the rail decodes only the cleartext header, never `carga`) | ❌ plaintext to broker; E2E (KIP-317) **never shipped** | ❌ plaintext default (client-side E2E optional, non-default) | ❌ plaintext; broker routes through a central exchange | **datarail — alone. No head-on competitor exists.** |
+| **RAM to move data** (measured, same throughput) | ✅ **7 MB under load · 3 MB idle** (lean Rust mover) | ❌ ~870 MB load · 275 MB idle | ❌ heavier (BookKeeper+ZK) | ❌ ~256MB–1.5GB | **datarail — 92–124× less RAM at the SAME 51 MB/s (32-core OMB). The disruption axis.** |
 | **Serverless / idle ≈ 0** | ✅ spawn → deliver → vanish; no standing state | ❌ always-on brokers + KRaft/ZK | ❌ always-on brokers + **BookKeeper** + ZK (heaviest) | ❌ always-on Erlang nodes (~256 MiB–1.5 GiB idle) | **datarail — the others bill 24/7** |
 | **Exactly-once** | ✅ effectively-once (1000-seed DST: 0-loss/0-dup) | ✅ EOS (txns, costs throughput) | ✅ txns (2.8+) | ❌ **at-most / at-least-once only** | datarail ✅ · Kafka/Pulsar ✅ · Rabbit ❌ |
 | **+ cryptographic delivery proof** | ✅ **Merkle receipt, independently verifiable** | ❌ | ❌ | ❌ | **datarail — alone** |

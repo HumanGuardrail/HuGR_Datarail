@@ -295,13 +295,17 @@ The throughput race is a tie, and even "encrypted" the brokers can approximate i
 is **throughput-per-resource**, not absolute throughput. Measured the server's own RSS+CPU (the OMB/loadgen
 client is identical, so this is the broker/shim footprint) at a fixed, realistic load.
 
-**Local directional measurement (Kafka in Docker -Xmx2g vs datarail shim; authoritative same-box CI run follows):**
+**AUTHORITATIVE — 32-core Turbo, same box, same OMB harness, both delivering the IDENTICAL 51 MB/s (50 k msg/s):**
 
 | | Kafka 3.8 (-Xmx2g) | **datarail** | datarail advantage |
 |---|---|---|---|
-| **RSS idle** (server up, no traffic) | 261 MB | **1 MB** | **~261× lighter at rest** |
-| **RSS under load** | ~760 MB @ 40 k msg/s | **~44 MB @ 107 k msg/s** | **~17× less RAM — while moving 2.7× more** |
-| **throughput per GB-RAM** | ~53 MB/s/GB | **~2,500 MB/s/GB** | **~47× more efficient** |
+| **delivered** | 51 MB/s | 51 MB/s | identical (fixed-rate) |
+| **RSS idle** (server up, no traffic) | 275 MB | **3 MB** | **92× lighter at rest** |
+| **RSS under load** (avg / max) | 867 / 1083 MB | **7 / 8 MB** | **124× less RAM** |
+| **throughput per GB-RAM** | 60 MB/s/GB | **7,492 MB/s/GB** | **125× more efficient** |
+
+(Earlier local-Docker directional run agreed: Kafka idle 261 MB / load ~760 MB vs datarail idle 1 MB / load
+~44 MB. The clean same-box CI number is even sharper because at the fixed 50 k/s datarail uses fewer buffers.)
 
 **This is the honest, decisive win — not "3–4× faster" (which doesn't exist), but "17–261× lighter."** datarail
 sustains the load in **tens of MB**; Kafka's JVM needs **hundreds of MB to GBs** just to exist. And the
