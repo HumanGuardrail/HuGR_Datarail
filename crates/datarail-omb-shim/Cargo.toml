@@ -22,6 +22,12 @@ path = "src/bin/loadgen.rs"
 name = "datarail-engine-bench"
 path = "src/bin/engine_bench.rs"
 
+# Proves durability decouples from RAM: store N sealed cofres on disk, show process RSS stays flat as the
+# on-disk store grows into the GBs (cheap/abundant disk vs scarce/expensive RAM).
+[[bin]]
+name = "datarail-store-bench"
+path = "src/bin/store_bench.rs"
+
 [lints]
 workspace = true
 
@@ -35,6 +41,7 @@ datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
 datarail-rail = { path = "../datarail-rail" }
 datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
+datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }
 datarail-terminal = { path = "../datarail-terminal" }
 
 # tokio is QUARANTINED to this benchmark adapter. The shim is NOT a product / core / sealed-path crate; the

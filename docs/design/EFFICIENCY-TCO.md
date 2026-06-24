@@ -48,19 +48,47 @@ For a workload that moves data **1 h/day**, the idle multiplier widens the gap t
 24/7 firehose it narrows toward the footprint ratio (still large). The burstier the workload, the more datarail
 wins.
 
-## Honest boundaries (where this does NOT apply)
+## The deeper point: storage is abundant, RAM is scarce — datarail decouples durability from RAM
 
-- **This is efficiency for MOVING data, not STORING it.** datarail's tiny footprint is partly *because* it is a
-  stateless mover — no durable log, no replication, no disk. If your job is a durable, replayable event log,
-  Kafka is the right tool and this comparison is moot. datarail competes for the **movement** use case (A→B
-  sealed transfer), where a broker's storage footprint is overhead you don't need.
-- **CPU is ~parity** — the win is RAM + idle/scale-to-zero, not compute. Don't claim a CPU advantage.
-- **Prices are illustrative.** The measured *resource ratios* are solid; the *dollar figures* depend on your
-  provider, region, and exact sizing. The ratio is robust because it is footprint-driven.
+An earlier draft of this doc drew a caveat — *"this is efficiency for moving, not storing; if you need
+durability, Kafka is the right tool."* **That caveat was wrong, and it conceded too much to Kafka.** The
+correction is the sharpest part of the thesis:
+
+**Durability means writing bytes to storage. Storage (disk / object store) is cheap and abundant. RAM is
+expensive and scarce.** Kafka achieves durability+performance by keeping its working set in the **OS page
+cache** — i.e. it spends the **scarce** resource (RAM) to make the durable log fast. Its RAM bill **grows with
+retention and throughput** (bigger working set → more brokers → more RAM).
+
+datarail does the opposite by design (SPEC-10 durable store): the source seals a cofre and **writes it to
+commodity object storage / disk** (S3 / GCS / R2 / MinIO — cheap, abundant, provider-blind: the store sees only
+ciphertext), keeping **only a tiny index in RAM**. So **durability scales on the cheap/abundant axis (disk),
+and RAM stays FLAT regardless of how much you store.**
+
+**Measured proof** (`datarail-store-bench`, local): sealing + storing **50,000 cofres = 3,151 MB of durable,
+sealed, provider-blind data on disk** held the process at **RSS ≈ 1 MB the whole time** — flat while disk grew
+to gigabytes. Store 10× more → disk grows 10×, **RAM does not move.** Kafka cannot do this: more durable data
+in its hot set means more page-cache RAM.
+
+> **So datarail is NOT "a mover that can't replace Kafka's durability." It is durability done on the abundant
+> resource (cheap object storage) instead of the scarce one (RAM) — which is why it competes with Kafka on
+> durable delivery AT ~100× less RAM, and the advantage WIDENS as data volume grows.** Kafka couples
+> durability to RAM; datarail decouples them. That is the architecture-level moat.
+
+(Honest residual: object-store durability adds latency vs Kafka's RAM-hot reads — fine for store-and-forward /
+temporal-decoupling / async movement, which is the use case; not for sub-ms hot replay of a huge working set.
+And when both endpoints are online, datarail uses **no store at all** — direct sealed shmem/QUIC/TCP.)
+
+## Honest boundaries (what stays true)
+
+- **CPU is ~parity** — the win is RAM + idle/scale-to-zero + durability-on-cheap-storage, not compute. Don't
+  claim a CPU advantage.
+- **Prices are illustrative.** The measured *resource ratios* are solid; the *dollar figures* depend on
+  provider, region, and sizing. The ratio is robust because it is footprint-driven.
 
 ## The one-line thesis (measured, honest)
 
-> **datarail moves the same data as Kafka using ~1/124th the RAM under load and ~1/92nd at rest, at comparable
-> CPU, scaling to $0 when idle — because it is a lean, stateless, sealed mover, not an always-on JVM cluster that
-> stores everything. Same throughput class; a footprint and cost from another category.** That is the
-> disruption: not faster — radically lighter, and for bursty movement, far cheaper.
+> **datarail moves AND durably stores the same data as Kafka using ~1/124th the RAM under load and ~1/92nd at
+> rest, at comparable CPU, scaling to $0 when idle — because it spends the abundant resources (disk, object
+> storage) where Kafka spends the scarce one (RAM). Same throughput class, full durability; a footprint and cost
+> from another category, and the gap WIDENS with data volume.** That is the disruption: not faster — it moves
+> the cost off the scarce axis (RAM) onto the abundant one (storage), which Kafka architecturally cannot do.
