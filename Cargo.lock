@@ -390,6 +390,7 @@ dependencies = [
  "datarail-rail",
  "datarail-substrate-objectstore",
  "datarail-substrate-shmem",
+ "datarail-substrate-wal",
  "datarail-terminal",
  "tokio",
 ]

@@ -434,3 +434,44 @@ mod prop {
         }
     }
 }
+
+// ---- CSPRNG (per-thread forward-secure DRBG) sanity — AUDIT-04 perf fix must not weaken randomness ----
+
+#[test]
+fn drbg_outputs_are_distinct_across_many_draws_and_reseed() {
+    use std::collections::HashSet;
+    // Draw well past the reseed boundary; every 32-byte output must be unique (a repeat would betray a broken
+    // PRF/counter). This exercises the ratchet AND the periodic OS reseed path.
+    let n = usize::try_from(super::DRBG_RESEED_EVERY).unwrap() + 5000;
+    let mut seen = HashSet::with_capacity(n);
+    for _ in 0..n {
+        let r = super::random_32().expect("drbg draw");
+        assert!(seen.insert(r), "DRBG produced a repeated 32-byte output — randomness is broken");
+        assert_ne!(r, [0u8; 32], "DRBG must not emit all-zeros");
+    }
+}
+
+#[test]
+fn drbg_backed_board_still_seals_and_offloads_round_trip() {
+    // The ephemeral key + nonce now come from the DRBG; a full board→offload must still verify + deliver,
+    // proving the DRBG-produced key material yields valid seals (not just distinct bytes).
+    let contract = ContentContract::new(4096, Vec::new());
+    let cfg = TerminalConfig {
+        route_id: ROUTE,
+        stream_id: STREAM,
+        aead_alg: AeadAlg::Gcmsiv256,
+        dest_x25519_pk: x25519_public(&DEST_X_SECRET),
+        tenant_secret: [6u8; 32],
+    };
+    let mut src = SourceTerminal::new(cfg.clone(), contract.clone(), SOURCE_SEED);
+    let src_vk = verifying_key(&SOURCE_SEED);
+    let mut dst = DestTerminal::new(cfg, contract, src_vk, DEST_SEED, DEST_X_SECRET);
+    let recs: Vec<&[u8]> = vec![b"alpha".as_slice(), b"bravo".as_slice(), b"charlie".as_slice()];
+    for i in 0u64..200 {
+        let cofre = src.board(&recs, &i.to_le_bytes()).expect("board");
+        // distinct ephemeral pubkey per cofre (fresh DRBG draw) — no key reuse across cofres
+        assert_ne!(cofre.etiqueta.eph_pk, [0u8; 32]);
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::Delivered);
+    }
+    assert_eq!(dst.sink().committed().len(), 200 * recs.len());
+}

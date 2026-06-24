@@ -59,14 +59,65 @@ fn aead_aad(e: &Etiqueta) -> Vec<u8> {
     aad
 }
 
-/// Read 32 bytes of OS entropy for a fresh per-cofre ephemeral key. Zero-dep (`/dev/urandom`); the source
-/// terminal calls this once per [`SourceTerminal::board`].
-fn random_32() -> Result<[u8; 32], TerminalError> {
+/// Read 32 bytes of OS entropy (`/dev/urandom`, zero-dep). Used ONLY to **seed** the per-thread CSPRNG once and
+/// to reseed it periodically — NOT once per cofre. The old design opened `/dev/urandom` twice per `board`, which
+/// serialized concurrent boarders on the kernel entropy path (a measured throughput bottleneck under load,
+/// AUDIT-04); the per-thread CSPRNG below removes that contention entirely.
+fn os_seed_32() -> Result<[u8; 32], TerminalError> {
     use std::io::Read as _;
     let mut file = std::fs::File::open("/dev/urandom").map_err(|_| TerminalError::Entropy)?;
     let mut buf = [0u8; 32];
     file.read_exact(&mut buf).map_err(|_| TerminalError::Entropy)?;
     Ok(buf)
+}
+
+/// Draws between fresh OS reseeds (prediction resistance / recovery from a state compromise).
+const DRBG_RESEED_EVERY: u64 = 1 << 16;
+
+/// A per-thread, **forward-secure** CSPRNG for per-cofre ephemeral keys + nonces.
+///
+/// Construction: a BLAKE3-keyed-PRF DRBG (BLAKE3's keyed mode is a secure PRF / MAC). Seeded once from the OS;
+/// each draw emits `PRF(seed, "output")` and then **ratchets** `seed ← PRF(seed, "ratchet")`. Ratcheting gives
+/// forward secrecy — a state compromise cannot recover the per-cofre keys already used (and zeroized). Every
+/// [`DRBG_RESEED_EVERY`] draws it mixes fresh OS entropy for prediction resistance. This is the standard
+/// seed-once-and-stretch design (what `rand::thread_rng` does), is cryptographically sound for X25519 ephemeral
+/// secrets + AEAD nonces, and uses only `blake3` (already a dependency) — Charter *leveza* preserved.
+struct Drbg {
+    seed: [u8; 32],
+    draws: u64,
+}
+
+impl Drbg {
+    fn seeded() -> Result<Self, TerminalError> {
+        Ok(Self { seed: os_seed_32()?, draws: 0 })
+    }
+
+    fn next_32(&mut self) -> Result<[u8; 32], TerminalError> {
+        if self.draws != 0 && self.draws.is_multiple_of(DRBG_RESEED_EVERY) {
+            let fresh = os_seed_32()?;
+            self.seed = hmac_blake3(&self.seed, &fresh);
+        }
+        let out = hmac_blake3(&self.seed, b"datarail-drbg-output-v1");
+        self.seed = hmac_blake3(&self.seed, b"datarail-drbg-ratchet-v1");
+        self.draws += 1;
+        Ok(out)
+    }
+}
+
+thread_local! {
+    static DRBG: core::cell::RefCell<Option<Drbg>> = const { core::cell::RefCell::new(None) };
+}
+
+/// 32 fresh cryptographically-random bytes for a per-cofre ephemeral key / nonce, from the per-thread CSPRNG
+/// (seeded lazily from the OS on first use). Replaces the old per-call `/dev/urandom` open.
+fn random_32() -> Result<[u8; 32], TerminalError> {
+    DRBG.with(|cell| {
+        let mut g = cell.borrow_mut();
+        if g.is_none() {
+            *g = Some(Drbg::seeded()?);
+        }
+        g.as_mut().expect("seeded just above").next_32()
+    })
 }
 
 // ----------------------------------------------------------------------------------------------------------

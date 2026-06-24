@@ -42,6 +42,7 @@ datarail-crypto = { path = "../datarail-crypto" }
 datarail-rail = { path = "../datarail-rail" }
 datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
 datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }
+datarail-substrate-wal = { path = "../datarail-substrate-wal" }
 datarail-terminal = { path = "../datarail-terminal" }
 
 # tokio is QUARANTINED to this benchmark adapter. The shim is NOT a product / core / sealed-path crate; the

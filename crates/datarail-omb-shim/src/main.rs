@@ -100,6 +100,10 @@ enum SubstrateKind {
     Tcp,
     /// A real shared-memory ring hop ([`datarail_substrate_shmem::ShmemRing`]) between board and offload.
     Shmem,
+    /// A **durable** fsync'd write-ahead-log hop ([`datarail_substrate_wal::DurableLog`]) — each cofre is sealed
+    /// to disk and fsync'd (group commit per 128-record cofre) before the dest opens it. The Kafka-`acks=all`
+    /// equivalent path, at O(1) RAM.
+    Wal,
 }
 
 /// The shim's parsed configuration (`docs/design/OMB-PROTOCOL.md` §"Shim config").
@@ -189,8 +193,9 @@ fn parse_substrate(value: &str) -> Result<SubstrateKind, ShimError> {
         "loopback" => Ok(SubstrateKind::Loopback),
         "tcp" => Ok(SubstrateKind::Tcp),
         "shmem" => Ok(SubstrateKind::Shmem),
+        "wal" => Ok(SubstrateKind::Wal),
         other => Err(ShimError::Config(format!(
-            "substrate must be loopback|tcp|shmem, got `{other}`"
+            "substrate must be loopback|tcp|shmem|wal, got `{other}`"
         ))),
     }
 }
@@ -632,6 +637,8 @@ enum Transport {
     Tcp(TcpSubstrate),
     /// A real shared-memory ring substrate.
     Shmem(ShmemRing),
+    /// A durable fsync'd write-ahead log (each cofre sealed to disk + fsync'd before offload).
+    Wal(datarail_substrate_wal::DurableLog),
 }
 
 impl Transport {
@@ -655,6 +662,19 @@ impl Transport {
                     Self::Loopback
                 }
             },
+            SubstrateKind::Wal => {
+                // A unique per-engine durable log dir (DATARAIL_WAL_DIR root, else the system temp dir).
+                let root = std::env::var("DATARAIL_WAL_DIR")
+                    .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned());
+                let dir = std::path::Path::new(&root).join(format!("dr-wal-{}", next_wal_id()));
+                match datarail_substrate_wal::DurableLog::open(&dir) {
+                    Ok(log) => Self::Wal(log),
+                    Err(e) => {
+                        eprintln!("datarail-omb-shim: wal substrate unavailable ({e}); using loopback handoff");
+                        Self::Loopback
+                    }
+                }
+            }
         }
     }
 
@@ -668,8 +688,16 @@ impl Transport {
             Self::Loopback => Ok(cofre.clone()),
             Self::Tcp(s) => relay_through(s, cofre),
             Self::Shmem(s) => relay_through(s, cofre),
+            Self::Wal(s) => relay_through(s, cofre),
         }
     }
+}
+
+/// Monotonic id for per-engine WAL directories (unique dir per topic worker so their logs never collide).
+fn next_wal_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Send `cofre` over a real substrate and drain it back (the substrate is a FIFO pipe; one in, one out). Used
