@@ -6,8 +6,10 @@
 //! over a real lossy link (`tc netem`) instead of only an in-process simulation. See the design contract in
 //! `docs/design/FASP-UDP-TRANSPORT.md`.
 //!
-//! **Scope (S1):** clean-path reliability — framing, ACKs, in-order reassembly, retransmit-on-timeout, and RTT
-//! samples feeding the controller. Window *pacing* under loss is S2; the real `tc netem` benchmark is S3.
+//! **Scope (S1+S2):** reliable framing, ACKs, in-order reassembly, retransmit-on-timeout, RTT samples feeding
+//! the controller, and loss recovery (the `loss_sim_drop_every` egress simulator proves exactly-once delivery +
+//! window-holds-under-loss at 33% drop). The real `tc netem` benchmark vs kernel TCP is S3; the adversarial
+//! audit before any PROVEN label is S4.
 //!
 //! The mover carries **opaque bytes** (each `send` is one ≤[`MAX_FASP_PAYLOAD`] message delivered intact and in
 //! order); the cofre is already sealed above this layer, so this is a dumb, confidential-by-construction pipe.
@@ -47,6 +49,10 @@ pub struct FaspCfg {
     pub max_window: f64,
     /// Queueing-delay threshold above which the controller treats the path as congested.
     pub queue_threshold: Duration,
+    /// **Test/bench loss simulator** (0 = off): deterministically drop every Nth outgoing datagram before it
+    /// hits the wire, to exercise loss recovery without a real network. Mirrors the established
+    /// [`WanProfile`](crate::WanProfile)`::drop_every` pattern; the *real* loss number comes from `tc netem` (S3).
+    pub loss_sim_drop_every: u32,
 }
 
 impl Default for FaspCfg {
@@ -58,6 +64,7 @@ impl Default for FaspCfg {
             min_window: 1.0,
             max_window: 1024.0,
             queue_threshold: Duration::from_millis(5),
+            loss_sim_drop_every: 0,
         }
     }
 }
@@ -131,6 +138,10 @@ struct InFlight {
     frame: Vec<u8>,
     sent_at: Instant,
     last_tx: Instant,
+    /// Whether this frame has been retransmitted — if so, its ACK is **not** used as an RTT sample (Karn's
+    /// algorithm: a retransmitted frame's ACK is ambiguous as to which transmission it answers, so sampling it
+    /// would feed the controller a spuriously inflated RTT and collapse the window under loss).
+    retransmitted: bool,
 }
 
 /// A reliable, ordered datagram mover over a connected UDP socket pair, paced by a [`DelayController`].
@@ -144,6 +155,7 @@ pub struct FaspLink {
     inflight: BTreeMap<u64, InFlight>,
     sent: u64,
     retransmits: u64,
+    tx_count: u64,
     // Receive side.
     next_deliver: u64,
     reorder: BTreeMap<u64, Vec<u8>>,
@@ -171,6 +183,7 @@ impl FaspLink {
             inflight: BTreeMap::new(),
             sent: 0,
             retransmits: 0,
+            tx_count: 0,
             next_deliver: 0,
             reorder: BTreeMap::new(),
             ready: std::collections::VecDeque::new(),
@@ -196,6 +209,18 @@ impl FaspLink {
     fn peer(&self) -> Result<SocketAddr, FaspError> {
         self.peer
             .ok_or_else(|| FaspError::Io(std::io::Error::new(std::io::ErrorKind::NotConnected, "fasp peer unset")))
+    }
+
+    /// Put one datagram on the wire, honoring the test/bench loss simulator: every Nth send is silently
+    /// dropped (as a real lossy path would), which retransmission then recovers.
+    fn wire_send(&mut self, frame: &[u8], addr: SocketAddr) -> Result<(), FaspError> {
+        self.tx_count += 1;
+        let drop_every = u64::from(self.cfg.loss_sim_drop_every);
+        if drop_every != 0 && self.tx_count.is_multiple_of(drop_every) {
+            return Ok(()); // simulated egress loss
+        }
+        self.sock.send_to(frame, addr)?;
+        Ok(())
     }
 
     /// The local address the socket bound to (useful when `local` requested an ephemeral port).
@@ -227,9 +252,9 @@ impl FaspLink {
         let seq = self.next_seq;
         self.next_seq += 1;
         let frame = encode_frame(seq, KIND_DATA, payload);
-        self.sock.send_to(&frame, peer)?;
+        self.wire_send(&frame, peer)?;
         let now = Instant::now();
-        self.inflight.insert(seq, InFlight { frame, sent_at: now, last_tx: now });
+        self.inflight.insert(seq, InFlight { frame, sent_at: now, last_tx: now, retransmitted: false });
         self.sent += 1;
         Ok(())
     }
@@ -272,7 +297,7 @@ impl FaspLink {
                 // Always ACK (even a duplicate) so the sender can retire it and stop retransmitting. Reply to the
                 // datagram's source so ACKs route correctly even before our own peer is set.
                 let ack = encode_frame(seq, KIND_ACK, &[]);
-                self.sock.send_to(&ack, from)?;
+                self.wire_send(&ack, from)?;
                 if seq >= self.next_deliver && !self.reorder.contains_key(&seq) {
                     self.reorder.insert(seq, payload.to_vec());
                     while let Some(bytes) = self.reorder.remove(&self.next_deliver) {
@@ -284,7 +309,9 @@ impl FaspLink {
             }
             KIND_ACK => {
                 if let Some(f) = self.inflight.remove(&seq) {
-                    self.cc.on_rtt_sample(f.sent_at.elapsed());
+                    if !f.retransmitted {
+                        self.cc.on_rtt_sample(f.sent_at.elapsed());
+                    }
                 }
             }
             _ => {} // unknown kind → ignore
@@ -303,8 +330,10 @@ impl FaspLink {
             .collect();
         for seq in due {
             if let Some(f) = self.inflight.get_mut(&seq) {
-                self.sock.send_to(&f.frame, peer)?;
+                let frame = f.frame.clone();
                 f.last_tx = now;
+                f.retransmitted = true;
+                self.wire_send(&frame, peer)?;
                 self.retransmits += 1;
                 self.cc.on_loss();
             }
