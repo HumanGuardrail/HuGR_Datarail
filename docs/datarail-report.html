@@ -188,9 +188,13 @@
       <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Graceful backpressure, not collapse.</strong>
         Under a firehose the rail throttles (bounded queue → producer slows), holding <em>0 loss with flat memory</em>
         — verified after the stress test found &amp; we fixed two real OOM bugs.</div></li>
-      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Holds throughput where TCP collapses.</strong>
-        FASP delay-based congestion control sustains <em>16–42× the goodput of loss-based TCP</em> as packet loss
-        climbs 5→30% — the moat for moving data across a lossy WAN, where Kafka's MirrorMaker (TCP) falls apart.</div></li>
+      <li><span class="badge b-dir">DIRECTIONAL</span><div class="t"><strong>The FASP <em>algorithm</em> holds
+        throughput where loss-based TCP collapses.</strong> Our delay-based controller sustains <em>16–42× the
+        goodput of a textbook TCP-Reno AIMD</em> as loss climbs 5→30% — <em>but honestly: that's an in-process
+        seeded-loss simulation, and the controller is not yet wired to a real UDP transport.</em> datarail's real
+        socket path today is kernel TCP, which would inherit TCP's loss collapse. Realizing this moat needs a
+        reliable-UDP mover paced by the controller, measured under real <code>tc netem</code> loss vs kernel TCP —
+        the build is designed (<code>FASP-UDP-TRANSPORT.md</code>) and is the honest next step, not done.</div></li>
       <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Delivery comes with a receipt.</strong>
         A Merkle manifest whose root an independent verifier re-derives; any tamper breaks it. Kafka has no
         cryptographic delivery proof.</div></li>
@@ -206,7 +210,7 @@
       <tr><td>Idle footprint</td><td class="win">3 MB → scale-to-zero</td><td class="lose">always-on cluster, 24/7</td></tr>
       <tr><td>Broker can read payloads?</td><td class="win">No — provider-blind</td><td class="lose">Yes — plaintext</td></tr>
       <tr><td>Durability cost scales on…</td><td class="win">cheap disk (RAM flat)</td><td class="lose">scarce RAM (page cache)</td></tr>
-      <tr><td>Throughput under WAN loss</td><td class="win">FASP — holds</td><td class="lose">TCP — collapses</td></tr>
+      <tr><td>Throughput under WAN loss</td><td>FASP algorithm holds <em>(sim; UDP transport pending)</em></td><td class="lose">TCP — collapses</td></tr>
       <tr><td>Cryptographic delivery proof</td><td class="win">Yes (Merkle)</td><td class="lose">No</td></tr>
       <tr><td>Raw throughput (same HW)</td><td>~parity (sealed)</td><td>~parity (plaintext)</td></tr>
       <tr><td>Durable multi-consumer log + replay</td><td class="lose">No (it's a mover)</td><td class="win">Yes — their job</td></tr>
