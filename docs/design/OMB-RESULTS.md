@@ -304,6 +304,15 @@ message — `driver-kafka-fsync.yaml`); datarail-WAL fsyncs every batch. Both ge
 | CPU under load | 1.67 cores | 2.00 cores |
 | E2E p50 / p99 | 5 / 10 ms | 1 / 3 ms |
 
+**n=3 CONFIRMATION (2026-06-24) — variance now measured.** Three independent fsync-vs-fsync runs (Kafka
+`flush.messages=1` each): datarail load **12.3 MB** (min 12, max 13), Kafka load
+**883 MB** (min 868, max 902, σ 14), idle **3 vs ~276 MB**.
+**RAM ratio = 71.6× under load (range 69.4–73.2×, σ 1.6), ~92× idle.**
+The ~70× headline is now n=3-measured with tiny variance — no longer a single-run number. (The remaining honest
+gap is byte-identical ruler: datarail `/proc` VmRSS vs Kafka `docker stats`; both already exclude reclaimable
+page cache, and docker-stats *undercounts* Kafka, so ~72× is a conservative LOWER bound.)
+
+
 **⇒ datarail uses ~72× less RAM under load (12 vs 868 MB), ~92× idle — both doing real per-message/per-batch
 fsync durability.** Two consistent data points now: ~67× (Run 11, Kafka stock) and ~72× (Run 12, Kafka fsync) —
 the RAM gap is stable across Kafka durability modes.

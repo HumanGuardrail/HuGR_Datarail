@@ -75,7 +75,7 @@
   </div>
 
   <div class="grid">
-    <div class="stat moatn"><div class="n">~72×</div><div class="l">less RAM at equal durability (12 MB vs 868 MB, both fsync)</div></div>
+    <div class="stat moatn"><div class="n">~72×</div><div class="l">less RAM at equal durability (n=3, range 69–73×; 12 vs 883 MB, both fsync)</div></div>
     <div class="stat moatn"><div class="n">~90×</div><div class="l">less RAM idle (3 MB vs 275 MB)</div></div>
     <div class="stat goodn"><div class="n">0</div><div class="l">bytes the pipe can read (provider-blind)</div></div>
     <div class="stat goodn"><div class="n">fsync</div><div class="l">durable WAL — built &amp; audited (5 loss-bugs fixed)</div></div>
@@ -233,7 +233,8 @@
       <li><span class="badge b-proven">DONE</span><div class="t"><strong>Durable fsync substrate — now BUILT.</strong>
         <code>datarail-substrate-wal</code> fsyncs every batch + dir, recovers torn tails, GCs by segment, O(1) read
         cursor — RAM flat on total volume (honest <em>O(in-flight)</em> on the un-acked window, gated). The remaining
-        honest gap is <em>same-ruler (both via cgroup) + n≥3 variance bars</em> on the ~70× number, and
+        honest gap is <em>byte-identical ruler</em> (both via the same cgroup field) on the ~72× number — already
+        <em>n=3, range 69–73×, σ 1.6</em>, and a conservative lower bound (docker-stats undercounts Kafka) — plus
         <em>node-loss</em> durability (delegate to S3 / RF=2 log-ship — not in-cluster RF≥3 today).</div></li>
       <li><span class="badge b-pend">PENDING</span><div class="t"><strong>Real cross-WAN field number.</strong> FASP's
         16–42× edge is proven in a seeded loss simulation; a physical lossy-link run vs Kafka MirrorMaker is the
