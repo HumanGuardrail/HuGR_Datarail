@@ -41,8 +41,8 @@ def throughput_mb(results_dir, sysname):
 def main() -> int:
     d = sys.argv[1] if len(sys.argv) > 1 else "."
     files = sorted(glob.glob(os.path.join(d, "*.resources")))
-    print("| system | delivered MB/s | idle RSS | load RSS (avg/max) | load CPU | **MB/s per GB-RAM** |")
-    print("|---|---|---|---|---|---|")
+    print("| system | delivered MB/s | idle RSS | load RSS (avg/max) | **anon (non-reclaim)** | load CPU | **MB/s per GB-RAM** |")
+    print("|---|---|---|---|---|---|---|")
     rows = []
     for f in files:
         r = read_kv(f)
@@ -58,13 +58,16 @@ def main() -> int:
         idle = num("idle_rss_mb")
         load_avg = num("load_rss_mb_avg")
         load_max = num("load_rss_mb_max")
+        anon = num("load_anon_mb_max")
+        wal = num("wal_dir_mb")
         cpu = num("load_cpu_pct_avg")
         # throughput per GB of RAM the server held under load — the efficiency headline.
         per_gb = mbps / (load_avg / 1024) if load_avg > 0 else 0
-        rows.append((s, mbps, idle, load_avg, load_max, cpu, per_gb))
-        print(f"| {s} | {mbps:,.0f} | {idle:,.0f} MB | {load_avg:,.0f} / {load_max:,.0f} MB | {cpu:.0f}% | **{per_gb:,.0f}** |")
+        rows.append((s, mbps, idle, load_avg, load_max, cpu, per_gb, anon, wal))
+        anon_cell = f"{anon:,.0f} MB" + (f" (+{wal:,.0f} MB WAL on disk, reclaimable)" if wal > 0 else "")
+        print(f"| {s} | {mbps:,.0f} | {idle:,.0f} MB | {load_avg:,.0f} / {load_max:,.0f} MB | {anon_cell} | {cpu:.0f}% | **{per_gb:,.0f}** |")
 
-    # if datarail + a broker both present, print the ratio
+    # if datarail + a broker both present, print BOTH ratios: resident (RSS) and the honest non-reclaimable (anon).
     dr = next((x for x in rows if x[0] == "datarail"), None)
     for x in rows:
         if x[0] != "datarail" and dr and x[3] > 0 and dr[3] > 0:
@@ -74,6 +77,13 @@ def main() -> int:
                 f"\n**datarail vs {x[0]} (same harness, ~same delivered rate): "
                 f"{ram_ratio:,.1f}× less RAM under load, {idle_ratio:,.1f}× less idle RAM.**"
             )
+            if x[7] > 0 and dr[7] > 0:
+                anon_ratio = x[7] / dr[7]
+                print(
+                    f"**Same-ruler (non-reclaimable anon, page cache excluded for BOTH): "
+                    f"datarail {dr[7]:,.0f} MB vs {x[0]} {x[7]:,.0f} MB ⇒ {anon_ratio:,.1f}× — the honest "
+                    f"scarce-resource number (RAM you must provision; page cache is evictable).**"
+                )
     return 0
 
 

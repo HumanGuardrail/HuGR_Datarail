@@ -152,6 +152,17 @@ server_cpu_pct() {
     docker:*) docker stats --no-stream --format '{{.CPUPerc}}' "${SERVER_TARGET#docker:}" 2>/dev/null | tr -d '%' | cut -d. -f1 ;;
   esac
 }
+# Non-reclaimable (anon) RAM — the SAME-RULER honest metric. Page cache is reclaimable under pressure (the OS
+# evicts it; it is not RAM you must provision), so the scarce-resource comparison is anon-vs-anon:
+#   pid:*    → RssAnon from /proc/PID/status (write()-based WAL ⇒ its log lives in reclaimable page cache, NOT here)
+#   docker:* → `anon` from the container cgroup memory.stat (the JVM heap), NOT docker-stats (which mixes in active_file)
+server_anon_mb() {
+  case "${SERVER_TARGET:-}" in
+    pid:*)    awk '/RssAnon/{printf "%d", $2/1024}' "/proc/${SERVER_TARGET#pid:}/status" 2>/dev/null ;;
+    docker:*) docker exec "${SERVER_TARGET#docker:}" cat /sys/fs/cgroup/memory.stat 2>/dev/null \
+                | awk '/^anon /{printf "%d", $2/1048576}' ;;
+  esac
+}
 
 if [ "${MEASURE_RESOURCES:-0}" = "1" ]; then
   sleep 5  # let the freshly-started server settle to a real idle baseline
@@ -167,7 +178,7 @@ echo "running OMB: driver=$DRIVER workload=$WL (cap ${RUN_TIMEOUT}s)"
 # genuine hang.
 bin/benchmark -d "$DRIVER" "workloads/$WL" > "$OUT" 2>&1 &
 bench_pid=$!
-rc=0; done_ok=0; rss_sum=0; rss_max=0; cpu_sum=0; samples=0; tick=0
+rc=0; done_ok=0; rss_sum=0; rss_max=0; cpu_sum=0; samples=0; tick=0; anon_max=0
 for _ in $(seq 1 "$RUN_TIMEOUT"); do
   if ! kill -0 "$bench_pid" 2>/dev/null; then wait "$bench_pid"; rc=$?; break; fi
   if grep -q "Writing test result into" "$OUT" 2>/dev/null; then
@@ -182,6 +193,7 @@ for _ in $(seq 1 "$RUN_TIMEOUT"); do
     if [ -n "$r" ] && [ "$r" -gt 0 ] 2>/dev/null; then
       rss_sum=$((rss_sum + r)); [ "$r" -gt "$rss_max" ] && rss_max=$r
       cpu_sum=$((cpu_sum + ${c:-0})); samples=$((samples + 1))
+      an=$(server_anon_mb); [ -n "$an" ] && [ "$an" -gt "$anon_max" ] 2>/dev/null && anon_max=$an
     fi
   fi
   sleep 1
@@ -203,6 +215,8 @@ if [ "${MEASURE_RESOURCES:-0}" = "1" ]; then
     echo "idle_cpu_pct=${IDLE_CPU:-NA}"
     echo "load_rss_mb_avg=$avg_rss"
     echo "load_rss_mb_max=$rss_max"
+    echo "load_anon_mb_max=$anon_max"
+    [ "$SYS" = "datarail" ] && [ -d "$RESULTS/wal" ] && echo "wal_dir_mb=$(du -sm "$RESULTS/wal" 2>/dev/null | cut -f1)"
     echo "load_cpu_pct_avg=$avg_cpu"
     echo "samples=$samples"
   } > "$RESULTS/$SYS.resources"
