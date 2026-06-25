@@ -241,10 +241,11 @@ impl FaspLink {
         if payload.len() > MAX_FASP_PAYLOAD {
             return Err(FaspError::TooLarge(payload.len()));
         }
-        // Bound memory: drain ACKs / retransmit until there is room. One pump per spin; the peer drives delivery.
-        while self.inflight.len() >= self.cfg.max_inflight {
+        // Pace to the FASP window (soft, rate control) AND max_inflight (hard, memory bound): drain ACKs /
+        // retransmit until there is room. One pump per spin; the peer drives delivery.
+        while !self.can_send() {
             self.pump()?;
-            if self.inflight.len() >= self.cfg.max_inflight {
+            if !self.can_send() {
                 std::thread::sleep(Duration::from_micros(50));
             }
         }
@@ -358,6 +359,17 @@ impl FaspLink {
     #[must_use]
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
+    }
+
+    /// May a new message go out now? Gated by the FASP congestion window (rate control — loss never shrinks it,
+    /// RTT growth does) and the hard `max_inflight` memory bound. The in-flight count is converted to `f64`
+    /// losslessly via `u32` (it never approaches `u32::MAX` in practice) so no float→int cast is needed.
+    fn can_send(&self) -> bool {
+        if self.inflight.len() >= self.cfg.max_inflight {
+            return false;
+        }
+        let inflight = f64::from(u32::try_from(self.inflight.len()).unwrap_or(u32::MAX));
+        inflight < self.cc.window()
     }
 }
 
