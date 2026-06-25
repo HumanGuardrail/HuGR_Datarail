@@ -84,7 +84,14 @@ case "$SYS" in
         docker exec omb-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 && break
         sleep 2
       done
-      DRIVER="driver-kafka-local.yaml"
+      # KAFKA_FSYNC=1 → flush.messages=1 (Kafka fsyncs every message) for a true fsync-vs-fsync apples-to-apples
+      # against datarail-WAL. Default (off) is Kafka's stock page-cache-ack durability (acks=all, no per-msg fsync).
+      if [ "${KAFKA_FSYNC:-0}" = "1" ]; then
+        echo "kafka durability = fsync-per-message (flush.messages=1)"
+        DRIVER="driver-kafka-fsync.yaml"
+      else
+        DRIVER="driver-kafka-local.yaml"
+      fi
     fi
     SERVER_TARGET="docker:omb-kafka" ;;
   rabbitmq)

@@ -31,6 +31,10 @@ on:
       datarail_substrate:
         description: "datarail in-shim transport: loopback (non-durable) or wal (fsync-durable)"
         default: "loopback"
+      kafka_fsync:
+        description: "Kafka flush.messages=1 (fsync every message — true apples-to-apples vs datarail-WAL)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -100,6 +104,7 @@ jobs:
           KAFKA_TLS: ${{ inputs.kafka_tls && '1' || '0' }}
           MEASURE_RESOURCES: ${{ inputs.measure_resources && '1' || '0' }}
           DATARAIL_SUBSTRATE: ${{ inputs.datarail_substrate }}
+          KAFKA_FSYNC: ${{ inputs.kafka_fsync && '1' || '0' }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/omb-results"
           IFS=',' read -ra SYS <<< "${{ inputs.systems }}"
