@@ -555,6 +555,8 @@ impl<S: Substrate> Substrate for WanLink<S> {
 /// transfer over a lossy / high-RTT WAN therefore does not collapse the way loss-based TCP does — loss is
 /// recovered by retransmission (`bao` resume, E4), never by cutting the rate. Pure state machine: feed it RTT
 /// samples and (observed-only) loss events; it owns no I/O.
+pub mod reliable_udp;
+
 pub mod congestion {
     use std::time::Duration;
 
