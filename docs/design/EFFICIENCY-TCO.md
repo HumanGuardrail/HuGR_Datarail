@@ -13,10 +13,10 @@
 | | datarail | Kafka | Pulsar |
 |---|---|---|---|
 | RSS idle | 3 MB | 275 MB | 810 MB |
-| RSS under load | 7 MB | 870 MB | 1,757 MB |
+| RSS under load | ~22 MB *(corrected; draft 7 MB)* | 870 MB | 1,757 MB |
 | CPU under load | 1.24 cores | 1.49 cores | 0.83 cores |
 
-**RAM: 124× (Kafka) / 251× (Pulsar) less. CPU: ~parity. Idle: 92–270× less.**
+**RAM: this draft said 124× — CORRECTED by the audit to ~40× loaded / ~90× idle (Run 10 re-measure), and ~67× for the durable same-work comparison (Run 11). CPU: ~parity.**
 
 ## Why footprint → dollars: instance sizing is RAM-bound for brokers
 

@@ -41,3 +41,21 @@ To make the durability/efficiency claim defensible — **same work, same ruler**
 
 ## UPDATE 2026-06-24 — critique #1 (does-less) ANSWERED
 The WAL substrate (`datarail-substrate-wal`, fsync-durable, O(1) RAM) was built + measured same-work vs Kafka `acks=all` (Run 11 in `OMB-RESULTS.md`): both single-node RF=1 leader-fsync, both 51 MB/s, 0 errors → datarail **13 MB vs Kafka 877 MB under load (~67×), 3 vs 274 MB idle (~91×)**. The 'datarail's RAM win is partly because it doesn't persist' finding no longer applies to the WAL path — it fsyncs every batch to disk, and the page-cache ruler asymmetry is gone (both write logs). The lean-process win is now demonstrated on **matched durable work**.
+
+## ROUND 2 (2026-06-24) — adversarial audit of the NEW code (WAL + RNG + Run 11 framing)
+
+The owner asked "how do we be sure we won't embarrass ourselves." Answer: audit the new/highest-stakes work
+the same brutal way — BEFORE anyone outside does. 3 lenses on the un-audited new code. Every finding
+lead-cold-verified; every real one fixed at the root with a regression gate.
+
+| Lens | Verdict | Real finding → fix |
+|---|---|---|
+| **Crypto (DRBG)** | WEAKENED-BUT-OK → **FIXED** | The thread-local BLAKE3-PRF DRBG had **no fork detection** — a `fork()`/VM-snapshot clones the state → identical `(eph_secret, nonce)` in parent+child → catastrophic key reuse under plain GCM. Latent (no production fork) but the docstring FALSELY claimed fork-safety and the design mandated a reseed-on-fork gate. **Fix:** PID-change detection → reseed (`49ee1ce`), `drbg_reseeds_on_fork` test. Audit confirmed otherwise sound (0 nonce collisions in 1M draws/70k Gcm256 boards, forward secrecy real). |
+| **Durability (WAL)** | HAS-LOSS-WINDOW → **FIXED** | (1) lost-cursor+GC → recv stopped → **0/300 un-acked recovered** (total loss). (2) **no directory fsync** anywhere. (3) corrupt frame in a sealed segment silently skipped the rest (**lost 13 not 1**). (4) **rigged O(1) RAM gate** (send-only) hid that the ack maps are **O(in-flight), not O(1)** (+21 MB at 200k un-acked). (5) macOS fsync ≠ F_FULLFSYNC. **Fixes (`8461eea`):** recv skip-forward + checkpoint-before-GC; `fsync_dir` on create/rotate/rename/unlink + sync_all; corrupt-in-sealed = hard error + CRC over len‖bytes; de-rigged gate (full send→recv→ack cycle) + honest O(in-flight) gate; durability boundary documented. 3 new regression gates. |
+| **Run 11 framing** | INACCURATE → **CORRECTED** | The Kafka baseline (`acks=all`, RF=1, stock flush) does **NOT fsync** — it acks on leader-page-cache write. So "both leader-fsync, same work" was false; datarail-WAL is *more* durable. Also: single-run (n=1), ruler still `/proc`-vs-`docker-stats`, leftover present-tense 124×/7 MB. **Corrected** the equivalence claim (datarail = more durable + ~67× leaner), labeled the caveats, purged the stale numbers. |
+
+**Net:** the new code had a latent crypto catastrophe + real data-loss windows + a rigged RAM gate + an
+inaccurate durability-equivalence claim. All caught by our own skeptics, cold-verified, and fixed at the root
+with gates — before any outsider saw them. That is the only "certainty" against embarrassment: attack your own
+work harder than the world will. **Still PENDING (honest):** same-ruler (both via cgroup) + n≥3 measurement
+hardening; a true fsync-vs-fsync Kafka (`log.flush.interval.messages=1`) re-run.

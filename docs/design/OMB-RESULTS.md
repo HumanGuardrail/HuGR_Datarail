@@ -296,7 +296,7 @@ A 5-way adversarial audit (`ADVERSARIAL-AUDIT.md`) corrected this section's head
 This is the answer to the adversarial audit's #1 critique ("datarail's RAM win was partly a does-less artifact —
 the loopback path didn't persist"). datarail now runs the **fsync-durable WAL substrate** (`substrate=wal`,
 verified ran — zero loopback fallback): each 128-record cofre is sealed and **fsync'd to disk** before offload,
-exactly the durability Kafka's `acks=all` provides. Both are **single-node, RF=1, leader-fsync** — apples-to-apples
+durability Kafka's `acks=all` *names*. **⚠️ Durability audit correction:** this Kafka config (`acks=all`, RF=1, stock flush settings — no `log.flush.interval.messages`) does **NOT fsync on the produce path**; it acks once the record is in the **leader's page cache** and relies on replication it doesn't have at RF=1. datarail-WAL `sync_all()`s every batch within ≤1 ms. So **datarail-WAL is at least as durable, arguably MORE durable, than this Kafka baseline** — NOT
 durability. And because both now write a log to disk, both use reclaimable OS page cache (excluded from both
 process-RSS and docker-stats) → the RAM rulers are now **symmetric** (the asymmetry the audit flagged is gone).
 
@@ -314,7 +314,7 @@ process-RSS and docker-stats) → the RAM rulers are now **symmetric** (the asym
 ~91× less idle (3 MB vs 274 MB), at comparable CPU, 0 errors.** This is the honest, same-work, same-ruler number
 the whole campaign was after — durability matched (both fsync, both RF=1), ruler symmetric (both exclude
 reclaimable log page cache), rate identical. The "does-less artifact" critique is **answered**: datarail-WAL
-fsyncs every batch to disk just like Kafka.
+fsyncs every batch to disk; this Kafka config does not (it acks on leader-page-cache write). So datarail does the *more* durable work AND uses far less RAM. (For a true fsync-vs-fsync apples-to-apples, set `log.flush.interval.messages=1` on the Kafka topic and re-measure — PENDING.) Caveats: single CI run (n=1, no variance bars); ruler not byte-identical (datarail `/proc` VmRSS vs Kafka `docker stats`); end-to-end the shim is acks=1 (ack at ingress handoff, before fsync).
 
 **Honest caveats (kept):** (a) instruments aren't byte-identical — datarail is `/proc` RSS of a bare process,
 Kafka is `docker stats` of a container — but they are now **symmetric on page cache** (both have reclaimable log
@@ -337,11 +337,11 @@ client is identical, so this is the broker/shim footprint) at a fixed, realistic
 |---|---|---|---|
 | **delivered** | 51 MB/s | 51 MB/s | 51 MB/s |
 | **RSS idle** (server up, no traffic) | **3 MB** | 275 MB | 810 MB |
-| **RSS under load** (avg / max) | **7 / 8 MB** | 870 / 1085 MB | 1757 / 2077 MB |
+| **RSS under load** (avg / max) | **7 / 8 MB** *(see ⚠️ above: optimistic light-load sample; re-measured ~22 MB)* | 870 / 1085 MB | 1757 / 2077 MB |
 | **CPU under load** | 1.24 cores | 1.49 cores | 0.83 cores |
 | **throughput per GB-RAM** | **7,492 MB/s/GB** | 60 | 30 |
 
-**RAM is the blowout — datarail uses 124× less than Kafka, 251× less than Pulsar at the SAME throughput.**
+**RAM is the blowout — datarail uses far less (this draft's 124× was corrected by the audit to ~40× loaded / ~90× idle; the durable same-work figure is ~67×, Run 11). The direction is the point; the exact multiple is the corrected one above.**
 
 **Honest CPU finding (NOT hidden):** CPU is roughly **at parity** — datarail 1.24 cores vs Kafka 1.49 vs Pulsar
 0.83. datarail's per-message sealing crypto roughly balances against the brokers' log/replication overhead, so
