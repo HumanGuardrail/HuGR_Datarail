@@ -85,15 +85,29 @@ const DRBG_RESEED_EVERY: u64 = 1 << 16;
 struct Drbg {
     seed: [u8; 32],
     draws: u64,
+    /// PID at seed time. A `fork()` / VM-snapshot-restore would clone the DRBG state byte-for-byte and replay
+    /// identical draws → identical `(eph_secret, nonce)` in parent and child → a catastrophic `(data_key, nonce)`
+    /// re-pair under plain GCM. We detect that by the PID changing under us and **reseed from the OS before the
+    /// next draw** — the `reseed-on-fork` gate the construction (`docs/design/03-crypto-construction.md`) mandates
+    /// for the plain-GCM mode. (AUDIT-04: the prior `/dev/urandom`-per-draw design was fork-immune for free; the
+    /// seed-and-stretch DRBG must re-earn that.)
+    pid: u32,
 }
 
 impl Drbg {
     fn seeded() -> Result<Self, TerminalError> {
-        Ok(Self { seed: os_seed_32()?, draws: 0 })
+        Ok(Self { seed: os_seed_32()?, draws: 0, pid: std::process::id() })
     }
 
     fn next_32(&mut self) -> Result<[u8; 32], TerminalError> {
-        if self.draws != 0 && self.draws.is_multiple_of(DRBG_RESEED_EVERY) {
+        // Fork/snapshot detection FIRST (before any key material is produced): a changed PID means our state was
+        // cloned across a fork — reseed with fresh OS entropy so parent and child never share a keystream.
+        let pid = std::process::id();
+        if pid != self.pid {
+            self.seed = os_seed_32()?;
+            self.pid = pid;
+            self.draws = 0;
+        } else if self.draws != 0 && self.draws.is_multiple_of(DRBG_RESEED_EVERY) {
             let fresh = os_seed_32()?;
             self.seed = hmac_blake3(&self.seed, &fresh);
         }
@@ -695,9 +709,11 @@ impl SourceTerminal {
         Ok(cofre)
     }
 
-    /// Draw a fresh random 12-byte nonce from OS entropy. **AUDIT-02 fix:** decoupled from `seq` (which resets
-    /// on `SourceTerminal::new`) so a fork/snapshot entropy replay cannot re-pair `(data_key, nonce)`. With a
-    /// fresh per-cofre data key this is defense-in-depth — one message per key already precludes nonce reuse.
+    /// Draw a fresh 12-byte nonce from the per-thread CSPRNG. Nonce reuse is precluded primarily by the
+    /// **fresh per-cofre data key** (one message per key). Fork/snapshot safety is provided by the DRBG's
+    /// **reseed-on-fork gate** ([`Drbg::next_32`] reseeds when the PID changes) — NOT by this nonce being random,
+    /// since a forked DRBG would replay both the key draw and the nonce draw identically without that gate
+    /// (AUDIT-04 corrected the prior claim that seq-decoupling alone gave fork safety).
     fn fresh_nonce() -> Result<[u8; 12], TerminalError> {
         let r = random_32()?;
         let mut nonce = [0u8; 12];

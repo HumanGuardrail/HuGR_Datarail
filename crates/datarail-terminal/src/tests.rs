@@ -475,3 +475,20 @@ fn drbg_backed_board_still_seals_and_offloads_round_trip() {
     }
     assert_eq!(dst.sink().committed().len(), 200 * recs.len());
 }
+
+#[test]
+fn drbg_reseeds_on_fork_so_parent_and_child_diverge() {
+    // Simulate a fork: a byte-for-byte clone of the DRBG state that then runs under a DIFFERENT pid (as a real
+    // forked child would). WITHOUT the reseed-on-fork gate, parent and child would replay an identical
+    // keystream → identical (eph_secret, nonce) → catastrophic (data_key, nonce) re-pair under plain GCM. The
+    // gate must make them diverge.
+    let mut parent = super::Drbg::seeded().expect("seed");
+    let _ = parent.next_32().expect("advance"); // get past the lazy first draw
+    // The child inherits the EXACT state (the fork clone)…
+    let mut child = super::Drbg { seed: parent.seed, draws: parent.draws, pid: parent.pid };
+    // …but the OS assigns it a different pid; emulate that mismatch (real id() in next_32 won't equal this).
+    child.pid ^= 0xFFFF;
+    let p = parent.next_32().expect("parent draw"); // same pid → normal ratchet
+    let c = child.next_32().expect("child draw"); // pid mismatch → reseed from fresh OS entropy
+    assert_ne!(p, c, "reseed-on-fork gate must make a forked child's keystream diverge from the parent's");
+}
