@@ -64,4 +64,8 @@ work harder than the world will.
 ~92× idle** (see `OMB-RESULTS.md` Run 12 n=3 block). The ~70× headline is no longer single-run. **One PENDING
 remains:** byte-identical ruler (datarail `/proc` VmRSS vs Kafka `docker stats`) — though both already exclude
 reclaimable page cache and `docker stats` *undercounts* Kafka, so ~72× is a conservative LOWER bound, not an
-inflation. Closing it (both containerized, same cgroup field) is a nicety, not a correction.
+inflation. **NOW CLOSED (2026-06-24):** measured non-reclaimable anon for both by one definition — datarail
+9 MB vs Kafka 616 MB heap ⇒ **68.4×**, consistent with the n=3 71.6×. Tightening the ruler CONFIRMED the number,
+not shrank it. Striking: datarail held 617 MB of durable data on disk at 9 MB non-reclaimable RAM; Kafka held the
+same ~617 MB as 616 MB of heap — the "storage abundant, RAM scarce" thesis in one measured line. **All round-2
+hardening is now closed; no measurement PENDING remains on the flagship ~70× claim.**

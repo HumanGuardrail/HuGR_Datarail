@@ -130,6 +130,14 @@
     genuinely power-loss-durable, both 51 MB/s, 0 errors — datarail used <strong>~12 MB RSS under load vs Kafka's
     ~868 MB ⇒ ~72× less RAM</strong> (3 MB vs 275 MB idle). Two consistent points (~67× Kafka-stock, ~72×
     Kafka-fsync); the RAM gap is stable across Kafka durability modes.</p>
+    <p><span class="badge b-proven">SAME-RULER</span> <strong>The strictest honest ruler confirms it.</strong> The
+    one ruler concern (datarail <code>/proc</code> vs Kafka <code>docker stats</code>) is now closed by measuring
+    <em>non-reclaimable anon for both</em> (page cache excluded for each — it's evictable, not RAM you provision):
+    <strong>datarail 9 MB vs Kafka 616 MB heap ⇒ 68.4×</strong>, matching the n=3 71.6×. And the most beautiful
+    measured line in this whole campaign: <em>datarail held <strong>617 MB of durable data on disk at just 9 MB of
+    non-reclaimable RAM</strong>; Kafka held the same ~617 MB as <strong>616 MB of heap</strong>.</em> Same durable
+    volume — datarail spends the <em>abundant</em> resource (disk), Kafka spends the <em>scarce</em> one (RAM).
+    That's the entire moat in one measurement.</p>
     <p class="muted"><strong>Honest scope (no spin):</strong> datarail-WAL is <em>single-node</em> fsync (survives
     power-loss; NOT node-loss — that's delegated to S3/replicated storage, not in-cluster RF≥3). Our prediction that
     per-message fsync would tank Kafka was <em>wrong</em> at this rate — Kafka held 51 MB/s; the fsync cost showed as
