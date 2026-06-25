@@ -117,44 +117,164 @@ fn rotation_and_gc_zero_loss() {
     assert!(remaining <= 2, "fully-acked segments must be GC'd (found {remaining} seg files)");
 }
 
-/// THE masterpiece gate: RSS must NOT grow with stored volume. Store a large number of cofres and assert the
-/// process's resident memory stays flat (Linux `/proc` only; skipped elsewhere).
+/// THE masterpiece gate (de-rigged after the durability audit): RSS must not grow with TOTAL volume across the
+/// FULL send→recv→ack cycle. The previous version only `send`-ed, so it never exercised the read/ack path (which
+/// is where the `inflight`/`seg_inflight` maps live) — the audit correctly called that gate rigged. This drives
+/// the whole pipeline with in-flight bounded to ~1 (ack right after recv) and asserts RSS stays flat as total
+/// stored+drained volume grows. (The SEPARATE cost of a large UN-acked backlog is asserted in the next test —
+/// honestly O(in-flight), not O(1).)
 #[test]
-fn ram_stays_flat_as_stored_volume_grows() {
-    const N: u64 = 100_000;
+fn ram_flat_across_full_send_recv_ack_cycle() {
+    const N: u64 = 60_000;
     let Some(rss0) = rss_kb() else {
         eprintln!("skip: /proc not available (non-Linux)");
         return;
     };
     let dir = temp_dir("ramflat");
-    let mut log = DurableLog::open(&dir).expect("open");
+    // bigger flush threshold so the test isn't dominated by per-record fsyncs
+    let cfg = WalConfig { flush_bytes: 1 << 20, flush_micros: 200_000, segment_bytes: 4 << 20 };
+    let mut log = DurableLog::open_with(&dir, cfg).expect("open");
     let cofre = cofre_seq(0);
     let mut peak = rss0;
     for i in 0..N {
-        // reuse one cofre's bytes (distinct-content isn't the point here; flat RAM is) — send is what matters
         log.send(&cofre).expect("send");
-        if i % 20_000 == 0 {
+        // drain+ack so in-flight stays ~1 — proves total-volume independence, not just write-side.
+        if let Some(c) = log.recv().expect("recv") {
+            log.ack(c.etiqueta.cofre_id).expect("ack");
+        }
+        if i % 10_000 == 0 {
             if let Some(r) = rss_kb() {
                 peak = peak.max(r);
             }
         }
     }
-    log.flush().expect("flush");
     let after = rss_kb().unwrap_or(rss0);
-    let stored = std::fs::read_dir(&dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum::<u64>();
-    eprintln!("stored {} MB across {N} cofres; RSS {rss0}→{after} KB (peak {peak})", stored / (1 << 20));
-    // Allow a generous fixed headroom (buffers + allocator slack), but NOT growth proportional to N.
-    // 100k cofres at the demo payload is tens of MB on disk; if RSS grew with volume it'd be hundreds of MB.
+    eprintln!("full-cycle {N} cofres; RSS {rss0}→{after} KB (peak {peak})");
     assert!(
-        after < rss0 + 64 * 1024,
-        "RSS must stay flat (grew {} KB over baseline {rss0} for {N} cofres — not O(1))",
+        after < rss0 + 32 * 1024 && peak < rss0 + 32 * 1024,
+        "RSS must stay flat across the full cycle (after {after}, peak {peak}, baseline {rss0} — grew {} KB)",
         after.saturating_sub(rss0)
     );
+}
+
+/// HONEST counter-gate: a large UN-acked delivered backlog costs O(in-flight) RAM (the ack-bookkeeping maps),
+/// NOT O(1) and NOT O(total). The audit caught us claiming "independent of in-flight backlog" — it is not. This
+/// asserts the cost is BOUNDED by the in-flight window and RECLAIMED on ack (so it's not a leak).
+#[test]
+fn unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack() {
+    const N: u64 = 80_000;
+    let Some(rss0) = rss_kb() else {
+        eprintln!("skip: /proc not available (non-Linux)");
+        return;
+    };
+    let dir = temp_dir("backlog");
+    let cfg = WalConfig { flush_bytes: 1 << 20, flush_micros: 200_000, segment_bytes: 4 << 20 };
+    let mut log = DurableLog::open_with(&dir, cfg).expect("open");
+    let cofre = cofre_seq(0);
+    for _ in 0..N {
+        log.send(&cofre).expect("send");
+    }
+    log.flush().expect("flush");
+    // Deliver everything WITHOUT acking → inflight maps hold N entries.
+    let mut ids = Vec::new();
+    while let Some(c) = log.recv().expect("recv") {
+        ids.push(c.etiqueta.cofre_id);
+    }
+    assert_eq!(ids.len(), usize::try_from(N).unwrap(), "all delivered");
+    let backlog_rss = rss_kb().unwrap();
+    // Now ack everything → the maps must be released.
+    for id in &ids {
+        log.ack(*id).expect("ack");
+    }
+    let after_ack = rss_kb().unwrap();
+    eprintln!("backlog: rss0 {rss0} → un-acked {backlog_rss} → acked {after_ack} KB");
+    // The point: it is O(in-flight) (grows with the un-acked backlog) and RECLAIMED on ack — not a leak. We do
+    // NOT assert it stays flat under backlog (it doesn't; that's the honest correction).
+    assert!(
+        after_ack < backlog_rss.saturating_sub((backlog_rss - rss0) / 2).max(rss0),
+        "acking a full backlog must reclaim most of the in-flight bookkeeping (un-acked {backlog_rss}, acked {after_ack})"
+    );
+}
+
+/// REGRESSION GATE for the audit's total-loss bug: a lost cursor checkpoint combined with GC of early segments
+/// must NOT lose the un-acked tail. recv must skip forward over the GC'd/missing segments and recover them.
+#[test]
+fn lost_cursor_plus_gc_still_recovers_unacked_tail() {
+    const N: u64 = 1200;
+    let dir = temp_dir("lostcursor");
+    let cfg = WalConfig { flush_bytes: 2048, flush_micros: 1, segment_bytes: 8 * 1024 };
+    {
+        let mut log = DurableLog::open_with(&dir, cfg).expect("open");
+        for seq in 0..N {
+            log.send(&cofre_seq(seq)).expect("send");
+        }
+        log.flush().expect("flush");
+        // ack the first half → GC deletes the early segments
+        for _ in 0..(N / 2) {
+            let c = log.recv().expect("recv").expect("some");
+            log.ack(c.etiqueta.cofre_id).expect("ack");
+        }
+    }
+    // Simulate a LOST cursor checkpoint (crash before the cursor rename was durable) while early segments are GC'd.
+    let _ = std::fs::remove_file(dir.join("cursor"));
+    let mut reopened = DurableLog::open_with(&dir, cfg).expect("reopen");
+    let mut got = Vec::new();
+    while let Some(c) = reopened.recv().expect("recv") {
+        let id = c.etiqueta.cofre_id;
+        got.push(c.etiqueta.seq);
+        reopened.ack(id).expect("ack");
+    }
+    // The un-acked tail (the second half) MUST be recovered — not 0 (the bug). Duplicates of the first half are
+    // fine (at-least-once → deduped downstream); the requirement is no LOSS of the un-acked tail.
+    for seq in (N / 2)..N {
+        assert!(got.contains(&seq), "un-acked cofre seq {seq} was LOST after lost-cursor+GC (the total-loss bug)");
+    }
+}
+
+/// REGRESSION GATE: a corrupt frame in a SEALED (non-active) segment must ERROR, not silently skip it plus the
+/// rest of the segment (the audit's "lost 13 not 1" finding).
+#[test]
+fn corrupt_interior_frame_in_sealed_segment_errors() {
+    const N: u64 = 400;
+    let dir = temp_dir("corrupt");
+    let cfg = WalConfig { flush_bytes: 2048, flush_micros: 1, segment_bytes: 8 * 1024 };
+    {
+        let mut log = DurableLog::open_with(&dir, cfg).expect("open");
+        for seq in 0..N {
+            log.send(&cofre_seq(seq)).expect("send");
+        }
+        log.flush().expect("flush");
+    }
+    // Corrupt a byte well inside the FIRST (sealed, non-active) segment.
+    let mut segs: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "seg"))
+        .collect();
+    segs.sort();
+    let first = &segs[0];
+    let mut data = std::fs::read(first).unwrap();
+    let mid = data.len() / 2;
+    data[mid] ^= 0xFF; // flip a byte inside a committed frame
+    std::fs::write(first, &data).unwrap();
+
+    let mut reopened = DurableLog::open_with(&dir, cfg).expect("reopen");
+    // Draining must hit the corruption and ERROR (not silently skip the rest of the sealed segment).
+    let mut errored = false;
+    loop {
+        match reopened.recv() {
+            Ok(Some(c)) => {
+                let _ = reopened.ack(c.etiqueta.cofre_id);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    assert!(errored, "corruption inside a sealed segment must surface as an error, not be silently swallowed");
 }
 
 fn rss_kb() -> Option<u64> {

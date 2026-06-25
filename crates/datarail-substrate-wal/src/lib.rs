@@ -96,10 +96,11 @@ const CRC32_TABLE: [u32; 256] = {
     table
 };
 
-fn crc32(bytes: &[u8]) -> u32 {
+/// CRC-32 over two concatenated slices (the frame's length prefix and its body), one pass.
+fn crc32_2(a: &[u8], b: &[u8]) -> u32 {
     let mut c = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        c = CRC32_TABLE[((c ^ u32::from(b)) & 0xFF) as usize] ^ (c >> 8);
+    for &x in a.iter().chain(b) {
+        c = CRC32_TABLE[((c ^ u32::from(x)) & 0xFF) as usize] ^ (c >> 8);
     }
     c ^ 0xFFFF_FFFF
 }
@@ -145,6 +146,7 @@ impl DurableLog {
         let path = seg_path(&dir, active_id);
         let mut active =
             OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
+        fsync_dir(&dir)?; // the active segment's dir-entry must be durable
         // Recovery: scan the active segment, truncate any torn tail to the last intact frame.
         let write_off = recover_segment_end(&mut active)?;
         active.set_len(write_off)?;
@@ -172,8 +174,10 @@ impl DurableLog {
             return Err(WalError::Codec("cofre exceeds MAX_COFRE_WIRE_LEN".into()));
         }
         let len = u32::try_from(bytes.len()).map_err(|_| WalError::Codec("len overflow".into()))?;
-        let crc = crc32(&bytes);
-        self.buf.extend_from_slice(&len.to_be_bytes());
+        // CRC covers the length prefix AND the body (per DURABLE-LOG.md) — so a corrupted *length* is caught.
+        let lenb = len.to_be_bytes();
+        let crc = crc32_2(&lenb, &bytes);
+        self.buf.extend_from_slice(&lenb);
         self.buf.extend_from_slice(&bytes);
         self.buf.extend_from_slice(&crc.to_be_bytes());
         if self.buf.len() >= self.cfg.flush_bytes
@@ -192,7 +196,11 @@ impl DurableLog {
     pub fn flush(&mut self) -> Result<(), WalError> {
         if !self.buf.is_empty() {
             self.active.write_all(&self.buf)?;
-            self.active.sync_data()?; // ← Kafka acks=all equivalent: bytes are on stable storage.
+            // sync_all (not sync_data) so the inode metadata is durable too. NOTE: std `fsync` flushes to the
+            // device but does NOT issue a drive-cache barrier on macOS (needs F_FULLFSYNC, unavailable in safe
+            // std) — true power-loss durability holds on Linux/ext4/xfs with write barriers, not on the macOS
+            // dev box or a no-barrier container FS. See DURABLE-LOG.md "durability boundary".
+            self.active.sync_all()?;
             self.write_off += self.buf.len() as u64;
             self.buf.clear();
             if self.write_off >= self.cfg.segment_bytes {
@@ -203,17 +211,21 @@ impl DurableLog {
         Ok(())
     }
 
-    /// Start a fresh, pre-sized segment file (pre-allocation avoids per-append metadata fsync churn).
+    /// Start a fresh segment file. The new file's dir-entry is made durable by fsync'ing the directory, so a
+    /// power-loss can't leave fsync'd segment data unreachable because its name never hit the directory.
     fn rotate(&mut self) -> Result<(), WalError> {
         self.active_id += 1;
         let path = seg_path(&self.dir, self.active_id);
         let active = OpenOptions::new().create(true).read(true).write(true).truncate(true).open(&path)?;
+        fsync_dir(&self.dir)?;
         self.active = active;
         self.write_off = 0;
         Ok(())
     }
 
-    /// Persist the read/ack cursors durably (write-tmp + fsync + rename = atomic checkpoint).
+    /// Persist the read/ack cursors durably (write-tmp + fsync + rename + **dir fsync** = a truly atomic,
+    /// crash-safe checkpoint — without the directory fsync the rename itself can be lost on power-loss, which is
+    /// what caused the GC-vs-lost-cursor total-loss bug).
     fn checkpoint(&mut self) -> Result<(), WalError> {
         let ack_floor = self.ack_floor();
         let tmp = self.dir.join("cursor.tmp");
@@ -224,8 +236,9 @@ impl DurableLog {
         rec.extend_from_slice(&ack_floor.0.to_be_bytes());
         rec.extend_from_slice(&ack_floor.1.to_be_bytes());
         f.write_all(&rec)?;
-        f.sync_data()?;
+        f.sync_all()?;
         std::fs::rename(&tmp, self.dir.join("cursor"))?;
+        fsync_dir(&self.dir)?;
         Ok(())
     }
 
@@ -268,9 +281,17 @@ impl Substrate for DurableLog {
                 self.flush()?;
             }
             if !self.ensure_read_file()? {
+                // The segment at `read_id` is missing (GC'd, or a lost cursor pointed below the live range).
+                // Skip FORWARD to the next segment rather than stopping — returning None here would permanently
+                // hide every surviving un-acked cofre in later segments (the GC+lost-cursor total-loss bug).
+                if self.read_id < self.active_id {
+                    self.read_id += 1;
+                    self.read_off = 0;
+                    continue;
+                }
                 return Ok(None);
             }
-            let frame = read_frame(self.read_file.as_mut().expect("read_file set above"))?;
+            let frame = read_frame(self.read_file.as_mut().expect("read_file set above"), self.read_id == self.active_id)?;
             match frame {
                 FrameRead::Cofre { bytes, advance } => {
                     let cofre = datarail_cofre::decode(&bytes).map_err(|e| WalError::Codec(e.to_string()))?;
@@ -300,18 +321,27 @@ impl Substrate for DurableLog {
                 *n = n.saturating_sub(1);
             }
         }
-        // GC: delete fully-read segments with zero in-flight cofres (everything in them is acked).
+        // CRASH-SAFE GC ORDER: durably checkpoint the advanced cursor FIRST, THEN delete segments. If we deleted
+        // first and crashed before the cursor was durable, recovery would point at a deleted segment — the
+        // total-loss bug. (recv's skip-forward is the additional safety net if a delete still races a stale
+        // cursor.) The dir fsync in checkpoint() makes the cursor rename itself durable.
+        self.checkpoint()?;
         let floor = self.ack_floor().0;
         let mut s = 1u64;
+        let mut deleted = false;
         while s < floor && s < self.read_id {
             let p = seg_path(&self.dir, s);
             if p.exists() {
                 std::fs::remove_file(&p).ok();
+                deleted = true;
             }
             self.seg_inflight.remove(&s);
             s += 1;
         }
-        self.checkpoint()
+        if deleted {
+            fsync_dir(&self.dir)?; // make the unlinks durable
+        }
+        Ok(())
     }
 }
 
@@ -326,6 +356,19 @@ impl Drop for DurableLog {
 
 fn seg_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:012}.seg"))
+}
+
+/// fsync a directory so a create/rename/unlink of its entries is durable (Unix semantics). Best-effort: some
+/// filesystems return `EINVAL` for a directory fsync — that's tolerated (durability there relies on the FS's
+/// own ordering), but a failure to OPEN the directory is a real error.
+fn fsync_dir(dir: &Path) -> Result<(), WalError> {
+    match File::open(dir) {
+        Ok(f) => {
+            let _ = f.sync_all(); // ignore EINVAL on FSes without dir-fsync; succeeds on ext4/xfs where it matters
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Highest existing segment id in `dir` (none ⇒ fresh log).
@@ -357,13 +400,14 @@ fn load_cursor(dir: &Path) -> (u64, u64, u64, u64) {
     }
 }
 
-/// Scan a segment from the start, returning the byte offset just past the last **intact** (CRC-valid) frame.
-/// A torn tail (interrupted write) stops the scan — those bytes are truncated by the caller.
+/// Scan the **active** segment from the start, returning the byte offset just past the last intact (CRC-valid)
+/// frame. A torn tail (interrupted write) stops the scan — those bytes are truncated by the caller. `active=true`
+/// because only the segment being written may legitimately have a torn tail.
 fn recover_segment_end(file: &mut File) -> Result<u64, WalError> {
     file.seek(SeekFrom::Start(0))?;
     let mut off = 0u64;
     loop {
-        match read_frame(file)? {
+        match read_frame(file, true)? {
             FrameRead::Cofre { advance, .. } => off += advance,
             FrameRead::Eof => return Ok(off),
         }
@@ -375,29 +419,40 @@ enum FrameRead {
     Eof,
 }
 
-/// Read one `[u32 len][bytes][u32 crc]` frame. A clean EOF or any short/torn/invalid read returns `Eof`
-/// (the recoverable boundary); a length over `MAX_COFRE_WIRE_LEN` is treated as a torn tail, not an error.
-fn read_frame(file: &mut File) -> Result<FrameRead, WalError> {
+/// Read one `[u32 len][bytes][u32 crc]` frame; the CRC covers `len‖bytes`.
+///
+/// `active` distinguishes the segment currently being appended (where a partial/torn tail is EXPECTED — a power
+/// loss mid-write — and is reported as `Eof` so the caller truncates) from a SEALED segment (which must be
+/// internally complete: a short read or CRC mismatch there is real **corruption** and is returned as an error,
+/// NOT silently skipped — silently skipping a corrupt interior frame would drop every intact cofre after it).
+fn read_frame(file: &mut File, active: bool) -> Result<FrameRead, WalError> {
+    let corrupt = |what: &str| -> Result<FrameRead, WalError> {
+        if active {
+            Ok(FrameRead::Eof) // torn tail of the live segment — truncate
+        } else {
+            Err(WalError::Corrupt(format!("sealed segment: {what}")))
+        }
+    };
     let mut lenb = [0u8; 4];
     match file.read_exact(&mut lenb) {
         Ok(()) => {}
-        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(FrameRead::Eof),
+        Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(FrameRead::Eof), // clean EOF
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_be_bytes(lenb) as usize;
     if len == 0 || len > MAX_COFRE_WIRE_LEN {
-        return Ok(FrameRead::Eof); // torn / not-yet-written tail
+        return corrupt("invalid frame length");
     }
     let mut bytes = vec![0u8; len];
     if file.read_exact(&mut bytes).is_err() {
-        return Ok(FrameRead::Eof);
+        return corrupt("truncated body");
     }
     let mut crcb = [0u8; 4];
     if file.read_exact(&mut crcb).is_err() {
-        return Ok(FrameRead::Eof);
+        return corrupt("truncated crc");
     }
-    if u32::from_be_bytes(crcb) != crc32(&bytes) {
-        return Ok(FrameRead::Eof); // torn write detected
+    if u32::from_be_bytes(crcb) != crc32_2(&lenb, &bytes) {
+        return corrupt("crc mismatch");
     }
     let advance = (FRAME_OVERHEAD + len) as u64;
     Ok(FrameRead::Cofre { bytes, advance })

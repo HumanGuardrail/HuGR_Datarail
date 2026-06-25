@@ -1,4 +1,4 @@
-# DURABLE-LOG — the masterpiece: Kafka-grade durability at O(1) RAM
+# DURABLE-LOG — fsync-durable, single-node WAL at O(1)-on-total-volume RAM
 
 > Goal (owner, 2026-06-24): a durable substrate that is **fsync-durable (survives power-loss, like Kafka
 > acks=all), adds ~0 extra memory (RAM flat regardless of stored/in-flight volume), is seamless (drop-in
@@ -35,13 +35,11 @@ pressure. So: **durability on disk (abundant) + RAM = two fixed buffers + O(1) c
 fsync per message. A flush is triggered by EITHER a byte threshold (buffer ≥ `FLUSH_BYTES`, e.g. 1 MiB) OR a
 time window (`FLUSH_MICROS`, e.g. 1000 µs) — whichever first. `flush()`:
 1. `write_all(buf)` to the active segment (one `write(2)`),
-2. **`file.sync_data()`** ← the durability point (Kafka `acks=all` equivalent),
+2. **`file.sync_all()`** ← the durability point (an fsync; on Linux+barriers this is on stable storage — see the durability boundary below),
 3. advance the durable write offset; **clear (not free) the buffer**,
-4. rotate to a new pre-allocated segment if over `SEGMENT_BYTES`.
+4. rotate to a new segment (its dir-entry fsync'd) if over `SEGMENT_BYTES`.
 
-**One fsync amortized over a whole batch of cofres** = Kafka-grade durability at high throughput (this is exactly
-group commit, as databases and Kafka's own log do). The producer ack fires after step 2 (durable), not on
-enqueue.
+**One fsync amortized over a whole batch of cofres** = group-commit durability at high throughput (as databases and Kafka's own log do). At the SUBSTRATE layer the cofre is durable after step 2. **End-to-end through the OMB shim, however, the producer is acked earlier — at the ingress→worker handoff (acks=1), before the seal+fsync** — so the strong end-to-end guarantee is acks=1; the WAL provides acks=all-grade durability at the substrate, not (yet) end-to-end.
 
 ### Read path — O(1) sequential cursor, no id-set
 `recv()` reads the next frame at `read_off` from disk (`read_exact` into a reused read buffer), verifies the
@@ -66,15 +64,12 @@ existing resumable-socket path already proves.
 
 ## The RAM invariant (the masterpiece guarantee — must be TESTED, not asserted)
 Process RSS attributable to the substrate = `write_buf cap + read_buf cap + ~3 file handles + fixed cursor
-struct` ≈ **a couple of MiB, FLAT** — independent of (a) total bytes stored, (b) number of cofres, (c) in-flight
-backlog. Storing 1 TB across 10^9 cofres uses the **same** RAM as storing 1 MB. **Verification (gate): store N→∞
-cofres, assert RSS does not grow** (the `store-bench`/a dedicated test, on Linux `/proc`, sampled across the
-run). This is the "0 extra memory overhead" requirement, made falsifiable.
+struct` ≈ **a couple of MiB, FLAT** — independent of (a) total bytes stored and (b) number of cofres. Storing 1 TB across 10^9 cofres uses the **same** RAM as storing 1 MB. **HONEST CAVEAT (durability audit):** the ack-side bookkeeping (`inflight`/`seg_inflight` maps, for ack-by-id → GC) is **O(in-flight, delivered-but-un-acked window)** — NOT O(1) and NOT O(total). It is bounded by consumer lag (small for a draining consumer) and is RECLAIMED on ack. **Verification (gates):** `ram_flat_across_full_send_recv_ack_cycle` (total-volume independence over the FULL cycle, not just send) + `unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack` (the honest O(in-flight) cost). The earlier send-only gate was rigged and is replaced.
 
 ## Performance levers (warp speed under load)
 1. **Group-commit fsync** — amortize the ~ms fsync over a batch ⇒ throughput is bounded by sequential write
    bandwidth, not fsync latency.
-2. **Pre-allocate segments** (`set_len`/`fallocate`) — avoid per-append metadata fsync churn.
+2. **Directory fsync** on segment create/rotate and after the cursor rename — so a create/rename is crash-safe (without it, power-loss can lose a fsync'd segment's dir-entry). (Pre-allocation via `fallocate` is a possible future nicety; not currently implemented.)
 3. **Zero per-message allocation** — reused write/read buffers; frame in place.
 4. **Hot-path RNG fix (separate, but multiplies this):** `random_32` currently `open("/dev/urandom")` **2× per
    cofre**, which *serializes across threads* on the kernel entropy path (audit Agent 4). Replace with a
@@ -90,3 +85,14 @@ run). This is the "0 extra memory overhead" requirement, made falsifiable.
 - The fair comparison is **datarail-WAL-durable vs Kafka-acks=all**, both measured with the **same ruler** (both
   containerized, cgroup `memory.current` *including* page cache, peak+avg, post-warm-up). Only then does a
   "durable AND ~Nx leaner" number get claimed.
+
+## Durability boundary (honest — durability audit 2026-06-24)
+- Uses std `File::sync_all` (fsync). On **Linux + ext4/xfs with write barriers** this is true power-loss
+  durability. On **macOS** std fsync does NOT flush the drive write-cache (that needs `F_FULLFSYNC`, unavailable
+  in safe std) — so the dev laptop is NOT a power-loss-durability environment. On a **no-barrier container FS**
+  (overlayfs/tmpfs) fsync may not survive host power-loss either. Claim precisely: "fsync-durable on
+  Linux/ext4+barriers", not "power-loss-safe everywhere".
+- **Single-node only.** No replication (RF=1). Survives a *process* crash and (on a barrier'd FS) a *power*
+  loss, but NOT disk/node loss. "Kafka-grade" in the RF≥3 sense is NOT claimed.
+- Recovery scans the active segment for a torn tail (truncates it); a CRC failure inside a SEALED segment is a
+  hard error (not silently skipped). A lost cursor + GC is survived by recv's skip-forward over missing segments.
