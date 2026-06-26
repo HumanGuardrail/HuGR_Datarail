@@ -88,6 +88,27 @@ VAES hardware** — the symmetric ceiling clears it by **~5–10×**. (The one-o
 > revised, or the per-cofre crypto is restructured (e.g. amortize the wrap/sign over larger batches). **Status:
 > RED / FAILS.** BACKED (CI, committed `loadgen.yml` th=1).
 
+### Batch-amortization curve (th=1, 16 KiB, VAES, CI 2026-06-26) — the bottleneck is PER-RECORD, not per-cofre
+
+| batch | MB/s/core | vs 1 GiB/s target |
+|---|---|---|
+| 128 | 134 | 13% |
+| 512 | 134 | 13% |
+| 2048 | 125 | 12% |
+| 8192 | 125 | 12% |
+
+**Measured truth — increasing the batch 64× does NOT raise per-core throughput (it slightly drops).** This
+**refutes "GATE-WARP is fixable by bigger batches"** and refines the earlier "asymmetric-crypto-bound" diagnosis:
+- The per-cofre **X25519 wrap + Ed25519 sign DO amortize** (that's why the curve is flat — they vanish per-record
+  at batch≥128). At batch=1 they dominate a single `board()`; at realistic batches they're negligible.
+- The real per-core ceiling (~125–134 MB/s) is set by **PER-RECORD work that does NOT amortize**: the
+  effectively-once **dedup-index admit + commit + per-record framing/copy** on the offload side.
+- **Conclusion:** GATE-WARP's **1 GiB/s/core target is unreachable by batching**. To approach it would require
+  optimizing the **per-record hot path** (dedup lookup + commit), or **revising the target** (it was set assuming
+  the AEAD/crypto would dominate; measurement shows the per-record datapath does). The **aggregate** ceiling is
+  healthy (~2.3 GB/s on 32 cores) and the product is not throughput-limited at any tested workload — so this is a
+  gate-target question, not a product blocker. **GATE-WARP stays RED; the actionable fix is per-record, not crypto.**
+
 ### (historical) the deleted-job "PASS" below measured the AEAD primitive, not the gate's datapath
 
 > **Lastro flag (2026-06-26):** the numbers below are a **single (n=1)** run on a one-off Northflank VAES core
