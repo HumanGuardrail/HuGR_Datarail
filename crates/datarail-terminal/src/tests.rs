@@ -438,11 +438,10 @@ mod prop {
 // ---- CSPRNG (per-thread forward-secure DRBG) sanity — AUDIT-04 perf fix must not weaken randomness ----
 
 #[test]
-fn drbg_outputs_are_distinct_across_many_draws_and_reseed() {
+fn drbg_outputs_are_distinct_across_many_draws() {
     use std::collections::HashSet;
-    // Draw well past the reseed boundary; every 32-byte output must be unique (a repeat would betray a broken
-    // PRF/counter). This exercises the ratchet AND the periodic OS reseed path.
-    let n = usize::try_from(super::DRBG_RESEED_EVERY).unwrap() + 5000;
+    // Every 32-byte output must be unique across a large run (a repeat would betray a broken PRF/entropy mix).
+    let n = 70_000usize;
     let mut seen = HashSet::with_capacity(n);
     for _ in 0..n {
         let r = super::random_32().expect("drbg draw");
@@ -477,18 +476,19 @@ fn drbg_backed_board_still_seals_and_offloads_round_trip() {
 }
 
 #[test]
-fn drbg_reseeds_on_fork_so_parent_and_child_diverge() {
-    // Simulate a fork: a byte-for-byte clone of the DRBG state that then runs under a DIFFERENT pid (as a real
-    // forked child would). WITHOUT the reseed-on-fork gate, parent and child would replay an identical
-    // keystream → identical (eph_secret, nonce) → catastrophic (data_key, nonce) re-pair under plain GCM. The
-    // gate must make them diverge.
-    let mut parent = super::Drbg::seeded().expect("seed");
-    let _ = parent.next_32().expect("advance"); // get past the lazy first draw
-    // The child inherits the EXACT state (the fork clone)…
-    let mut child = super::Drbg { seed: parent.seed, draws: parent.draws, pid: parent.pid };
-    // …but the OS assigns it a different pid; emulate that mismatch (real id() in next_32 won't equal this).
-    child.pid ^= 0xFFFF;
-    let p = parent.next_32().expect("parent draw"); // same pid → normal ratchet
-    let c = child.next_32().expect("child draw"); // pid mismatch → reseed from fresh OS entropy
-    assert_ne!(p, c, "reseed-on-fork gate must make a forked child's keystream diverge from the parent's");
+fn drbg_identical_state_clones_diverge_every_draw() {
+    // AUDIT-05: a VM-snapshot / CRIU / paused-VM clone preserves the PID *and* the DRBG state byte-for-byte —
+    // the exact case the old PID-based reseed gate missed. Construct two DRBGs with the IDENTICAL seed (a perfect
+    // clone) and assert their draws DIFFER every time: because each draw mixes fresh OS entropy, the clones can
+    // never replay an identical (eph_secret, nonce) → no catastrophic (data_key, nonce) re-pair under plain GCM.
+    let seed = super::os_seed_32().expect("seed");
+    let mut original = super::Drbg { seed };
+    let mut clone = super::Drbg { seed }; // byte-identical clone — same seed, same (preserved) PID
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1000 {
+        let from_original = original.next_32().expect("original draw");
+        let from_clone = clone.next_32().expect("clone draw");
+        assert_ne!(from_original, from_clone, "identical-state clones must diverge every draw (snapshot immunity)");
+        assert!(seen.insert(from_original) && seen.insert(from_clone), "no repeated output across clones");
+    }
 }

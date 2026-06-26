@@ -72,48 +72,32 @@ fn os_seed_32() -> Result<[u8; 32], TerminalError> {
 }
 
 /// Draws between fresh OS reseeds (prediction resistance / recovery from a state compromise).
-const DRBG_RESEED_EVERY: u64 = 1 << 16;
-
 /// A per-thread, **forward-secure** CSPRNG for per-cofre ephemeral keys + nonces.
 ///
-/// Construction: a BLAKE3-keyed-PRF DRBG (BLAKE3's keyed mode is a secure PRF / MAC). Seeded once from the OS;
-/// each draw emits `PRF(seed, "output")` and then **ratchets** `seed ← PRF(seed, "ratchet")`. Ratcheting gives
-/// forward secrecy — a state compromise cannot recover the per-cofre keys already used (and zeroized). Every
-/// [`DRBG_RESEED_EVERY`] draws it mixes fresh OS entropy for prediction resistance. This is the standard
-/// seed-once-and-stretch design (what `rand::thread_rng` does), is cryptographically sound for X25519 ephemeral
-/// secrets + AEAD nonces, and uses only `blake3` (already a dependency) — Charter *leveza* preserved.
+/// Construction: a BLAKE3-keyed-PRF over a secret ratcheting seed that **mixes fresh OS entropy into every
+/// draw**. Each draw reads 32 fresh OS bytes and emits `out = PRF(seed, os_fresh)`, then ratchets the seed via
+/// `seed = PRF(seed, "ratchet")`. Clone/snapshot immunity (AUDIT-05 fix): because every draw depends on fresh OS
+/// entropy obtained AFTER any fork / VM-snapshot-restore / CRIU / paused-VM clone, two clones that preserve the
+/// PID and the DRBG state still draw DIFFERENT OS bytes and never re-emit an identical `(eph_secret, nonce)` —
+/// the prior design keyed clone-detection on the PID, which is invariant across snapshot-restore, so that hole
+/// is now closed by construction, not by detection. Forward secrecy: the ratcheting seed means a state
+/// compromise cannot recover already-used (zeroized) keys. The per-draw OS read is negligible beside the
+/// per-cofre X25519/Ed25519 work, and the secret seed is defense-in-depth if the OS RNG momentarily degrades.
 struct Drbg {
     seed: [u8; 32],
-    draws: u64,
-    /// PID at seed time. A `fork()` / VM-snapshot-restore would clone the DRBG state byte-for-byte and replay
-    /// identical draws → identical `(eph_secret, nonce)` in parent and child → a catastrophic `(data_key, nonce)`
-    /// re-pair under plain GCM. We detect that by the PID changing under us and **reseed from the OS before the
-    /// next draw** — the `reseed-on-fork` gate the construction (`docs/design/03-crypto-construction.md`) mandates
-    /// for the plain-GCM mode. (AUDIT-04: the prior `/dev/urandom`-per-draw design was fork-immune for free; the
-    /// seed-and-stretch DRBG must re-earn that.)
-    pid: u32,
 }
 
 impl Drbg {
     fn seeded() -> Result<Self, TerminalError> {
-        Ok(Self { seed: os_seed_32()?, draws: 0, pid: std::process::id() })
+        Ok(Self { seed: os_seed_32()? })
     }
 
     fn next_32(&mut self) -> Result<[u8; 32], TerminalError> {
-        // Fork/snapshot detection FIRST (before any key material is produced): a changed PID means our state was
-        // cloned across a fork — reseed with fresh OS entropy so parent and child never share a keystream.
-        let pid = std::process::id();
-        if pid != self.pid {
-            self.seed = os_seed_32()?;
-            self.pid = pid;
-            self.draws = 0;
-        } else if self.draws != 0 && self.draws.is_multiple_of(DRBG_RESEED_EVERY) {
-            let fresh = os_seed_32()?;
-            self.seed = hmac_blake3(&self.seed, &fresh);
-        }
-        let out = hmac_blake3(&self.seed, b"datarail-drbg-output-v1");
+        // Fresh OS entropy on EVERY draw ⇒ a snapshot/clone (PID + DRBG state preserved) cannot replay key
+        // material: each restored clone reads different OS bytes here. The ratchet keeps forward secrecy.
+        let fresh = os_seed_32()?;
+        let out = hmac_blake3(&self.seed, &fresh);
         self.seed = hmac_blake3(&self.seed, b"datarail-drbg-ratchet-v1");
-        self.draws += 1;
         Ok(out)
     }
 }
