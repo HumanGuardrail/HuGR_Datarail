@@ -323,6 +323,7 @@ dependencies = [
  "datarail-core",
  "datarail-crypto",
  "datarail-identity",
+ "datarail-kafka",
  "datarail-manifest",
  "datarail-rail",
  "datarail-spec",
@@ -367,6 +368,17 @@ name = "datarail-erasure"
 version = "0.0.0"
 
 [[package]]
+name = "datarail-fuzz"
+version = "0.0.0"
+dependencies = [
+ "datarail-blobstore",
+ "datarail-broker",
+ "datarail-erasure",
+ "datarail-netblob",
+ "datarail-replaylog",
+]
+
+[[package]]
 name = "datarail-identity"
 version = "0.0.0"
 dependencies = [
@@ -378,6 +390,10 @@ dependencies = [
  "spake2",
  "subtle",
 ]
+
+[[package]]
+name = "datarail-kafka"
+version = "0.0.0"
 
 [[package]]
 name = "datarail-keyrouter"

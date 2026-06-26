@@ -669,6 +669,16 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   half-built debt. Next increment: handlers + Produce + serve-loop + live-verify, in the iterate-against-a-real-
   -client loop.
 
+- 2026-06-26 — **Kafka wire-compat COMPLETE + PROVEN END-TO-END: an unmodified Kafka producer → sealed → Postgres.**
+  Built the handlers (`ApiVersions` v0/v3, `Metadata` v0/v1, `Produce` v0-7), the v2 `RecordBatch` AND legacy v0/v1
+  `MessageSet` parsers (librdkafka sent legacy magic-0 on the fallback path — caught by COLD LIVE-TESTING against
+  kcat, not assumed), and the serve loop. Wired into the CLI as `datarail kafka-ingest <rail.toml> --advertised H
+  --sink-postgres …` via a streaming `KafkaChannelSource` feeding `run_pipe` (board → seal → offload → sink).
+  **LIVE COLD-VERIFIED (AP-5):** `kcat` (real librdkafka) in docker → datarail kafka-ingest → sealed rail → **4
+  rows landed in real Postgres 16**. The adoption bridge is real: *your Kafka producers, now provider-blind +
+  serverless, no code change.* Zero-dep, forbid(unsafe), clippy clean, 27 unit tests. (Open: consumer-side Fetch
+  API for full read-compat; compression; SCRAM — all next-arc, not needed for produce-ingest.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

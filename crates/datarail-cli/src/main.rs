@@ -47,6 +47,8 @@ USAGE:
     datarail pair --listen ADDR  --code <hex> [--my-static <hex>]    (F3 remote pairing: responder)
     datarail pair --connect ADDR --code <hex> [--my-static <hex>]    (F3 remote pairing: initiator)
     datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]   (cross-process dest)
+    datarail kafka-ingest <rail.toml> [--listen ADDR] [--advertised HOST] [--sink-postgres CONN|--sink-webhook URL|--sink-file F]
+                     a Kafka wire-protocol endpoint: an UNMODIFIED Kafka producer sends -> datarail seals -> sink
     datarail send <rail.toml> --connect ADDR [--source-file F | record ...] (cross-process source)
 
     keygen --noise   mint a Noise_KK static keypair (X25519) for the encrypted hop.
@@ -92,6 +94,7 @@ fn dispatch(args: &[String]) -> Result<String, CliError> {
         "pair" => cmd_pair(rest),
         "send" => cmd_send(rest),
         "recv" => cmd_recv(rest),
+        "kafka-ingest" => cmd_kafka_ingest(rest),
         "help" | "-h" | "--help" => Ok(USAGE.to_owned()),
         other => Err(CliError::UnknownCommand(other.to_owned())),
     }
@@ -670,6 +673,79 @@ impl Pipeline {
 /// With `watch`, a live one-line speedometer (elapsed ms, boarded, committed, dead-lettered, records/sec) is
 /// printed to stdout after every batch and as a final summary. The flag is purely observational — delivery
 /// semantics are byte-for-byte identical with and without it.
+/// A streaming [`Source`] over the Kafka ingest channel: each batch a real Kafka producer sends becomes one rail
+/// batch (its record values), boarded → sealed → offloaded → landed by [`run_pipe`]. Drains until the endpoint stops.
+struct KafkaChannelSource {
+    rx: std::sync::mpsc::Receiver<datarail_kafka::serve::ProducedBatch>,
+}
+
+impl Source for KafkaChannelSource {
+    fn next_batch(&mut self) -> std::io::Result<Option<Vec<Vec<u8>>>> {
+        match self.rx.recv() {
+            Ok((_topic, _partition, values)) => Ok(Some(values)),
+            Err(_) => Ok(None), // the ingest endpoint closed
+        }
+    }
+}
+
+/// `kafka-ingest <rail.toml> [--listen ADDR] [--advertised HOST] [--sink-postgres CONN | --sink-webhook URL | --sink-file F]`
+/// Run a Kafka wire-protocol endpoint: an UNMODIFIED Kafka producer sends records, datarail seals each through the
+/// rail and lands it via the sink (provider-blind, no producer code change). Blocks as a daemon until killed.
+fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
+    let spec = load_spec(require(rest, 0, "rail.toml")?)?;
+    let mut listen = "0.0.0.0:9092".to_owned();
+    let mut advertised = "127.0.0.1".to_owned();
+    let mut sink_pg: Option<String> = None;
+    let mut sink_file: Option<String> = None;
+    let mut sink_webhook: Option<String> = None;
+    let mut i = 1;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--listen" => {
+                listen = require(rest, i + 1, "addr")?.to_string();
+                i += 2;
+            }
+            "--advertised" => {
+                advertised = require(rest, i + 1, "host")?.to_string();
+                i += 2;
+            }
+            "--sink-postgres" => {
+                sink_pg = Some(require(rest, i + 1, "conn")?.to_string());
+                i += 2;
+            }
+            "--sink-file" => {
+                sink_file = Some(require(rest, i + 1, "path")?.to_string());
+                i += 2;
+            }
+            "--sink-webhook" => {
+                sink_webhook = Some(require(rest, i + 1, "url")?.to_string());
+                i += 2;
+            }
+            other => return Err(CliError::Arg(format!("kafka-ingest: unexpected arg `{other}`"))),
+        }
+    }
+    let port: i32 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(9092);
+    let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
+    let (tx, rx) = std::sync::mpsc::channel::<datarail_kafka::serve::ProducedBatch>();
+    let adv = advertised.clone();
+    std::thread::spawn(move || {
+        let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx);
+    });
+
+    let mut sink: Box<dyn Sink> = if let Some(conn) = sink_pg {
+        Box::new(PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?)
+    } else if let Some(url) = sink_webhook {
+        Box::new(WebhookSink::post(&url).map_err(|e| CliError::Io(e.to_string()))?)
+    } else if let Some(path) = sink_file {
+        Box::new(LineFileSink::create(&path).map_err(|e| CliError::Io(e.to_string()))?)
+    } else {
+        Box::new(VecSink::new())
+    };
+    eprintln!("datarail kafka-ingest on {listen} (advertised {advertised}:{port}) -> sealed rail -> sink");
+    let mut source = KafkaChannelSource { rx };
+    run_pipe(&spec, &mut source, sink.as_mut(), false)
+}
+
 fn run_pipe(
     spec: &RailSpec,
     source: &mut dyn Source,
