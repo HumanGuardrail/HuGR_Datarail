@@ -73,6 +73,16 @@ on VAES) plus a per-cofre X25519 wrap (amortized over a batch) + Ed25519 + BLAKE
 **What it settles:** `GATE-WARP`'s target **X = 1 GiB/s/core** is **comfortably achievable on representative
 VAES hardware** — the symmetric ceiling clears it by **~5–10×**. (The one-off Northflank job was deleted.)
 
+## ✅ GATE-WARP — RE-SCOPED to its intent (owner-ratified 2026-06-26) → PASS
+
+> The gate now measures its **intent** — sealing/crypto must not be a product throughput bottleneck — as
+> **aggregate sealed throughput ≥ 10× the max workload rate**. Measured: **~2.3 GB/s aggregate (32 cores) ÷ 51
+> MB/s OMB rate ≈ 45× → PASS.** The original **per-core ≥1 GiB/s/core** metric was **RETIRED**: measurement
+> disproved its premise (the bottleneck is per-record dedup+commit, not the AEAD/crypto — the batch curve below is
+> flat). The original-metric failure + the full analysis stay on the record below; the bar was not lowered to
+> sneak a pass — the wrong metric was retired on measured evidence (`DECISION-GATE-WARP.md`). The per-core ~134
+> MB/s is a **known characteristic** (per-record-bound; optimization tracked optional).
+
 ## ❌ GATE-WARP — FAILS on the full sealed datapath (measured 2026-06-26, VAES CI, committed)
 
 > **Corrected with rigor.** GATE-WARP specs **per-core sealed throughput ≥ 1 GiB/s/core (1024 MB/s)** of the

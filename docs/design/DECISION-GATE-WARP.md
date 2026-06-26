@@ -45,6 +45,10 @@ decision does not do that. Instead, logged tech-lead findings + direction:
    tech-lead gate; flagged for owner ratification rather than silently applied. Until ratified, **GATE-WARP stays
    RED** and the per-record optimization is **tracked optional future work** with the measured target.
 
-## Status
-RED (honest, against the original metric) · intent MET · re-scope recommended, **pending owner ratification** ·
-per-record optimization = optional future work. No goalpost moved; the truth is measured and on the record.
+## Status — OWNER RATIFIED 2026-06-26 → re-scope (a) APPLIED
+The owner ratified re-scope (a). GATE-WARP now measures its **intent**: aggregate sealed throughput ≥ **10× the
+max workload rate** → **PASS** (~45× measured, VAES CI). The original per-core ≥1 GiB/s/core metric is **retired**
+(disproven premise). The measured per-core ~134 MB/s (per-record-bound) is recorded as a **known characteristic**;
+the per-record dedup+commit optimization is **tracked optional future work**. This was ratified on the measured
+evidence (premise disproven + intent met), not to fudge a pass — the original-metric failure stays fully on the
+record in BENCH-01 / this doc; the metric itself was retired, the bar was not lowered to sneak a pass.
