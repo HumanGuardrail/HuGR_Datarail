@@ -29,16 +29,18 @@ def ready():
         try: s.close()
         except OSError: pass
         return False
-times=[]
-for _ in range(trials):
+def one():
     while ready(): time.sleep(0.05)
     t0=time.perf_counter()
     p=subprocess.Popen([BIN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     while not ready() and time.perf_counter()-t0 < 10: time.sleep(0.0005)
-    times.append((time.perf_counter()-t0)*1000)
+    dt=(time.perf_counter()-t0)*1000
     p.send_signal(signal.SIGKILL); p.wait(); time.sleep(0.15)
-times.sort()
-print(f"datarail: median={st.median(times):.0f} ms  min={min(times):.0f}  max={max(times):.0f}  (n={trials})")
+    return dt
+for _ in range(2): one()  # discard warmup (first-spawn page-in)
+times=sorted(one() for _ in range(trials))
+def pct(v,q): return v[min(len(v)-1, int(q*len(v)))]
+print(f"datarail: p50={st.median(times):.0f} ms  p10={pct(times,0.10):.0f}  p90={pct(times,0.90):.0f}  min={min(times):.0f}  max={max(times):.0f}  (n={trials}, warmup-discarded)")
 PY
 
 if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
@@ -66,7 +68,7 @@ for _ in range(trials):
         time.sleep(0.25)
     if ok: ts.append(time.perf_counter()-t0)
     subprocess.run(["docker","rm","-f","cs-kafka"],capture_output=True); time.sleep(1)
-if ts: print(f"kafka: median={st.median(ts):.1f} s  (n={len(ts)})")
+if ts: print(f"kafka: p50={st.median(ts):.1f} s  min={min(ts):.1f}  max={max(ts):.1f}  (n={len(ts)})")
 else:  print("kafka: did not come up within 180s")
 PY
 else

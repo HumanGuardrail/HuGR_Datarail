@@ -1,0 +1,27 @@
+name: Cold-start — datarail vs Kafka time-to-ready (controlled)
+
+# Closes the COLD-START-RESULTS.md PENDING-RIGOR gap: runs the committed cold-start harness on a CLEAN
+# GitHub-hosted runner (no laptop noise) with warmup-discard + percentiles, n large enough for a real
+# distribution. Kafka uses docker (pre-installed on ubuntu runners), measured broker-ready inside the container.
+on:
+  workflow_dispatch:
+    inputs:
+      datarail_trials:
+        description: "datarail spawn→ready trials (warmup-discarded)"
+        default: "30"
+      kafka_trials:
+        description: "Kafka docker-run→broker-ready trials"
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  cold-start:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the cold-start harness (controlled, percentiles)
+        run: |
+          bash bench/cold-start/cold-start.sh "${{ inputs.datarail_trials }}" "${{ inputs.kafka_trials }}" | tee "$GITHUB_STEP_SUMMARY"
