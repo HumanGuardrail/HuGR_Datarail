@@ -1,0 +1,9 @@
+[package]
+name = "datarail-offsets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-offsets — durable consumer-group offset store (Kafka's __consumer_offsets, done leaner): crash-safe commit/fetch."
+[lints]
+workspace = true
+[dependencies]

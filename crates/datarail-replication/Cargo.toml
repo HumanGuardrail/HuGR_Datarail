@@ -1,0 +1,11 @@
+[package]
+name = "datarail-replication"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-replication — erasure-coded replicated durable store: shard a record across a BlobStore, reconstruct on loss (1.5x not 3x)."
+[lints]
+workspace = true
+[dependencies]
+datarail-erasure = { path = "../datarail-erasure" }
+datarail-blobstore = { path = "../datarail-blobstore" }

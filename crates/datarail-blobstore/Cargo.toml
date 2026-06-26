@@ -1,0 +1,9 @@
+[package]
+name = "datarail-blobstore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-blobstore — the BlobStore seam (put/get/list/delete) for the cold tier: in-memory ref + local-fs; S3 is the same trait."
+[lints]
+workspace = true
+[dependencies]
