@@ -67,7 +67,11 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// escaped, the result is always a single path component that can never traverse
 /// out of the store root — this is the security boundary, not a sanity check.
 fn encode_key(key: &str) -> String {
-    let mut out = String::with_capacity(key.len());
+    // Constant 'B' marker prefix (WP6 audit fix): guarantees the encoded name is never EMPTY (so an empty key
+    // maps to "B", not the root dir itself) and never starts with '.' (so it can never collide with a `.tmp.*`
+    // temp file). 'B' is in the verbatim alphanumeric set, so decode just strips one leading 'B'.
+    let mut out = String::with_capacity(key.len() + 1);
+    out.push('B');
     for &b in key.as_bytes() {
         if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' {
             out.push(char::from(b));
@@ -104,6 +108,9 @@ fn hex_value(c: u8) -> Option<u8> {
 /// temp files), so callers can skip non-blob entries safely.
 fn decode_key(name: &str) -> Option<String> {
     let bytes = name.as_bytes();
+    // Must start with the 'B' marker written by `encode_key`; anything else (temp files, foreign files) is not
+    // one of our blobs → None (so `list` skips it).
+    let bytes = bytes.strip_prefix(b"B")?;
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -158,9 +165,16 @@ impl BlobStore for FsBlob {
     fn put(&mut self, key: &str, bytes: &[u8]) -> Result<(), io::Error> {
         let tmp = self.tmp_path();
         fs::write(&tmp, bytes)?;
+        // WP6 audit fix: fsync the bytes BEFORE the rename so a power loss can't leave a present-but-empty blob
+        // (power-durable, not merely crash-atomic — matching the rest of this codebase's durability bar).
+        fs::File::open(&tmp)?.sync_all()?;
         if let Err(e) = fs::rename(&tmp, self.path_for(key)) {
             drop(fs::remove_file(&tmp));
             return Err(e);
+        }
+        // fsync the directory so the rename itself is durable.
+        if let Ok(dir) = fs::File::open(&self.root) {
+            let _ = dir.sync_all();
         }
         Ok(())
     }

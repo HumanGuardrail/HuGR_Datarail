@@ -194,10 +194,12 @@ impl ReplayLog {
     /// **Precondition (WP8 audit honesty):** `start_offset` MUST be a record boundary — a value returned by
     /// [`append`](Self::append), or `0`, or [`end_offset`](Self::end_offset). Only `> end` is *validated*
     /// (→ `BadOffset`); a mis-aligned in-range offset is a caller error that yields an empty/garbage replay, not
-    /// an error. **Known limitation:** a CRC failure in a *non-final* segment (disk rot mid-history) ends the
-    /// replay there rather than resyncing to the next intact segment — corruption is detected (never returns
-    /// wrong bytes), but later intact segments become unreachable via that replay until the segment is repaired.
-    /// A resyncing reader is tracked as future work.
+    /// an error. **Corruption resync:** a bad `len` or CRC failure in a *non-final* segment (disk rot mid-history)
+    /// no longer ends the replay — the reader SKIPS to the start of the next segment and continues, so later
+    /// intact segments stay reachable (records never straddle segments, so every segment boundary is a frame
+    /// boundary; at most the corrupt segment's remaining records are lost, never later ones). Corruption is still
+    /// detected — wrong bytes are never returned. Only a torn tail in the *final* segment stops the replay (clean
+    /// truncation), exactly as before.
     ///
     /// # Errors
     /// [`ReplayError::BadOffset`] if `start_offset` is past the end; [`ReplayError::Io`] on a filesystem error.
@@ -336,6 +338,22 @@ impl Replay {
         Ok(())
     }
 
+    /// A bad frame (oversize `len` or CRC mismatch) was found at logical offset `bad_off`. If a *later* segment
+    /// exists, RESYNC: drop the corrupt segment and reopen the reader at the next segment's start (segment
+    /// boundaries are frame boundaries, so this loses at most the corrupt segment's remaining records, never
+    /// later ones). Returns `Ok(true)` if resynced (caller should keep reading), `Ok(false)` if `bad_off` is in
+    /// the final segment (a torn tail — the caller stops with `Ok(None)`).
+    fn resync_or_stop(&mut self, bad_off: u64) -> Result<bool, ReplayError> {
+        // First segment-start strictly greater than `bad_off` = the start of the next intact segment.
+        let next = self.starts.partition_point(|&s| s <= bad_off);
+        let Some(&start) = self.starts.get(next) else {
+            return Ok(false); // corruption is in the final segment → clean truncation
+        };
+        self.seg_idx = next;
+        self.open_segment(start)?;
+        Ok(true)
+    }
+
     /// The next record, or `None` at the end of the retained log. (Not the `Iterator` trait: this is fallible,
     /// returning `Result<Option<…>>`.)
     ///
@@ -353,7 +371,11 @@ impl Replay {
             let p = self.cursor;
             let len = u32::from_le_bytes([self.buf[p], self.buf[p + 1], self.buf[p + 2], self.buf[p + 3]]) as usize;
             if len > MAX_RECORD {
-                return Ok(None); // corruption / torn tail → end of readable log
+                // Corruption: resync to the next segment if one exists, else (final segment) stop — a torn tail.
+                if self.resync_or_stop(self.buf_base + self.cursor as u64)? {
+                    continue;
+                }
+                return Ok(None);
             }
             let frame = 4 + len + 4;
             if self.buf.len() - self.cursor < frame {
@@ -376,6 +398,10 @@ impl Replay {
                 self.buf[p + 4 + len + 3],
             ]);
             if stored != crc32(&[&self.buf[p..p + 4], body]) {
+                // Corruption: resync to the next segment if one exists, else (final segment) stop — a torn tail.
+                if self.resync_or_stop(offset)? {
+                    continue;
+                }
                 return Ok(None);
             }
             let record = body.to_vec();
@@ -511,6 +537,80 @@ mod tests {
         // The witness: peak buffered RAM is O(read buffer), NOT O(total retained volume).
         assert!(peak <= bound, "peak {peak} exceeded the flat-RAM bound {bound}");
         assert!(total >= 40 * 1024 * 1024, "sanity: retained volume was large ({total} bytes)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WP4 gate: corruption in the MIDDLE of a non-final segment must RESYNC — the replay skips the corrupt
+    /// segment's remaining records but still reaches and yields the records in the later intact segments.
+    #[test]
+    fn corruption_in_a_non_final_segment_resyncs_to_later_segments() {
+        let dir = tmpdir("resync");
+        let n = 2000u32;
+        let mut log = ReplayLog::open(&dir, 4096).expect("open"); // small segments → many of them
+        for i in 0..n {
+            log.append(format!("resync-record-{i:05}").as_bytes()).expect("append");
+        }
+        log.sync().expect("sync");
+
+        // Collect the segment files, sorted by start offset.
+        let mut segs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("seg"))
+            .collect();
+        segs.sort();
+        assert!(segs.len() >= 3, "test needs >=3 segments, got {}", segs.len());
+
+        // Corrupt a body byte in the MIDDLE of a non-final segment so its CRC fails.
+        let victim = &segs[segs.len() / 2];
+        let mut bytes = std::fs::read(victim).expect("read seg");
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(victim, &bytes).expect("write seg");
+
+        // Replay from 0 must resync past the corrupt segment and still deliver the later intact segments.
+        let got = drain(&log, 0);
+        let expected_last = format!("resync-record-{:05}", n - 1).into_bytes();
+        assert_eq!(
+            got.last().expect("replay yielded nothing").1,
+            expected_last,
+            "later intact segments were unreachable — resync did not happen"
+        );
+        // The corrupt segment's tail is dropped, so we never deliver all n records, but we DO reach the end.
+        assert!(got.len() < n as usize, "expected to lose the corrupt segment's tail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A torn tail in the FINAL segment still truncates cleanly (no resync target → stop), unchanged behavior.
+    #[test]
+    fn corruption_in_the_final_segment_truncates_cleanly() {
+        let dir = tmpdir("torntail");
+        let n = 2000u32;
+        let mut log = ReplayLog::open(&dir, 4096).expect("open");
+        for i in 0..n {
+            log.append(format!("tail-record-{i:05}").as_bytes()).expect("append");
+        }
+        log.sync().expect("sync");
+
+        let mut segs: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("seg"))
+            .collect();
+        segs.sort();
+        assert!(segs.len() >= 3, "test needs >=3 segments, got {}", segs.len());
+
+        // Corrupt a body byte in the MIDDLE of the FINAL segment → no later segment → clean truncation.
+        let victim = segs.last().expect("final segment");
+        let mut bytes = std::fs::read(victim).expect("read seg");
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        std::fs::write(victim, &bytes).expect("write seg");
+
+        let got = drain(&log, 0);
+        // Some records survive (everything before the torn tail), but not all — and no error/panic.
+        assert!(!got.is_empty(), "clean records before the tear should still replay");
+        assert!(got.len() < n as usize, "the torn tail should have been truncated");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

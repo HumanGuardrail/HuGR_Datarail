@@ -402,6 +402,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-netblob"
+version = "0.0.0"
+dependencies = [
+ "datarail-blobstore",
+]
+
+[[package]]
 name = "datarail-offsets"
 version = "0.0.0"
 
@@ -439,6 +446,15 @@ dependencies = [
 [[package]]
 name = "datarail-replaylog"
 version = "0.0.0"
+
+[[package]]
+name = "datarail-replicated-topic"
+version = "0.0.0"
+dependencies = [
+ "datarail-blobstore",
+ "datarail-replication",
+ "datarail-topic",
+]
 
 [[package]]
 name = "datarail-replication"

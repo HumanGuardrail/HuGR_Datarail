@@ -45,6 +45,17 @@ impl OffsetStore for MemOffsets {
 
 /// Name of the append-only commit log inside the store directory.
 const LOG_NAME: &str = "offsets.log";
+/// Name of the temp file a compaction snapshot is written to before the
+/// atomic rename. A stale copy (a crash mid-compaction) is removed on open.
+const TMP_NAME: &str = "offsets.log.tmp";
+/// A compaction is never triggered below this many physical records — it keeps
+/// small logs (the common case) from paying any rewrite cost.
+const COMPACT_MIN_RECORDS: usize = 1024;
+/// Above the minimum, compact once the log holds more than this many physical
+/// records per live group. This bounds on-disk size to O(groups): a single
+/// group committed a million times compacts back to one record long before the
+/// log can grow large.
+const COMPACT_GROWTH_FACTOR: usize = 4;
 
 /// Bitwise CRC-32 (IEEE 802.3, reflected) over `bytes` — a std-only integrity
 /// check so a torn write at the log tail is detected on recovery.
@@ -69,10 +80,25 @@ fn crc32(bytes: &[u8]) -> u32 {
 /// committed offset survives a process restart or crash. On [`open`](Self::open)
 /// the log is replayed start-to-finish and the last record per group wins; a
 /// torn or corrupt tail record is discarded, leaving every prior commit intact.
+///
+/// ## Bounded size via compaction
+/// Because the log is append-only and last-write-wins, a group committed N
+/// times leaves N records though only the last matters. To keep on-disk size
+/// O(groups) rather than O(commits), once the log holds more than
+/// [`COMPACT_GROWTH_FACTOR`] physical records per live group (and at least
+/// [`COMPACT_MIN_RECORDS`]) it is *compacted*: a snapshot of one record per
+/// group (the current offset) is written to a temp file, fsync'd, and
+/// atomically renamed over the live log (with a directory fsync so the rename
+/// is durable). Recovery is unaffected — a crash mid-compaction leaves either
+/// the intact old log or the intact new snapshot, never a torn mix, because the
+/// rename is atomic. A stale temp file from such a crash is removed on `open`.
 #[derive(Debug)]
 pub struct FileOffsets {
     file: File,
     map: BTreeMap<String, u64>,
+    dir: PathBuf,
+    /// Count of physical records in the live log (drives the compaction trigger).
+    records: usize,
 }
 
 impl FileOffsets {
@@ -83,26 +109,85 @@ impl FileOffsets {
     /// The directory cannot be created, the log cannot be opened, or an I/O
     /// error occurs while reading the log during recovery.
     pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
+        let dir = dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir)?;
+        // A leftover temp file means a crash before a compaction's rename; the
+        // live log is authoritative, so drop the partial snapshot.
+        let _ = std::fs::remove_file(dir.join(TMP_NAME));
         let path: PathBuf = dir.join(LOG_NAME);
         let mut file = OpenOptions::new().read(true).append(true).create(true).open(path)?;
-        let map = Self::replay(&mut file)?;
-        Ok(Self { file, map })
+        let (map, records) = Self::replay(&mut file)?;
+        Ok(Self { file, map, dir, records })
     }
 
     /// Read the whole log and fold it into the latest-offset-per-group map,
     /// stopping at the first incomplete or CRC-mismatched record (a torn tail).
-    fn replay(file: &mut File) -> io::Result<BTreeMap<String, u64>> {
+    /// Also returns the number of intact physical records replayed.
+    fn replay(file: &mut File) -> io::Result<(BTreeMap<String, u64>, usize)> {
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         let mut map = BTreeMap::new();
         let mut pos = 0usize;
+        let mut records = 0usize;
         while let Some((group, offset, next)) = Self::parse_record(&buf, pos) {
             map.insert(group, offset);
             pos = next;
+            records += 1;
         }
-        Ok(map)
+        Ok((map, records))
+    }
+
+    /// Encode one length-prefixed, CRC-checked record for `group`/`offset`.
+    ///
+    /// # Errors
+    /// The group name exceeds `u32::MAX` bytes.
+    fn encode_record(group: &str, offset: u64) -> io::Result<Vec<u8>> {
+        let group_len = u32::try_from(group.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group name too long"))?;
+        let mut record = Vec::with_capacity(group.len() + 16);
+        record.extend_from_slice(&group_len.to_le_bytes());
+        record.extend_from_slice(group.as_bytes());
+        record.extend_from_slice(&offset.to_le_bytes());
+        let crc = crc32(&record);
+        record.extend_from_slice(&crc.to_le_bytes());
+        Ok(record)
+    }
+
+    /// Compact the log if it has grown past the trigger
+    /// ([`COMPACT_MIN_RECORDS`] records and more than [`COMPACT_GROWTH_FACTOR`]
+    /// records per live group), bounding on-disk size to O(groups).
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        let live = self.map.len().max(1);
+        if self.records < COMPACT_MIN_RECORDS || self.records <= COMPACT_GROWTH_FACTOR * live {
+            return Ok(());
+        }
+        self.compact()
+    }
+
+    /// Rewrite the log as one record per group via temp-file + fsync + atomic
+    /// rename, then continue appending to the fresh file. Crash-safe: until the
+    /// rename completes the old log is untouched, and the rename is atomic, so
+    /// recovery always sees exactly one intact file.
+    fn compact(&mut self) -> io::Result<()> {
+        let tmp_path = self.dir.join(TMP_NAME);
+        let live_path = self.dir.join(LOG_NAME);
+        {
+            let mut tmp =
+                OpenOptions::new().write(true).create(true).truncate(true).open(&tmp_path)?;
+            let mut snapshot = Vec::new();
+            for (group, &offset) in &self.map {
+                snapshot.extend_from_slice(&Self::encode_record(group, offset)?);
+            }
+            tmp.write_all(&snapshot)?;
+            tmp.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &live_path)?;
+        // fsync the directory so the rename itself is durable across a crash.
+        File::open(&self.dir)?.sync_all()?;
+        // The old handle pointed at the now-unlinked inode; reopen the new file.
+        self.file = OpenOptions::new().read(true).append(true).open(&live_path)?;
+        self.records = self.map.len();
+        Ok(())
     }
 
     /// Parse one record starting at `pos`, returning the group, offset, and the
@@ -129,18 +214,12 @@ impl FileOffsets {
 
 impl OffsetStore for FileOffsets {
     fn commit(&mut self, group: &str, offset: u64) -> Result<(), std::io::Error> {
-        let group_len = u32::try_from(group.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "group name too long"))?;
-        let mut record = Vec::with_capacity(group.len() + 16);
-        record.extend_from_slice(&group_len.to_le_bytes());
-        record.extend_from_slice(group.as_bytes());
-        record.extend_from_slice(&offset.to_le_bytes());
-        let crc = crc32(&record);
-        record.extend_from_slice(&crc.to_le_bytes());
+        let record = Self::encode_record(group, offset)?;
         self.file.write_all(&record)?;
         self.file.sync_all()?;
         self.map.insert(group.to_owned(), offset);
-        Ok(())
+        self.records += 1;
+        self.maybe_compact()
     }
     fn fetch(&self, group: &str) -> Option<u64> {
         self.map.get(group).copied()
@@ -228,5 +307,65 @@ mod tests {
         let tmp = TmpDir::new("unknown");
         let store = FileOffsets::open(&tmp.0).expect("open");
         assert_eq!(store.fetch("nope"), None);
+    }
+
+    /// Current on-disk size of the live log.
+    fn log_size(dir: &std::path::Path) -> u64 {
+        std::fs::metadata(dir.join("offsets.log")).map_or(0, |m| m.len())
+    }
+
+    #[test]
+    fn compaction_bounds_disk_size_one_group() {
+        // The same group committed far past the compaction trigger
+        // (COMPACT_MIN_RECORDS = 1024) so ≥2 compactions occur; the final count
+        // lands just past a compaction boundary, leaving a tiny live log. Each
+        // commit fsyncs, so the count is kept modest while still O(commits)
+        // would balloon the file (~40 KB) absent compaction.
+        let tmp = TmpDir::new("compact-bound");
+        let mut store = FileOffsets::open(&tmp.0).expect("open");
+        for i in 0..2_100u64 {
+            store.commit("g", i).expect("commit");
+        }
+        // One group, last-write-wins: the log must stay O(groups), not O(commits).
+        assert!(log_size(&tmp.0) < 4096, "log not compacted: {}", log_size(&tmp.0));
+        assert_eq!(store.fetch("g"), Some(2_099));
+    }
+
+    #[test]
+    fn durable_across_compaction() {
+        let tmp = TmpDir::new("compact-durable");
+        let mut expected = std::collections::BTreeMap::new();
+        {
+            let mut store = FileOffsets::open(&tmp.0).expect("open");
+            // Enough commits across several groups to trigger ≥1 compaction.
+            for i in 0..2_100u64 {
+                let g = format!("group-{}", i % 8);
+                store.commit(&g, i).expect("commit");
+                expected.insert(g, i);
+            }
+        }
+        // Reopen from disk: every group's latest offset must be recovered.
+        let store = FileOffsets::open(&tmp.0).expect("reopen");
+        for (g, want) in &expected {
+            assert_eq!(store.fetch(g), Some(*want));
+        }
+    }
+
+    #[test]
+    fn commits_after_compaction_still_correct() {
+        let tmp = TmpDir::new("compact-then-more");
+        let mut store = FileOffsets::open(&tmp.0).expect("open");
+        for i in 0..1_100u64 {
+            store.commit("x", i).expect("commit"); // crosses the compaction trigger
+        }
+        // Append more, including a new group, after the rewrite.
+        store.commit("x", 123_456).expect("commit");
+        store.commit("y", 7).expect("commit");
+        assert_eq!(store.fetch("x"), Some(123_456));
+        assert_eq!(store.fetch("y"), Some(7));
+        drop(store);
+        let store = FileOffsets::open(&tmp.0).expect("reopen");
+        assert_eq!(store.fetch("x"), Some(123_456));
+        assert_eq!(store.fetch("y"), Some(7));
     }
 }

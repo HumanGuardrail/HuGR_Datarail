@@ -122,12 +122,20 @@ impl Substrate for ObjectStoreSubstrate {
     /// **without reading it** — no per-object RAM is retained. Decodes the wire bytes to return the cofre but
     /// never inspects `carga` (`INV-OPAQUE-CARGO`).
     ///
+    /// **Precondition (WP7 audit C3):** the high-watermark cursor assumes a stream's objects ARRIVE in `seq`
+    /// order (the in-order source the rail provides). A `seq` that appears in the bucket *after* a higher `seq`
+    /// from the same stream was already delivered is treated as already-seen and skipped — fine for the in-order
+    /// rail, but callers feeding a stream out of order must not rely on the late-lower-seq being delivered.
+    ///
     /// # Errors
-    /// [`std::io::Error`] on a read failure, `InvalidData` if a stored object's name is not a store `seq` or if
-    /// its bytes fail to decode.
+    /// [`std::io::Error`] on a read failure (a non-`seq` filename is skipped, not an error — WP7 H1), or
+    /// `InvalidData` if a stored object exceeds the max size or its bytes fail to decode.
     fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
         for path in self.sorted_objects()? {
-            let seq = parse_seq(&path)?;
+            // WP7 audit H1 fix: a `*.cofre` whose name isn't a store seq was never written by this store — SKIP
+            // it, don't abort the whole `recv`. Erroring let one crafted filename from a hostile storage operator
+            // make every legit cofre behind it undeliverable (a one-file DoS).
+            let Ok(seq) = parse_seq(&path) else { continue };
             let stream_dir = path.parent().map(Path::to_path_buf);
             // Forward-cursor dedup: a record is deliverable iff its seq is past its stream's monotonic cursor.
             // Cheap (path-only) skip of already-delivered objects — no read, no retained id.
@@ -166,14 +174,34 @@ impl Substrate for ObjectStoreSubstrate {
     /// [`std::io::Error`] on a delete failure other than "not found".
     fn ack(&mut self, cofre_id: [u8; 32]) -> Result<(), Self::Error> {
         if let Some(path) = self.by_id.remove(&cofre_id) {
+            let stream_dir = path.parent().map(Path::to_path_buf);
             if let Err(e) = std::fs::remove_file(&path) {
                 // A missing object is fine (already collected / idempotent ack); anything else propagates.
                 if e.kind() != std::io::ErrorKind::NotFound {
                     return Err(e);
                 }
             }
+            // WP7 audit C1/C2 fix: when a stream's last object is acked+GC'd, drop its cursor entry (and the now-
+            // empty dir). This makes `cursors` genuinely O(LIVE streams) — not O(every stream ever seen) — and
+            // lets a later reuse of the same stream id start fresh instead of silently skipping its low seqs.
+            if let Some(dir) = stream_dir {
+                if stream_drained(&dir) {
+                    self.cursors.remove(&dir);
+                    let _ = std::fs::remove_dir(&dir);
+                }
+            }
         }
         Ok(())
+    }
+}
+
+/// Whether a stream directory has no remaining `*.cofre` objects (its delivered history is fully GC'd).
+fn stream_drained(dir: &Path) -> bool {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => !entries.flatten().any(|e| {
+            e.path().extension().is_some_and(|x| x == "cofre")
+        }),
+        Err(_) => false,
     }
 }
 
@@ -327,8 +355,10 @@ mod tests {
                 store.bookkeeping_len()
             );
         }
-        // The cursor map is exactly one entry (one stream) after 5000 stored+drained objects — flat in volume.
-        assert_eq!(store.bookkeeping_len(), 1, "one stream ⇒ one cursor entry, regardless of volume");
+        // WP7 audit C1 fix: a FULLY-DRAINED stream reclaims its cursor too — bookkeeping returns to ZERO, not a
+        // lingering per-stream entry. This is the truly-O(live-streams) bound (drained ≠ live), and it refutes the
+        // audit's "cursors never removed" finding directly.
+        assert_eq!(store.bookkeeping_len(), 0, "drained stream ⇒ cursor GC'd too (O(LIVE streams), not lifetime)");
         assert!(store.recv().expect("drain").is_none(), "bucket fully drained");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -354,11 +384,12 @@ mod tests {
         assert_eq!(ids.len(), usize::try_from(N).expect("fits"), "all delivered");
         // 1 stream cursor + N in-flight.
         assert_eq!(store.bookkeeping_len(), 1 + ids.len(), "backlog ⇒ O(in-flight) bookkeeping");
-        // Ack everything → the in-flight map is released back to just the stream cursor.
+        // Ack everything → the in-flight map is released, and the now-fully-drained stream reclaims its cursor
+        // too (WP7 audit C1 fix), so bookkeeping returns to ZERO — O(LIVE streams), and there are none left.
         for id in &ids {
             store.ack(*id).expect("ack");
         }
-        assert_eq!(store.bookkeeping_len(), 1, "ack reclaims the in-flight map — only the cursor remains");
+        assert_eq!(store.bookkeeping_len(), 0, "ack reclaims in-flight AND the drained stream's cursor");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
