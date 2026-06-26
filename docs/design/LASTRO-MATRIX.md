@@ -17,7 +17,7 @@
 
 | Claim | Source | Repro artifact (committed) | Rigor | Verdict |
 |---|---|---|---|---|
-| effectively-once 0-loss/0-dup | DOD-01 AC-4 | `datarail-once/tests/ac4_dst.rs` | 1000 seeds | **BACKED** |
+| effectively-once 0-loss/0-dup **within a process run** | DOD-01 AC-4 | `datarail-once/tests/ac4_dst.rs` | 1000 seeds | **BACKED (in-process)** — NOT across crashes: the dedup index is in-memory + not wired into the broker (`CORE-AUDIT.md` D-3, tracked); the broker is at-least-once across restarts |
 | erasure RS(4,2) every double-loss @ 1.5× | ledger #3 | `datarail-erasure` gates (exhaustive + GF axioms) | exhaustive | **BACKED** |
 | keyrouter even-spread / 0-reshuffle / churn ~1/N | ledger #5,#6 | `datarail-keyrouter` gates | 60–80k keys | **BACKED** |
 | replay flat-RAM (40 MiB, bounded buffer) | ledger #2 | `datarail-replaylog` gate | asserted bound | **BACKED** |
@@ -27,7 +27,7 @@
 | GCM-256 wire-compat KAT | BENCH-01 | `datarail-crypto` KAT | KAT | **BACKED** |
 | all parsers no-panic-on-garbage + roundtrip | — | `datarail-fuzz` (7 gates) | ~millions, deterministic | **BACKED** |
 | restart-resume / shard-loss / remote-tier (system) | INTEGRATION/capstone | `datarail-system/tests/e2e.rs` | asserted | **BACKED** |
-| **no-loss under crash CHAOS** (many random broker crashes) | system | `datarail-system/tests/chaos.rs` | seeded, 2000 records | **BACKED** |
+| **no-loss of acked records across crash** | system + broker | `datarail-system/tests/chaos.rs` (process-kill resume) + broker durability-before-ack (`741b803`) | seeded 2000; fsync-before-ack | **BACKED** — the chaos test models process-kill (page-cache survives); power-loss safety comes from the broker fsync-before-ack fix (`CORE-AUDIT.md` D-1) |
 | **v1 product flow: HTTP API → sealed rail → Postgres** | connectors | `datarail run --source-http --sink-postgres` + `tests/postgres_live.rs` | live docker PG 16 (trust+md5), e2e 3 sealed rows | **BACKED** |
 | **Kafka ingest: unmodified producer → sealed → Postgres** | datarail-kafka | `kafka-ingest.yml` (kcat + PG service) | real librdkafka, e2e 3 sealed rows in CI | **BACKED** |
 | **~72× less RAM @ equal fsync durability, ~92× idle** | OMB Run 12 | `bench/omb/run-omb.sh` + `omb-benchmark.yml` (`kafka_fsync`) | **n=3, σ1.6** | **BACKED** (the headline) |
@@ -39,6 +39,8 @@
 | Run 11 "~67×, 13 MB vs 877 MB" | OMB Run 11 | OMB harness | n=1 (self-stated) | **STALE** → superseded by Run 12 (n=3) |
 | "124× / 7 MB" loaded RAM | OMB Run 10 | OMB harness | single light-load sample | **STALE** → self-corrected to ~40× then n=3 ~72× |
 | "3.4× faster" / 2-core "25×" | DOD-01 AC-10 | none (self-configured Kafka) | retracted | **STALE** → retracted in-doc |
+
+| brutal core audit (seal + once/durability) — findings + dispositions | CORE-AUDIT | `CORE-AUDIT.md` | 2 auditors, PoCs | **BACKED** — provider-blind HOLDS (wire adversary); DRBG clone-reuse FIXED; durability-before-ack FIXED; cross-crash dedup TRACKED |
 
 ## Flagged this pass (2026-06-26) — the cold-start-class soft spots, now corrected
 1. **HTML cold-start** showed `8 ms / MEASURED` contradicting its PENDING-RIGOR source → first re-badged DIRECTIONAL, then **CLOSED**: re-measured on controlled CI (`cold-start.yml`, n=30/5) → datarail p50 **2 ms** (zero spread) vs Kafka **5.1 s**; HTML now shows the BACKED number.

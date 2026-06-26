@@ -692,6 +692,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   `06daccc`. Legit `kcat` produce re-verified post-hardening. No false positives to reject this round (the
   auditors proved the scary lenses safe rather than inventing weak findings).
 
+- 2026-06-26 — **BRUTAL CORE AUDIT (seal + exactly-once/durability) — `CORE-AUDIT.md`; 2 over-claims corrected.**
+  Two hostile auditors hit the pillars. Seal-core VERDICT: provider-blind HOLDS vs the wire adversary (signatures/
+  verify-before-decrypt/key-freshness/panic-safety/constant-time all CONFIRMED) — one real HIGH (DRBG reseed keyed
+  on PID → VM-snapshot/clone replays `(eph_secret,nonce)`) FIXED `675d70d` (mix fresh OS entropy every draw,
+  clone-immune by construction). Durability VERDICT (pre-fix): no-loss + effectively-once did NOT hold across
+  crashes — broker acked produce WITHOUT fsync (CRIT, PROVEN). FIXED `741b803`: durability-before-ack +
+  seq-level dedup (D-4) + commit-offset validation (D-7). **Two over-claims corrected honestly:** (1)
+  effectively-once is in-process only — the dedup index is in-memory + not wired into the broker (D-3, TRACKED;
+  broker is at-least-once across restarts); (2) the chaos test modeled process-kill (page cache survives), not
+  power-loss — power-loss safety now comes from the fsync-before-ack. Tracked gaps (none a wire break): dedup
+  persistence (D-3), sealed-sender epoch (S-2), gap horizon (D-5), offsets dir-fsync (D-6). The methodology worked:
+  scary lenses proven safe, real defects fixed at root or honestly tracked.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
