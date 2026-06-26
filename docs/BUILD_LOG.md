@@ -649,6 +649,14 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   sealed rail (shmem) → Postgres: boarded=3, committed=3, dead-letter=0, 3 sealed rows landed. Wired into the CLI;
   live PG test kept `#[ignore]` (`tests/postgres_live.rs`). The engine is now a product.
 
+- 2026-06-26 — **v1 connector SURFACE complete + `WebhookSink`.** Added a zero-dep HTTP POST sink (NDJSON body,
+  2xx check) over `std::net`, impl `Sink`, 5 unit tests + e2e cold-verified (`datarail run --source-http → sealed
+  rail → --sink-webhook` delivered all records). The v1 connector surface is now **sources: inline/stdin · file ·
+  HTTP** and **sinks: in-memory · file · Postgres · webhook** — all zero-dep, all real. Next big direction:
+  **Kafka wire-compat** (let existing Kafka producers send to datarail unchanged → provider-blind + serverless,
+  no code change) — a dedicated arc (protocol codec → ApiVersions/Metadata → Produce + RecordBatch v2 parser →
+  live-verify vs a real Kafka client).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
