@@ -33,14 +33,22 @@ jobs:
       - name: Install psql client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
 
-      - name: Live PostgresSink — hand-rolled wire protocol vs real Postgres 16 (trust auth)
+      - name: Live PostgresSink + exactly-once (TxnSink) vs real Postgres 16 (trust auth)
         run: |
           psql -h localhost -U postgres -c "CREATE TABLE datarail_events (data text);"
+          psql -h localhost -U postgres -c "CREATE TABLE datarail_eo (data text);"
           DATARAIL_PG_HOST=localhost DATARAIL_PG_PORT=5432 \
             cargo test -p datarail-connectors --test postgres_live -- --ignored --nocapture
           ROWS=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_events;")
           echo "PostgresSink landed rows=$ROWS"
           [ "$ROWS" = "4" ] || { echo "::error::expected 4 rows, got $ROWS"; exit 1; }
+          # Exactly-once: a batch + 3 replays must land EXACTLY 4 rows (a,b,c,d), never 7+.
+          EO=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_eo;")
+          echo "exactly-once rows (after replays) = $EO"
+          [ "$EO" = "4" ] || { echo "::error::exactly-once broken: expected 4 rows after replays, got $EO"; exit 1; }
+          WM=$(psql -h localhost -U postgres -t -A -c "SELECT seq FROM datarail_watermark;")
+          [ "$WM" = "4" ] || { echo "::error::watermark expected 4, got $WM"; exit 1; }
+          echo "## Exactly-once into Postgres ✅ — batch + 3 replays → 4 rows, watermark 4" >> "$GITHUB_STEP_SUMMARY"
 
       - name: End-to-end — datarail run --source-http → sealed rail → --sink-postgres
         run: |
