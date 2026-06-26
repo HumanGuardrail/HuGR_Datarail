@@ -162,10 +162,10 @@
       <tr><th>datarail throughput (1 KB, sealed)</th><th>result</th><th>note</th></tr>
       <tr><td>OMB Java client (its measurement)</td><td class="num">658 MB/s</td><td class="muted">the client was the bottleneck, not datarail</td></tr>
       <tr><td>Native efficient driver, full TCP path</td><td class="num">1,534 MB/s</td><td>~0.96× Kafka — a near-tie</td></tr>
-      <tr><td>Pure sealed engine (no sockets)</td><td class="num win">~1,900 MB/s</td><td>~1.2× Kafka's plaintext — engine wins</td></tr>
+      <tr><td>Pure sealed engine (no sockets, n=3)</td><td class="num">~1,400 MB/s</td><td>~0.87× Kafka's plaintext — a tie, slightly behind @1&nbsp;KB (n=1 "1,900/wins" corrected)</td></tr>
       <tr><td class="muted">Kafka 3.8 (plaintext, same harness)</td><td class="num muted">1,604 MB/s</td><td class="muted">the throughput king's number</td></tr>
     </table>
-    <p><span class="badge b-tie">TIE</span> datarail's <em>sealed</em> engine (~1.9 GB/s) is in Kafka's
+    <p><span class="badge b-tie">TIE</span> datarail's <em>sealed</em> engine (~1.4 GB/s, n=3) is in Kafka's
     <em>plaintext</em> class (1.6 GB/s); the full path is ~parity. <em>Same class, not faster.</em></p>
     <p class="muted"><strong>Audit honesty (Agent 4):</strong> these "1 KB" numbers are <em>128-record-cofre
     batched</em> — the shim packs 128×1 KB records per sealed cofre, amortizing the per-cofre crypto; true
@@ -322,10 +322,10 @@
 
   <h2>🛠️ How it's built (why the above is trustworthy)</h2>
   <div class="panel">
-    <p><strong>20 Rust crates · 160+ tests green (incl. 8 WAL durability gates) · clippy <code>deny(all+pedantic)</code> clean ·
+    <p><strong>33 Rust crates · 246 tests green (incl. WAL durability + system crash-chaos gates) · clippy <code>deny(all+pedantic)</code> clean ·
     <code>#![forbid(unsafe_code)]</code></strong> (one audited shared-memory waiver). Default AEAD is portable
     AES-256-GCM-SIV; an opt-in <code>vaes</code> backend routes AES-256-GCM through the VAES warp path
-    (~5.9 GB/s/core sealing), wire-compatible (a known-answer test pins both to one byte-exact ciphertext).</p>
+    (VAES speeds the raw AEAD ~1.25×; note the <em>full</em> per-cofre sealed datapath is per-record-bound at ~134 MB/s/core — see <code>DECISION-GATE-WARP.md</code>), wire-compatible (a known-answer test pins both to one byte-exact ciphertext).</p>
     <p class="muted">Reproduce every number: GitHub Actions → <em>OMB Benchmark</em> (with
     <code>measure_resources=true</code> for the efficiency table) and the <em>loadgen</em> workflow on a larger
     runner. 10 documented OMB runs in <code>docs/design/OMB-RESULTS.md</code>; the cost analysis in
