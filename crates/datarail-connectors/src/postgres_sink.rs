@@ -94,28 +94,12 @@ impl PostgresSink {
             column: cfg.column,
         })
     }
-}
 
-impl crate::Sink for PostgresSink {
-    /// Land each record as one row in the configured `table(column)` using `COPY ... FROM STDIN`
-    /// (text format). Records are raw bytes escaped per the `COPY` text format; they land into a text
-    /// column. An empty batch is a no-op.
-    fn commit(&mut self, records: &[Vec<u8>]) -> io::Result<()> {
-        if records.is_empty() {
-            return Ok(());
-        }
-
-        // The COPY text format cannot represent a NUL byte; reject up front with a clear error rather than
-        // letting a single crafted record fail mid-COPY (which would also leave the connection mid-stream).
-        if records.iter().any(|r| r.contains(&0)) {
-            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
-        }
-
-        let mut query = format!("COPY \"{}\" (\"{}\") FROM STDIN", self.table, self.column)
-            .into_bytes();
+    /// Land `records` via `COPY <table>(<column>) FROM STDIN` (text format). Caller guarantees non-empty + NUL-free.
+    fn copy_in(&mut self, records: &[Vec<u8>]) -> io::Result<()> {
+        let mut query = format!("COPY \"{}\" (\"{}\") FROM STDIN", self.table, self.column).into_bytes();
         query.push(0); // simple Query is a NUL-terminated C string
         send(&mut self.stream, b'Q', &query)?;
-
         // Expect CopyInResponse ('G'); tolerate informational messages, fail on ErrorResponse.
         loop {
             let (tag, body) = read_msg(&mut self.stream)?;
@@ -126,14 +110,12 @@ impl crate::Sink for PostgresSink {
                 _ => {}
             }
         }
-
         for record in records {
             let mut frame = escape_copy(record);
             frame.push(b'\n'); // row terminator
             send(&mut self.stream, b'd', &frame)?;
         }
         send(&mut self.stream, b'c', &[])?; // CopyDone
-
         // Expect CommandComplete ('C') then ReadyForQuery ('Z').
         loop {
             let (tag, body) = read_msg(&mut self.stream)?;
@@ -144,6 +126,120 @@ impl crate::Sink for PostgresSink {
             }
         }
         Ok(())
+    }
+
+    /// The transaction body for `commit_at` (between `BEGIN` and `COMMIT`/`ROLLBACK`): read the current watermark
+    /// under a row lock; if this batch already landed, no-op; otherwise land the records + advance the watermark.
+    fn txn_body(&mut self, stream_hex: &str, watermark: i64, records: &[Vec<u8>]) -> io::Result<()> {
+        let current = read_watermark(&mut self.stream, stream_hex, true)?; // FOR UPDATE
+        if current >= watermark {
+            return Ok(()); // already landed (idempotent replay) — the COMMIT makes it a clean no-op
+        }
+        if !records.is_empty() {
+            self.copy_in(records)?;
+        }
+        let upsert = format!(
+            "INSERT INTO datarail_watermark (stream, seq) VALUES ('\\x{stream_hex}', {watermark}) \
+             ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq"
+        );
+        query_simple(&mut self.stream, &upsert)?;
+        Ok(())
+    }
+}
+
+/// Create the watermark table if absent (idempotent). The dedup watermark lives in the sink's own DB.
+fn ensure_watermark_table(stream: &mut (impl Read + Write)) -> io::Result<()> {
+    query_simple(stream, "CREATE TABLE IF NOT EXISTS datarail_watermark (stream bytea PRIMARY KEY, seq bigint NOT NULL)")
+        .map(|_| ())
+}
+
+/// Read the current watermark seq for `stream_hex` (`0` if no row), optionally with `FOR UPDATE` to lock it
+/// inside a transaction. `stream_hex` is a hex string (no injection); the seq is an integer.
+fn read_watermark(stream: &mut (impl Read + Write), stream_hex: &str, for_update: bool) -> io::Result<i64> {
+    let lock = if for_update { " FOR UPDATE" } else { "" };
+    let sql = format!("SELECT seq FROM datarail_watermark WHERE stream = '\\x{stream_hex}'{lock}");
+    let row = query_simple(stream, &sql)?;
+    let seq = row
+        .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.trim().parse::<i64>().ok()))
+        .unwrap_or(0);
+    Ok(seq)
+}
+
+/// Run a simple `Query`, draining to `ReadyForQuery`. Returns the first field of the first `DataRow` (if any) —
+/// used both for value-less statements (`BEGIN`/`COMMIT`/DDL/`INSERT`) and single-scalar `SELECT`s. Defensive
+/// against short/garbage backend messages; an `ErrorResponse` becomes an `io::Error`.
+fn query_simple(stream: &mut (impl Read + Write), sql: &str) -> io::Result<Option<Vec<u8>>> {
+    let mut q = sql.as_bytes().to_vec();
+    q.push(0); // NUL-terminated C string
+    send(stream, b'Q', &q)?;
+    let mut first: Option<Vec<u8>> = None;
+    loop {
+        let (tag, body) = read_msg(stream)?;
+        match tag {
+            b'D' if first.is_none() => {
+                // DataRow: int16 field count, then per field [int32 len][bytes] (len -1 = NULL).
+                let nfields = body.get(0..2).and_then(|b| <[u8; 2]>::try_from(b).ok()).map(i16::from_be_bytes);
+                if nfields.is_some_and(|n| n >= 1) {
+                    let len = body.get(2..6).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(i32::from_be_bytes);
+                    first = match len {
+                        Some(l) if l >= 0 => {
+                            let n = usize::try_from(l).unwrap_or(0);
+                            body.get(6..6 + n).map(<[u8]>::to_vec)
+                        }
+                        _ => Some(Vec::new()), // NULL field
+                    };
+                }
+            }
+            b'E' => return Err(backend_error(&body)),
+            b'Z' => break, // ReadyForQuery
+            _ => {} // RowDescription 'T', CommandComplete 'C', NoticeResponse, etc.
+        }
+    }
+    Ok(first)
+}
+
+impl crate::Sink for PostgresSink {
+    /// Land each record as one row in the configured `table(column)` using `COPY ... FROM STDIN`
+    /// (text format). Records are raw bytes escaped per the `COPY` text format; they land into a text
+    /// column. An empty batch is a no-op.
+    fn commit(&mut self, records: &[Vec<u8>]) -> io::Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        // The COPY text format cannot represent a NUL byte; reject up front with a clear error rather than
+        // letting a single crafted record fail mid-COPY (which would also leave the connection mid-stream).
+        if records.iter().any(|r| r.contains(&0)) {
+            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
+        }
+        self.copy_in(records)
+    }
+}
+
+impl crate::TxnSink for PostgresSink {
+    /// Tier-A exactly-once (see `EXACTLY-ONCE-DESIGN.md`): land `records` AND advance the watermark for `stream`
+    /// in ONE Postgres transaction. Idempotent — a replayed batch (`watermark <= stored`) is a committed no-op.
+    fn commit_at(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()> {
+        if records.iter().any(|r| r.contains(&0)) {
+            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
+        }
+        let stream_hex = hex(stream);
+        let wm = i64::try_from(watermark).unwrap_or(i64::MAX);
+        ensure_watermark_table(&mut self.stream)?;
+        query_simple(&mut self.stream, "BEGIN")?;
+        // Run the transaction body; on ANY error roll back so the connection is reusable (not stuck in a failed txn).
+        match self.txn_body(&stream_hex, wm, records) {
+            Ok(()) => query_simple(&mut self.stream, "COMMIT").map(|_| ()),
+            Err(e) => {
+                let _ = query_simple(&mut self.stream, "ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    fn resume_watermark(&mut self, stream: &[u8]) -> io::Result<u64> {
+        ensure_watermark_table(&mut self.stream)?;
+        let cur = read_watermark(&mut self.stream, &hex(stream), false)?;
+        Ok(u64::try_from(cur).unwrap_or(0))
     }
 }
 

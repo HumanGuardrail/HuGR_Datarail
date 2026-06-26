@@ -40,6 +40,27 @@ pub trait Sink {
     fn commit(&mut self, records: &[Vec<u8>]) -> io::Result<()>;
 }
 
+/// A sink that can land a batch **and** record a monotonic watermark **atomically** — the basis for true
+/// exactly-once delivery across crashes (see `docs/design/EXACTLY-ONCE-DESIGN.md`, Tier A). The dedup watermark
+/// lives transactionally in the sink itself, so there is no external dedup state to keep in sync or to lose.
+pub trait TxnSink {
+    /// Atomically: if `watermark` is at or below the sink's stored watermark for `stream`, do nothing (this
+    /// batch already landed — an idempotent replay); otherwise land `records` and advance the stored watermark to
+    /// `watermark`, all-or-nothing. A crash leaves records+watermark both committed or neither — never "landed
+    /// but forgotten".
+    ///
+    /// # Errors
+    /// Propagates the underlying sink/transaction error (the transaction is rolled back).
+    fn commit_at(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()>;
+
+    /// The sink's durable watermark for `stream` (`0` if none) — where to resume after a restart. No external
+    /// dedup state is consulted: the sink IS the dedup store.
+    ///
+    /// # Errors
+    /// Propagates the underlying read error.
+    fn resume_watermark(&mut self, stream: &[u8]) -> io::Result<u64>;
+}
+
 /// An in-memory source over pre-staged batches (tests / `datarail run` with inline records).
 #[derive(Debug, Default)]
 pub struct SliceSource {
