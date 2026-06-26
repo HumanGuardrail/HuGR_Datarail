@@ -12,6 +12,7 @@ members = [
     "crates/datarail-substrate-wal",
     "crates/datarail-erasure",
     "crates/datarail-replaylog",
+    "crates/datarail-keyrouter",
     "crates/datarail-substrate-quic",
     "crates/datarail-substrate-shmem",
     "crates/datarail-terminal",

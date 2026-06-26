@@ -1,0 +1,11 @@
+[package]
+name = "datarail-keyrouter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-keyrouter — rendezvous (HRW) key routing: dynamic parallelism with no fixed partition count (ledger #5) and minimal-disruption membership changes with no stop-the-world rebalance (ledger #6)."
+
+[lints]
+workspace = true
+
+[dependencies]
