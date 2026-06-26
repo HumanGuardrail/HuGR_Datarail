@@ -111,4 +111,5 @@ real transport: `auto`/`loopback` · `tcp` · `shmem` · `s3` · `quic` (the las
 | [`docs/DECOMPOSITION.md`](docs/DECOMPOSITION.md) | Capabilities, acceptance criteria, invariants, milestones |
 | [`docs/design/00-CONSTITUTION.md`](docs/design/00-CONSTITUTION.md) | The machine shape (CAST) + the named invariants + the Craft Charter |
 | [`docs/design/DOD-01.md`](docs/design/DOD-01.md) | Definition-of-Done ledger — honest PROVEN/DIRECTIONAL/PENDING per AC/gate/invariant |
+| [`docs/design/KAFKA-COMPAT.md`](docs/design/KAFKA-COMPAT.md) | Kafka wire-protocol ingest — honest scope, limits, and the security boundary |
 | [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) | Single source of truth — goal lock, decisions, running log |
