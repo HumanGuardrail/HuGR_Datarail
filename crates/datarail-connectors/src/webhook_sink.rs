@@ -6,6 +6,9 @@
 use std::io::{self, Read as _, Write as _};
 use std::net::TcpStream;
 
+/// Hard cap on the endpoint's response we will buffer — a malicious endpoint cannot OOM us.
+const MAX_WEBHOOK_RESPONSE: u64 = 8 * 1024 * 1024;
+
 /// An HTTP webhook sink: each `commit` POSTs the batch (records joined by `\n`) to the configured URL.
 #[derive(Debug, Clone)]
 pub struct WebhookSink {
@@ -70,8 +73,9 @@ impl crate::Sink for WebhookSink {
         stream.write_all(&body)?;
         stream.flush()?;
 
+        // Bound the response read: a malicious/compromised endpoint cannot OOM us by streaming forever.
         let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
+        std::io::Read::take(&mut stream, MAX_WEBHOOK_RESPONSE).read_to_end(&mut response)?;
         let status = parse_status(&response)?;
         if (200..300).contains(&status) {
             Ok(())

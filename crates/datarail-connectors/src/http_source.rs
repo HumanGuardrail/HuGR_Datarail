@@ -91,7 +91,11 @@ impl Target {
     }
 }
 
-/// Connect, send the GET, read the full response, and return the decoded body bytes.
+/// Hard cap on a server response we will buffer — a malicious or compromised endpoint (the hop is plaintext)
+/// cannot OOM us by streaming forever or lying about `Content-Length`.
+const MAX_HTTP_RESPONSE: u64 = 64 * 1024 * 1024;
+
+/// Connect, send the GET, read the full response (capped), and return the decoded body bytes.
 fn fetch(target: &Target) -> io::Result<Vec<u8>> {
     let mut stream = TcpStream::connect((target.host.as_str(), target.port))?;
     let request = format!(
@@ -102,7 +106,10 @@ fn fetch(target: &Target) -> io::Result<Vec<u8>> {
     stream.flush()?;
 
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    std::io::Read::take(&mut stream, MAX_HTTP_RESPONSE).read_to_end(&mut response)?;
+    if u64::try_from(response.len()).unwrap_or(u64::MAX) >= MAX_HTTP_RESPONSE {
+        return Err(invalid_data("HTTP response exceeds the 64 MiB cap"));
+    }
 
     let split = find_subslice(&response, b"\r\n\r\n")
         .ok_or_else(|| invalid_data("response has no header terminator"))?;
@@ -142,8 +149,10 @@ fn fetch(target: &Target) -> io::Result<Vec<u8>> {
     if chunked {
         decode_chunked(body)
     } else if let Some(len) = content_length {
-        let end = len.min(body.len());
-        Ok(body.get(..end).unwrap_or(&[]).to_vec())
+        if len > body.len() {
+            return Err(invalid_data("HTTP response truncated: body shorter than Content-Length"));
+        }
+        Ok(body.get(..len).unwrap_or(&[]).to_vec())
     } else {
         Ok(body.to_vec())
     }
@@ -267,6 +276,16 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\none\ntwo\nIGNORED",
         );
         assert_eq!(drain(&url), vec![b"one".to_vec(), b"two".to_vec()]);
+    }
+
+    #[test]
+    fn content_length_overrun_is_an_error_not_a_silent_truncation() {
+        // Server claims 100 bytes but sends fewer: a short read must ERROR, not silently return a partial batch
+        // (audit F4 — a MITM on the plaintext hop could otherwise drop trailing records undetected).
+        let url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nevt:a\n",
+        );
+        assert!(HttpSource::get(&url).is_err(), "truncated body shorter than Content-Length must error");
     }
 
     #[test]

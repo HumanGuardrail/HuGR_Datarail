@@ -105,6 +105,12 @@ impl crate::Sink for PostgresSink {
             return Ok(());
         }
 
+        // The COPY text format cannot represent a NUL byte; reject up front with a clear error rather than
+        // letting a single crafted record fail mid-COPY (which would also leave the connection mid-stream).
+        if records.iter().any(|r| r.contains(&0)) {
+            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
+        }
+
         let mut query = format!("COPY \"{}\" (\"{}\") FROM STDIN", self.table, self.column)
             .into_bytes();
         query.push(0); // simple Query is a NUL-terminated C string
