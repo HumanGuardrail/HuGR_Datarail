@@ -637,6 +637,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   (tracked, low-ROI — the product is not throughput-limited). Every buildable + measurable item is done, tested,
   audited, and honestly labelled; the evidence base is the `LASTRO-MATRIX`.
 
+- 2026-06-26 — **THE v1 PRODUCT, BUILT + PROVEN — `HttpSource` + zero-dep `PostgresSink` (API → sealed rail →
+  Postgres).** datarail was an audited engine that only moved files; the stated v1 use-case (API→Postgres,
+  provider-blind) was unbuilt. Built it keeping the zero-dep ethos: a hand-rolled HTTP/1.1 source (Content-Length
+  + chunked + Connection:close) and a hand-rolled **Postgres wire-protocol v3** sink (Startup + trust/cleartext/
+  hand-rolled-MD5 auth + COPY-IN with text escaping; SCRAM = clear Unsupported error) — both over `std::net`,
+  ZERO external deps, `forbid(unsafe)`, no panic in non-test. Dispatched as a 2-agent disjoint wave (frozen
+  Source/Sink contract; lead owns lib.rs); **cold-verified (AP-5) against REAL systems**: PostgresSink round-trips
+  against real Postgres 16 in docker (trust AND md5 → rows land, tab/backslash escaping correct), and the **full
+  v1 flow is PROVEN end-to-end** — `python http.server` NDJSON → `datarail run --source-http … --sink-postgres …`
+  sealed rail (shmem) → Postgres: boarded=3, committed=3, dead-letter=0, 3 sealed rows landed. Wired into the CLI;
+  live PG test kept `#[ignore]` (`tests/postgres_live.rs`). The engine is now a product.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
