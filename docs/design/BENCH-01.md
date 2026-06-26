@@ -73,7 +73,13 @@ on VAES) plus a per-cofre X25519 wrap (amortized over a batch) + Ed25519 + BLAKE
 **What it settles:** `GATE-WARP`'s target **X = 1 GiB/s/core** is **comfortably achievable on representative
 VAES hardware** — the symmetric ceiling clears it by **~5–10×**. (The one-off Northflank job was deleted.)
 
-## ✅ GATE-WARP — LITERAL PASS: the real datarail binary on a VAES core (Northflank, 2026-06-22)
+## ⚠️ GATE-WARP — n=1 cloud measurement (Northflank, 2026-06-22) — `PENDING-RIGOR` (artifact deleted)
+
+> **Lastro flag (2026-06-26):** the numbers below are a **single (n=1)** run on a one-off Northflank VAES core
+> whose job was **deleted** — there is NO committed artifact reproducing them, and this laptop has no VAES. The
+> harness exists (`loadgen.yml` with `vaes=true` on a VAES runner), so it is reproducible IN PRINCIPLE, but until
+> a committed CI artifact lands this is **DIRECTIONAL/PENDING-RIGOR, not a banked PASS**. The order-of-magnitude
+> conclusion (≥1 GiB/s/core achievable on VAES) is sound; the exact 1.43 GB/s figure is unbacked.
 
 Built the actual workspace (`cargo build --release -p datarail-bench`, `RUSTFLAGS=-C target-cpu=native`) on a
 VAES cloud container and ran the **real binary** (not the openssl proxy). CPU flags confirmed: `vaes avx512f

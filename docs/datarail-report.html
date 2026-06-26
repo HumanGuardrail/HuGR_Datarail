@@ -78,7 +78,7 @@
     <div class="stat moatn"><div class="n">~72×</div><div class="l">less RAM at equal durability (n=3, range 69–73×; 12 vs 883 MB, both fsync)</div></div>
     <div class="stat moatn"><div class="n">~90×</div><div class="l">less RAM idle (3 MB vs 275 MB)</div></div>
     <div class="stat goodn"><div class="n">0</div><div class="l">bytes the pipe can read (provider-blind)</div></div>
-    <div class="stat goodn"><div class="n">8 ms</div><div class="l">cold-start to ready vs Kafka 5.5 s → scale-to-zero</div></div>
+    <div class="stat goodn"><div class="n">ms</div><div class="l">cold-start (vs Kafka seconds) → scale-to-zero · <em>exact figure PENDING-RIGOR</em></div></div>
   </div>
 
   <!-- ================= THE HEADLINE ================= -->
@@ -214,7 +214,7 @@
     <table>
       <tr><th>capability</th><th>datarail</th><th>Kafka / Pulsar</th></tr>
       <tr><td>RAM at equal (fsync) durability</td><td class="win">~12 MB load · 3 MB idle</td><td class="lose">868 / 1,757 MB</td></tr>
-      <tr><td>Idle footprint &amp; cold-start</td><td class="win">3 MB · 8 ms ready → scale-to-zero</td><td class="lose">275 MB · 5.5 s ready → always-on 24/7</td></tr>
+      <tr><td>Idle footprint &amp; cold-start</td><td class="win">3 MB idle · <em>ms</em>-to-ready → scale-to-zero</td><td class="lose">275 MB · <em>seconds</em>-to-ready → always-on 24/7</td></tr>
       <tr><td>Broker can read payloads?</td><td class="win">No — provider-blind</td><td class="lose">Yes — plaintext</td></tr>
       <tr><td>Durability cost scales on…</td><td class="win">cheap disk (RAM flat)</td><td class="lose">scarce RAM (page cache)</td></tr>
       <tr><td>Throughput under WAN loss</td><td>FASP algorithm holds <em>(sim; UDP transport pending)</em></td><td class="lose">TCP — collapses</td></tr>
@@ -240,7 +240,7 @@
       <tr><td>JVM heap holds the working set</td><td class="win">lean Rust mover</td><td><span class="badge b-proven">~72× less RAM</span> n=3, same-ruler</td></tr>
       <tr><td>Page-cache = RAM grows with retention</td><td class="win">retained log, streamed replay</td><td><span class="badge b-proven">REPLAY @ FLAT RAM</span> <code>datarail-replaylog</code></td></tr>
       <tr><td>Replication writes every byte 3×</td><td class="win">erasure coding 1.5×</td><td><span class="badge b-proven">CODEC PROVEN</span> <code>datarail-erasure</code>, exhaustive</td></tr>
-      <tr><td>Always-on cluster (5.5 s cold-start)</td><td class="win">8 ms cold-start → scale-to-zero</td><td><span class="badge b-proven">MEASURED</span></td></tr>
+      <tr><td>Always-on cluster (seconds cold-start)</td><td>ms cold-start → scale-to-zero</td><td><span class="badge b-dir">DIRECTIONAL</span> regime ms-vs-s; exact figure PENDING-RIGOR</td></tr>
       <tr><td>Fixed partition count caps parallelism</td><td class="win">rendezvous routing, no partitions</td><td><span class="badge b-proven">ROUTING PROVEN</span> <code>datarail-keyrouter</code></td></tr>
       <tr><td>Stop-the-world rebalance on join/leave</td><td class="win">monotonic — only ~1/N keys move</td><td><span class="badge b-proven">ROUTING PROVEN</span> measured churn</td></tr>
       <tr><td>Broker reads plaintext (no E2E)</td><td class="win">provider-blind by construction</td><td><span class="badge b-proven">PROVEN</span> crypto-audited</td></tr>

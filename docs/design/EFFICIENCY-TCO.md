@@ -104,7 +104,11 @@ And when both endpoints are online, datarail uses **no store at all** — direct
 > is a lean stateless Rust mover, not an always-on JVM cluster. Same throughput class; a footprint and cost from
 > another category.** That is the disruption: not faster — radically leaner on the scarce resource (RAM).
 >
-> **Durable-AND-lean — MEASURED (Run 11, 2026-06-24, durability-audit-corrected):** the WAL substrate makes
+> **Durable-AND-lean — MEASURED (Run 12, n=3, same-ruler — supersedes the n=1 Run 11 below):** the n=3
+> fsync-vs-fsync number is **~72× less RAM (range 69–73×, σ1.6), ~92× idle** (`OMB-RESULTS.md` Run 12). The n=1
+> Run-11 paragraph below (~67×) is kept for history but is superseded by Run 12's variance-bounded figure.
+>
+> The WAL substrate makes
 > datarail fsync-durable (`sync_all` every batch). Measured vs Kafka `acks=all` (RF=1), both 51 MB/s, 0 errors:
 > **datarail-WAL ~13 MB RSS under load / 3 MB idle vs Kafka 877 MB / 274 MB ⇒ ~67× less RAM, ~91× idle.**
 > **Honest correction:** this Kafka config (stock flush settings) does NOT fsync on the produce path — it acks on
