@@ -6,14 +6,26 @@
 > build in `FASP-UDP-TRANSPORT.md` (S1–S3). **Confidence: MEASURED-ON-REAL-SOCKET, n=1→3, S4 audit PENDING
 > before any PROVEN label.**
 
-## The sweep (ubuntu-latest, 25 ms one-way delay ≈ 50 ms RTT, 5 s/transfer, `wan-bench.yml` run 28209210001)
+## The sweep (ubuntu-latest, 25 ms one-way delay ≈ 50 ms RTT, 5 s/transfer; n=2 of 3 — the 3rd run hung, see below)
 
-| loss | FASP MB/s | kernel TCP MB/s | ratio |
+| loss | FASP MB/s (run A / run B) | kernel TCP MB/s (A / B) | ratio (range) |
 |---|---|---|---|
-| 0%  | 18.95 | 4.00 | 4.7× |
-| 5%  | 18.27 | 6.93 | 2.6× |
-| 15% | 16.38 | 0.14 | ~119× |
-| 30% | 12.59 | 0.02 | ~776× |
+| 0%  | 18.9 / 16.9 | 4.00 / 4.01 | ~4× |
+| 5%  | 18.3 / 18.3 | 6.93 / 4.38 | 2.6–4× |
+| 15% | 16.4 / 17.4 | 0.14 / 1.25 | 14–119× |
+| 30% | 12.6 / 13.3 | 0.02 / 0.33 | 40–776× |
+
+**Two things the second run revealed (honesty):**
+- **FASP goodput is rock-solid run-to-run** — 18.9/16.9, 18.3/18.3, 16.4/17.4, 12.6/13.3. The flatness under loss
+  is *robust*, not a lucky draw.
+- **The TCP collapse magnitude is wildly variable** — at 15% loss TCP gave 0.14 one run and 1.25 the next (≈10×);
+  at 30%, 0.02 vs 0.33 (≈16×). Random loss + loss-based collapse is chaotic. **So the *ratio* is NOT a stable
+  number** (the 15% ratio swings 14×–119×, the 30% swings 40×–776×). The robust, defensible claim is the SHAPE:
+  *FASP holds ~13–19 MB/s flat; single-stream TCP collapses to under ~1.3 MB/s past 15% loss (often under 0.3) —
+  a one-to-two-order-of-magnitude collapse, exact value run-dependent.* We do NOT headline a single multiplier.
+- **The 3rd run hung (>10 min) and was cancelled** — a real bench limitation: `bench_tcp` drains its post-shutdown
+  send buffer under heavy loss with no timeout, so an unlucky netem draw can stall the TCP retransmit drain for
+  minutes. The finding stands on n=2; firming to n≥3 needs a per-transfer timeout in the harness (future).
 
 ## The honest reading (the SHAPE, not the gaudy ratio)
 - **FASP goodput is nearly FLAT as loss climbs** — 18.95 → 12.59 MB/s across 0→30% loss. The delay-based window
