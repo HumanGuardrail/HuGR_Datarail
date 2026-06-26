@@ -188,13 +188,15 @@
       <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Graceful backpressure, not collapse.</strong>
         Under a firehose the rail throttles (bounded queue → producer slows), holding <em>0 loss with flat memory</em>
         — verified after the stress test found &amp; we fixed two real OOM bugs.</div></li>
-      <li><span class="badge b-dir">DIRECTIONAL</span><div class="t"><strong>The FASP <em>algorithm</em> holds
-        throughput where loss-based TCP collapses.</strong> Our delay-based controller sustains <em>16–42× the
-        goodput of a textbook TCP-Reno AIMD</em> as loss climbs 5→30% — <em>but honestly: that's an in-process
-        seeded-loss simulation, and the controller is not yet wired to a real UDP transport.</em> datarail's real
-        socket path today is kernel TCP, which would inherit TCP's loss collapse. Realizing this moat needs a
-        reliable-UDP mover paced by the controller, measured under real <code>tc netem</code> loss vs kernel TCP —
-        the build is designed (<code>FASP-UDP-TRANSPORT.md</code>) and is the honest next step, not done.</div></li>
+      <li><span class="badge b-dir">DIRECTIONAL</span><div class="t"><strong>Holds goodput where TCP collapses —
+        now measured on a REAL socket under real <code>tc netem</code> loss.</strong> We built the reliable-UDP
+        mover (<code>FaspLink</code>) and benchmarked it vs kernel TCP on the same loopback under genuine kernel
+        packet loss: <em>FASP goodput stays nearly flat (19→13 MB/s across 0→30% loss) while single-stream kernel
+        TCP collapses (15% → 0.14, 30% → 0.02 MB/s)</em> — the exact failure Kafka's MirrorMaker suffers on a
+        lossy WAN. <strong>Honest caveats:</strong> our mover's absolute throughput is modest (~19 MB/s, user-space
+        — <em>resilient, not fast</em>); the 0% TCP figure looks like a cold-start artifact, so we lead with the
+        15–30% collapse; n=1→3; loopback netem, not a geographic WAN; and the <code>FaspLink</code> adversarial
+        audit (S4) is pending before any PROVEN label. (<code>WAN-RESULTS.md</code>)</div></li>
       <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Delivery comes with a receipt.</strong>
         A Merkle manifest whose root an independent verifier re-derives; any tamper breaks it. Kafka has no
         cryptographic delivery proof.</div></li>
