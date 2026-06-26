@@ -31,7 +31,7 @@ echo "|---|---|---|---|"
 for L in 0 5 15 30; do
   cleanup
   sudo tc qdisc add dev lo root netem loss "${L}%" delay "${DELAY_MS}ms"
-  out="$("$BIN" "$SECS")"
+  out="$(timeout 90 "$BIN" "$SECS" || echo "fasp_mbps=NaN tcp_mbps=NaN ratio=NaN")"
   cleanup
   f="$(printf '%s' "$out" | sed -E 's/.*fasp_mbps=([0-9.]+).*/\1/')"
   t="$(printf '%s' "$out" | sed -E 's/.*tcp_mbps=([0-9.]+).*/\1/')"
