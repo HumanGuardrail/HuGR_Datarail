@@ -21,6 +21,7 @@ members = [
     "crates/datarail-replicated-topic",
     "crates/datarail-netblob",
     "crates/datarail-system",
+    "crates/datarail-tieredlog",
     "crates/datarail-substrate-quic",
     "crates/datarail-substrate-shmem",
     "crates/datarail-terminal",

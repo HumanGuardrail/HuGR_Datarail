@@ -536,6 +536,7 @@ dependencies = [
  "datarail-offsets",
  "datarail-replicated-topic",
  "datarail-replication",
+ "datarail-tieredlog",
  "datarail-topic",
 ]
 
@@ -549,6 +550,13 @@ dependencies = [
  "datarail-once",
  "proptest",
  "zeroize",
+]
+
+[[package]]
+name = "datarail-tieredlog"
+version = "0.0.0"
+dependencies = [
+ "datarail-blobstore",
 ]
 
 [[package]]

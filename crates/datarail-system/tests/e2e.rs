@@ -90,3 +90,39 @@ fn record_survives_losing_m_shards_on_a_remote_blob_store() {
     let got = store.get("rec1").expect("get").expect("must reconstruct after losing m shards");
     assert_eq!(got, data, "remote erasure failed to reconstruct after losing m shards");
 }
+
+/// Tiered storage, end to end: a log's HOT segment stays on local disk while all sealed history offloads to a
+/// REMOTE (TCP) blob server; replay fetches the cold segments back over the network — local disk stays at one
+/// segment regardless of total volume. Kafka holds the hot set in RAM; this keeps cheap remote storage cold and
+/// the scarce local resources flat.
+#[test]
+fn tiered_log_offloads_cold_history_to_a_remote_server_and_replays_over_the_network() {
+    use datarail_blobstore::{BlobStore, MemBlob};
+    use datarail_netblob::{serve as serve_blob, NetBlob};
+    use datarail_tieredlog::TieredLog;
+
+    let cold_addr = serve_blob(MemBlob::new()).expect("serve cold tier");
+    let dir = tmp("tier-local");
+    let mut log = TieredLog::open(&dir, NetBlob::new(cold_addr), 4096).expect("open tiered log");
+
+    let mut want = Vec::new();
+    for i in 0u32..5000 {
+        let rec = format!("event-{i}").into_bytes();
+        let off = log.append(&rec).expect("append");
+        want.push((off, rec));
+    }
+    log.sync().expect("sync");
+
+    // Local disk holds only the hot segment; all sealed history is on the REMOTE server.
+    assert_eq!(log.local_segment_count().expect("count"), 1, "local disk must hold only the hot segment");
+    let remote_cold = NetBlob::new(cold_addr).list("seg/").expect("list remote");
+    assert!(remote_cold.len() >= 5, "cold segments must live on the remote server (got {})", remote_cold.len());
+
+    // Replay fetches every cold segment back over the network + the hot local one.
+    let got = log.replay_from(0).expect("replay over the network");
+    assert_eq!(got.len(), want.len(), "tiered replay lost records");
+    for (g, w) in got.iter().zip(want.iter()) {
+        assert_eq!((g.0, &g.1), (w.0, &w.1), "tiered replay corrupted a record");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

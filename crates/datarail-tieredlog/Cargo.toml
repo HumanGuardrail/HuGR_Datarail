@@ -1,0 +1,10 @@
+[package]
+name = "datarail-tieredlog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-tieredlog — native tiered storage: the hot segment stays local, sealed segments offload to a cold BlobStore (local/remote/S3-shaped) and are evicted; replay fetches cold segments on demand at O(1-segment) RAM and O(1-segment) local disk, regardless of total retained volume."
+[lints]
+workspace = true
+[dependencies]
+datarail-blobstore = { path = "../datarail-blobstore" }

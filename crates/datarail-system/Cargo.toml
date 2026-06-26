@@ -15,3 +15,4 @@ datarail-replicated-topic = { path = "../datarail-replicated-topic" }
 datarail-blobstore = { path = "../datarail-blobstore" }
 datarail-replication = { path = "../datarail-replication" }
 datarail-netblob = { path = "../datarail-netblob" }
+datarail-tieredlog = { path = "../datarail-tieredlog" }
