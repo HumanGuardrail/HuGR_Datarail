@@ -31,14 +31,14 @@
 | FASP holds flat / TCP collapses past 15% loss (real netem) | WAN-RESULTS | `bench/wan/netem-fasp-vs-tcp.sh` + `wan-bench.yml` | n=2, labelled DIRECTIONAL, no headline × | **BACKED** (honest n=2) |
 | FASP "16.3/29.6/42.1×" *specific* multipliers | DOD-01, scorecard | `fasp_vs_lossbased.rs` asserts only **>1.5× + widening** | one seed | **SINGLE-SAMPLE** → flagged |
 | throughput "engine WINS ~1.2× / 1.9 GB/s" | OMB Run 7–8 | `engine_bench.rs`/`loadgen.rs` + `loadgen.yml` | n=1, swings 2–3× | **SINGLE-SAMPLE** → flagged DIRECTIONAL |
-| **cold-start 8 ms / 5.5 s / ~690×** | COLD-START-RESULTS | `bench/cold-start/cold-start.sh` | n=1 sample; re-run 141 ms/22 s | **SINGLE-SAMPLE** → `PENDING-RIGOR` (regime holds) |
+| **cold-start: datarail p50 2 ms vs Kafka p50 5.1 s** | COLD-START-RESULTS | `bench/cold-start/cold-start.sh` + `cold-start.yml` | **n=30/5 controlled CI, datarail spread=0** | **BACKED** (gap closed 2026-06-26) |
 | GATE-WARP "LITERAL PASS 1.43 GB/s" | BENCH-01, DOD-01 | `loadgen.yml --vaes` (harness only; cited job **deleted**) | n=1, no committed artifact | **OVERCLAIMED** → downgraded to PENDING-RIGOR |
 | Run 11 "~67×, 13 MB vs 877 MB" | OMB Run 11 | OMB harness | n=1 (self-stated) | **STALE** → superseded by Run 12 (n=3) |
 | "124× / 7 MB" loaded RAM | OMB Run 10 | OMB harness | single light-load sample | **STALE** → self-corrected to ~40× then n=3 ~72× |
 | "3.4× faster" / 2-core "25×" | DOD-01 AC-10 | none (self-configured Kafka) | retracted | **STALE** → retracted in-doc |
 
 ## Flagged this pass (2026-06-26) — the cold-start-class soft spots, now corrected
-1. **HTML cold-start** showed `8 ms` with a green `MEASURED` badge while its source doc was already PENDING-RIGOR → **re-badged DIRECTIONAL/PENDING in the HTML** (3 spots).
+1. **HTML cold-start** showed `8 ms / MEASURED` contradicting its PENDING-RIGOR source → first re-badged DIRECTIONAL, then **CLOSED**: re-measured on controlled CI (`cold-start.yml`, n=30/5) → datarail p50 **2 ms** (zero spread) vs Kafka **5.1 s**; HTML now shows the BACKED number.
 2. **GATE-WARP** labelled PROVEN on an n=1 **deleted** Northflank job → **downgraded to PENDING-RIGOR** (harness exists; needs a committed CI VAES artifact to bank).
 3. **FASP 16–42× exact multipliers** → flagged single-seed (the gate proves the *shape*, not the range).
 4. **Throughput "WINS ~1.2×"** → flagged n=1/no-variance → DIRECTIONAL (parity-class is the robust claim).
@@ -47,5 +47,6 @@
 ## Standing rule
 Before any number is written as PROVEN/MEASURED in a doc or the HTML, it must trace to a committed `cargo test`
 gate or a committed `bench/` + workflow, run at n>1 (or exhaustively). The one durable benchmark headline that
-meets this fully is **~72× RAM (Run 12, n=3)**; FASP-WAN and the directional throughput/cold-start figures are
-honestly labelled below PROVEN until their n≥3 / real-WAN / VAES-artifact work lands.
+meets this fully now are **~72× RAM (Run 12, n=3)** and **cold-start (2 ms vs 5.1 s, n=30/5 controlled CI)**;
+FASP-WAN (n=2) and the directional throughput / GATE-WARP figures are honestly labelled below PROVEN until their
+n≥3 / real-WAN / VAES-artifact work lands.
