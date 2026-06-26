@@ -12,6 +12,12 @@
 use std::io;
 use std::path::Path;
 
+pub mod http_source;
+pub mod postgres_sink;
+
+pub use http_source::HttpSource;
+pub use postgres_sink::{PgConfig, PostgresSink};
+
 /// A data **source**: the next batch of raw byte-records, or `None` once exhausted. The onboarding terminal
 /// boards each batch (contract + seal); the connector never handles keys or cofres.
 pub trait Source {

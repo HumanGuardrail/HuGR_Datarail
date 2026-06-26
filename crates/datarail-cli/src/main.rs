@@ -22,7 +22,9 @@ use std::net::{TcpListener, TcpStream};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use datarail_connectors::{LineFileSink, LineFileSource, Sink, SliceSource, Source, VecSink};
+use datarail_connectors::{
+    HttpSource, LineFileSink, LineFileSource, PgConfig, PostgresSink, Sink, SliceSource, Source, VecSink,
+};
 use datarail_core::{Cofre, Disposition, Substrate};
 use datarail_crypto::{blake3_256, ctx, sign_domain, verifying_key};
 use datarail_identity::{NoiseSubstrate, Pairing, ShortCode, StaticKeypair};
@@ -50,6 +52,12 @@ USAGE:
     send/recv --noise-secret <hex> --peer-public <hex>   wrap the TCP hop in a Noise_KK channel (F2):
                      mutual-static auth + on-wire encryption of the etiqueta metadata. Both flags or neither.
 
+    run connectors (the v1 product flow — an HTTP API to a database, sealed end-to-end):
+      --source-http URL          GET an endpoint; each non-empty line of the body is one record (one batch).
+      --sink-postgres CONN       land each delivered record as a row, via the zero-dep Postgres wire protocol.
+                                 CONN = comma-separated key=value: host,user,db,table,column[,port][,password]
+                                 e.g. host=db,user=rail,db=events,table=raw,column=data,port=5432,password=secret
+      (precedence: --source-http > --source-file > inline/stdin ; --sink-postgres > --sink-file > in-memory)
     --watch        on `run`: print a live one-line speedometer per batch (no TUI; raw stdout).
     replay reads from the configured source (--source-file > inline args > stdin) and re-ships only the
     selected index slice; the once-gate dedups an already-delivered range in-process (no re-commit). True
@@ -96,6 +104,7 @@ enum CliError {
     Usage,
     UnknownCommand(String),
     MissingArg(&'static str),
+    Arg(String),
     Io(String),
     Spec(SpecError),
     BadHex,
@@ -114,6 +123,7 @@ impl core::fmt::Display for CliError {
             Self::Usage => write!(f, "no command given\n\n{USAGE}"),
             Self::UnknownCommand(c) => write!(f, "unknown command `{c}`\n\n{USAGE}"),
             Self::MissingArg(a) => write!(f, "missing argument <{a}>"),
+            Self::Arg(e) => write!(f, "argument: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Spec(e) => write!(f, "spec: {e}"),
             Self::BadHex => write!(f, "argument is not valid hex"),
@@ -219,6 +229,8 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
     // Optional `--source-file` / `--sink-file` / `--watch`; remaining args are inline records.
     let mut source_file: Option<String> = None;
     let mut sink_file: Option<String> = None;
+    let mut source_http: Option<String> = None;
+    let mut sink_pg: Option<String> = None;
     let mut watch = false;
     let mut inline: Vec<Vec<u8>> = Vec::new();
     let mut i = 1;
@@ -232,6 +244,14 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
                 sink_file = Some(require(rest, i + 1, "path")?.to_string());
                 i += 2;
             }
+            "--source-http" => {
+                source_http = Some(require(rest, i + 1, "url")?.to_string());
+                i += 2;
+            }
+            "--sink-postgres" => {
+                sink_pg = Some(require(rest, i + 1, "conn")?.to_string());
+                i += 2;
+            }
             "--watch" => {
                 watch = true;
                 i += 1;
@@ -243,8 +263,10 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
         }
     }
 
-    // Source connector: `--source-file` > inline args > stdin lines > a built-in conforming demo.
-    let mut source: Box<dyn Source> = if let Some(path) = source_file {
+    // Source connector: `--source-http` (one GET = one batch) > `--source-file` > inline > stdin > demo.
+    let mut source: Box<dyn Source> = if let Some(url) = source_http {
+        Box::new(HttpSource::get(&url).map_err(|e| CliError::Io(e.to_string()))?)
+    } else if let Some(path) = source_file {
         Box::new(LineFileSource::open(&path).map_err(|e| CliError::Io(e.to_string()))?)
     } else {
         let mut records = resolve_inline_or_stdin(inline)?;
@@ -254,10 +276,13 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
         Box::new(SliceSource::one(records))
     };
 
-    // Sink connector: `--sink-file` (append as lines) > in-memory.
-    let mut sink: Box<dyn Sink> = match sink_file {
-        Some(path) => Box::new(LineFileSink::create(&path).map_err(|e| CliError::Io(e.to_string()))?),
-        None => Box::new(VecSink::new()),
+    // Sink connector: `--sink-postgres` (seal→land as rows) > `--sink-file` (append lines) > in-memory.
+    let mut sink: Box<dyn Sink> = if let Some(conn) = sink_pg {
+        Box::new(PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?)
+    } else if let Some(path) = sink_file {
+        Box::new(LineFileSink::create(&path).map_err(|e| CliError::Io(e.to_string()))?)
+    } else {
+        Box::new(VecSink::new())
     };
 
     run_pipe(&spec, source.as_mut(), sink.as_mut(), watch)
@@ -278,6 +303,51 @@ fn resolve_inline_or_stdin(inline: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, CliErro
         .filter(|l| !l.is_empty())
         .map(|l| l.as_bytes().to_vec())
         .collect())
+}
+
+/// Parse a `--sink-postgres` connection string: comma-separated `key=value` pairs. Required keys:
+/// `host`, `user`, `db`, `table`, `column`; optional: `port` (default 5432), `password`.
+/// Example: `host=db.internal,port=5432,user=rail,password=secret,db=events,table=raw,column=data`.
+fn parse_pg_conn(conn: &str) -> Result<PgConfig, CliError> {
+    let mut host = None;
+    let mut user = None;
+    let mut db = None;
+    let mut table = None;
+    let mut column = None;
+    let mut port: u16 = 5432;
+    let mut password = None;
+    for pair in conn.split(',').filter(|p| !p.is_empty()) {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| CliError::Arg(format!("--sink-postgres: expected key=value, got `{pair}`")))?;
+        match key.trim() {
+            "host" => host = Some(value.to_owned()),
+            "user" => user = Some(value.to_owned()),
+            "db" => db = Some(value.to_owned()),
+            "table" => table = Some(value.to_owned()),
+            "column" => column = Some(value.to_owned()),
+            "password" => password = Some(value.to_owned()),
+            "port" => {
+                port = value
+                    .parse()
+                    .map_err(|_| CliError::Arg(format!("--sink-postgres: bad port `{value}`")))?;
+            }
+            other => return Err(CliError::Arg(format!("--sink-postgres: unknown key `{other}`"))),
+        }
+    }
+    let need = |opt: Option<String>, name: &str| {
+        opt.ok_or_else(|| CliError::Arg(format!("--sink-postgres: missing required `{name}`")))
+    };
+    let mut cfg = PgConfig::new(
+        need(host, "host")?,
+        need(user, "user")?,
+        need(db, "db")?,
+        need(table, "table")?,
+        need(column, "column")?,
+    );
+    cfg.port = port;
+    cfg.password = password;
+    Ok(cfg)
 }
 
 /// A parsed `replay` range over the source's records: a 0-based start (inclusive) and an end (exclusive).
