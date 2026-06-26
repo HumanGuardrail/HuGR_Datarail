@@ -5,7 +5,24 @@
 > fast enough to spin up per-request. This is the measured proof that datarail can, and Kafka can't — turning the
 > "idle ≈ 0 / serverless" claim from DIRECTIONAL (derived TCO) into a measured number.
 
-## Measured (2026-06-26, same laptop, Kafka image pre-pulled)
+> **Reproduce:** `bench/cold-start/cold-start.sh [datarail-trials] [kafka-trials]` (committed harness — the
+> datarail side is a bare-binary spawn timed to ingress-ready; the Kafka side needs docker).
+
+> ## ⚠️ KNOWN GAP — `PENDING-RIGOR` (flagged 2026-06-26, to close later; does NOT invalidate the other benchmarks)
+> When the committed repro script was run again, the numbers did **not** reproduce tightly: a quick re-run gave
+> **datarail median ~141 ms (n=3, range 7–784)** and **Kafka ~22 s (n=1)** — vs the **8 ms / 5.5 s** recorded
+> below. The earlier figures were a single favorable sample on a warm machine; cold-start here is **noisy** (first
+> process spawn / page-in, docker scheduler, laptop load).
+>
+> **What still holds:** the **regime** — datarail is *milliseconds* to ready, Kafka is *seconds* (even the bad
+> draw is ~141 ms vs ~22 s, still ~2 orders of magnitude) → scale-to-zero viable vs always-on mandatory. **What is
+> NOT yet rigorous:** the exact figures (8 ms / 5.5 s) and the "~690×" multiplier — treat them as DIRECTIONAL, not
+> a pinned number, until re-measured with n≥10 controlled (warm docker, quiet machine, percentiles).
+>
+> **Scope of this gap:** it is isolated to *cold-start*. It does NOT touch the harness-backed, CI-reproducible
+> benchmarks (the ~70× RAM in `OMB-RESULTS.md`, the FASP-WAN sweep in `WAN-RESULTS.md`) or any `cargo test` gate.
+
+## Measured (2026-06-26, same laptop, Kafka image pre-pulled — SINGLE favorable sample; see the gap note above)
 
 | system | cold-start to ready | n | how "ready" is defined |
 |---|---|---|---|
