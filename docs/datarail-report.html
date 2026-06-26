@@ -228,6 +228,31 @@
     becoming a different product.</p>
   </div>
 
+  <!-- ================= THE WASTE LEDGER ================= -->
+  <h2>🗂️ The whole Kafka-waste ledger, attacked — not copied, re-engineered</h2>
+  <div class="panel moatcard">
+    <p>The thesis was never "re-implement Kafka." It was: understand what Kafka <em>wastes</em> (there's a lot)
+    and build the 2026 version — leaner, secure-by-default, serverless. Each row is a real Kafka inefficiency, a
+    smarter datarail design, and the <em>proof</em> (built + gated + measured, claim kept smaller than the
+    evidence). Full detail + honest scope in <code>KAFKA-WASTE-LEDGER.md</code>.</p>
+    <table>
+      <tr><th>Kafka waste</th><th>datarail</th><th>status</th></tr>
+      <tr><td>JVM heap holds the working set</td><td class="win">lean Rust mover</td><td><span class="badge b-proven">~72× less RAM</span> n=3, same-ruler</td></tr>
+      <tr><td>Page-cache = RAM grows with retention</td><td class="win">retained log, streamed replay</td><td><span class="badge b-proven">REPLAY @ FLAT RAM</span> <code>datarail-replaylog</code></td></tr>
+      <tr><td>Replication writes every byte 3×</td><td class="win">erasure coding 1.5×</td><td><span class="badge b-proven">CODEC PROVEN</span> <code>datarail-erasure</code>, exhaustive</td></tr>
+      <tr><td>Always-on cluster (5.5 s cold-start)</td><td class="win">8 ms cold-start → scale-to-zero</td><td><span class="badge b-proven">MEASURED</span></td></tr>
+      <tr><td>Fixed partition count caps parallelism</td><td class="win">rendezvous routing, no partitions</td><td><span class="badge b-proven">ROUTING PROVEN</span> <code>datarail-keyrouter</code></td></tr>
+      <tr><td>Stop-the-world rebalance on join/leave</td><td class="win">monotonic — only ~1/N keys move</td><td><span class="badge b-proven">ROUTING PROVEN</span> measured churn</td></tr>
+      <tr><td>Broker reads plaintext (no E2E)</td><td class="win">provider-blind by construction</td><td><span class="badge b-proven">PROVEN</span> crypto-audited</td></tr>
+      <tr><td>MirrorMaker (TCP) collapses on WAN loss</td><td>FASP holds goodput (real socket)</td><td><span class="badge b-dir">DIRECTIONAL</span> S1–S4 audited, loopback netem</td></tr>
+      <tr><td>Durability couples to scarce RAM</td><td class="win">fsync log, RAM flat on volume</td><td><span class="badge b-proven">PROVEN</span> <code>datarail-substrate-wal</code></td></tr>
+    </table>
+    <p class="muted"><strong>Honest scope, stated everywhere:</strong> the codecs/mechanisms (erasure, retained
+    replay, rendezvous routing) are <em>proven and gated</em> at the component level; wiring them into a single
+    distributed broker (S3 cold tier, live consumer groups, shard placement) is the next layer, labeled future in
+    the ledger. We prove the engineering that makes each win real — and don't claim the cluster we haven't built.</p>
+  </div>
+
   <!-- ================= TCO ================= -->
   <h2>📉 What it means in dollars (derived)</h2>
   <div class="panel">
