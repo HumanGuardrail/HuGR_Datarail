@@ -124,13 +124,16 @@ pub fn parse_produce(reader: &mut Reader, version: i16) -> io::Result<Vec<Produc
     let _acks = reader.int16()?;
     let _timeout_ms = reader.int32()?;
     let topic_count = reader.int32()?;
-    let tc = usize::try_from(topic_count.max(0)).unwrap_or(0);
-    let mut topics = Vec::with_capacity(tc.min(1024));
+    // Bound the count by the bytes actually remaining (each element is ≥1 byte): a small frame cannot claim
+    // billions of topics/partitions and drive an over-allocation (audit K3). A genuine over-claim then fails
+    // fast when the per-element reads run out of buffer.
+    let tc = usize::try_from(topic_count.max(0)).unwrap_or(0).min(reader.remaining().len());
+    let mut topics = Vec::with_capacity(tc);
     for _ in 0..tc {
         let name = reader.string()?;
         let part_count = reader.int32()?;
-        let pc = usize::try_from(part_count.max(0)).unwrap_or(0);
-        let mut partitions = Vec::with_capacity(pc.min(1024));
+        let pc = usize::try_from(part_count.max(0)).unwrap_or(0).min(reader.remaining().len());
+        let mut partitions = Vec::with_capacity(pc);
         for _ in 0..pc {
             let partition = reader.int32()?;
             let values = match reader.nullable_bytes()? {
@@ -241,6 +244,21 @@ mod tests {
         set.int32(i32::try_from(body.len()).unwrap()); // message size
         set.raw(&body);
         set.into_bytes()
+    }
+
+    #[test]
+    fn over_claimed_count_does_not_over_allocate() {
+        // topic_count = i32::MAX with no topic bytes: the remaining-bytes bound keeps allocation tiny (audit K3).
+        // Before the bound, `Vec::with_capacity(i32::MAX as usize)` aborts the process.
+        let mut req = Writer::new();
+        req.nullable_string(None);
+        req.int16(1);
+        req.int32(0);
+        req.int32(i32::MAX);
+        let bytes = req.into_bytes();
+        let mut reader = crate::codec::Reader::new(&bytes);
+        let topics = parse_produce(&mut reader, 7).expect("bounded parse, no over-alloc");
+        assert!(topics.len() < 1024, "count must be bounded by remaining bytes, got {}", topics.len());
     }
 
     #[test]

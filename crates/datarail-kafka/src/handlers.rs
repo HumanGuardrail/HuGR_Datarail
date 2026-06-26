@@ -73,8 +73,11 @@ pub fn parse_metadata_topics(reader: &mut Reader) -> io::Result<Vec<String>> {
     if count <= 0 {
         return Ok(Vec::new()); // null (-1) or empty (0) ⇒ all topics
     }
-    let n = usize::try_from(count).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad topic count"))?;
-    let mut topics = Vec::with_capacity(n.min(1024));
+    // Bound by remaining bytes (each topic name is ≥2 bytes) so a huge count can't drive an over-allocation.
+    let n = usize::try_from(count)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad topic count"))?
+        .min(reader.remaining().len());
+    let mut topics = Vec::with_capacity(n);
     for _ in 0..n {
         topics.push(reader.string()?);
     }

@@ -6,8 +6,10 @@
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::codec::{Reader, Writer};
 use crate::handlers::{
@@ -18,7 +20,15 @@ use crate::produce::{parse_produce, produce_response};
 /// A produced batch handed to the integration layer: `(topic, partition, record values)`.
 pub type ProducedBatch = (String, i32, Vec<Vec<u8>>);
 
-const MAX_FRAME: usize = 100 * 1024 * 1024;
+/// Max bytes in a single framed request — a hostile peer cannot make us allocate a giant buffer.
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Max concurrent connections — bounds thread/FD/memory under a connection flood (audit K2).
+const MAX_CONNECTIONS: usize = 256;
+/// Per-socket read/write deadline — a stalled/slowloris peer errors out instead of pinning a thread (audit K2).
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max distinct `(topic, partition)` offset entries retained — bounds the global map so a hostile producer
+/// cannot mint unbounded permanent keys (audit K1). Beyond this, a new key simply restarts at offset 0.
+const MAX_OFFSET_KEYS: usize = 100_000;
 
 struct Shared {
     offsets: Mutex<HashMap<(String, i32), i64>>,
@@ -44,11 +54,23 @@ pub fn serve(
         host: advertised_host.to_owned(),
         port: advertised_port,
     });
+    let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let stream = stream?;
+        // Bound concurrency: refuse (and immediately drop) connections past the cap rather than spawn unboundedly.
+        if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
+        // A stalled peer must not pin a thread forever — fail its blocking reads/writes after a deadline.
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        active.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::clone(&shared);
+        let active = Arc::clone(&active);
         std::thread::spawn(move || {
             let _ = handle_connection(stream, &shared);
+            active.fetch_sub(1, Ordering::Relaxed);
         });
     }
     Ok(())
@@ -101,12 +123,17 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             API_PRODUCE => {
                 let topics = parse_produce(&mut reader, api_version)?;
                 let response = {
-                    let mut offsets =
-                        shared.offsets.lock().map_err(|_| io::Error::other("offset lock poisoned"))?;
+                    // Recover from a poisoned lock (the protected state is plain data) so one panicked
+                    // connection can't brick produce for the broker's lifetime (audit K5).
+                    let mut offsets = shared.offsets.lock().unwrap_or_else(PoisonError::into_inner);
                     produce_response(api_version, correlation_id, &topics, &mut |name, part, count| {
                         let key = (name.to_owned(), part);
                         let base = *offsets.get(&key).unwrap_or(&0);
-                        offsets.insert(key, base + i64::try_from(count).unwrap_or(i64::MAX));
+                        // Bound the map: past the cap, don't retain new keys (they restart at 0) — no unbounded
+                        // growth from attacker-chosen (topic, partition) identities (audit K1). saturating add (K6).
+                        if offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS {
+                            offsets.insert(key, base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)));
+                        }
                         base
                     })
                 };
