@@ -527,6 +527,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-system"
+version = "0.0.0"
+dependencies = [
+ "datarail-blobstore",
+ "datarail-broker",
+ "datarail-netblob",
+ "datarail-offsets",
+ "datarail-replicated-topic",
+ "datarail-replication",
+ "datarail-topic",
+]
+
+[[package]]
 name = "datarail-terminal"
 version = "0.0.0"
 dependencies = [

@@ -1,0 +1,17 @@
+[package]
+name = "datarail-system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-system — end-to-end capstone tests: the proven components composed into a durable, networked broker that survives restart, shard loss, and a remote cold tier."
+[lints]
+workspace = true
+[dependencies]
+[dev-dependencies]
+datarail-broker = { path = "../datarail-broker" }
+datarail-offsets = { path = "../datarail-offsets" }
+datarail-topic = { path = "../datarail-topic" }
+datarail-replicated-topic = { path = "../datarail-replicated-topic" }
+datarail-blobstore = { path = "../datarail-blobstore" }
+datarail-replication = { path = "../datarail-replication" }
+datarail-netblob = { path = "../datarail-netblob" }

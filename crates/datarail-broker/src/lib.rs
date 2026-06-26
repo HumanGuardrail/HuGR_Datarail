@@ -330,7 +330,17 @@ impl<O: OffsetStore> Server<O> {
                 Err(e) => Response::Err(e.to_string()),
             },
             Request::Poll { group } => {
-                let g = self.groups.entry(group).or_insert_with(|| Group::new(&[0]));
+                // RESUME from the durable committed offset on first use of a group (restart-safe): after a broker
+                // restart, a group resumes where it last committed, not from offset 0.
+                if !self.groups.contains_key(&group) {
+                    let start = self.offsets.fetch(&group).unwrap_or(0);
+                    let mut g = Group::new(&[0]);
+                    g.seek(start);
+                    self.groups.insert(group.clone(), g);
+                }
+                let Some(g) = self.groups.get_mut(&group) else {
+                    return Response::Err("group state vanished".to_owned());
+                };
                 match self.topic.dispatch_next(g) {
                     Ok(Some(d)) => Response::Record(Some((d.offset, d.key, d.payload))),
                     Ok(None) => Response::Record(None),
