@@ -73,7 +73,22 @@ on VAES) plus a per-cofre X25519 wrap (amortized over a batch) + Ed25519 + BLAKE
 **What it settles:** `GATE-WARP`'s target **X = 1 GiB/s/core** is **comfortably achievable on representative
 VAES hardware** — the symmetric ceiling clears it by **~5–10×**. (The one-off Northflank job was deleted.)
 
-## ⚠️ GATE-WARP — n=1 cloud measurement (Northflank, 2026-06-22) — `PENDING-RIGOR` (artifact deleted)
+## ❌ GATE-WARP — FAILS on the full sealed datapath (measured 2026-06-26, VAES CI, committed)
+
+> **Corrected with rigor.** GATE-WARP specs **per-core sealed throughput ≥ 1 GiB/s/core (1024 MB/s)** of the
+> *full sealed-payload datapath*. Measured properly — `engine_bench` at **threads=1** (one core, full datapath:
+> AEAD-seal + Ed25519 sign + X25519 per-cofre wrap + verify/open/admit/commit) on the **VAES** Turbo runner via
+> `loadgen.yml` — the per-core number is **~101 MB/s @1KB, ~134 MB/s @16KB (VAES; ~88–107 GCM-SIV)** — i.e.
+> **~7.6–10× BELOW the 1 GiB/s/core target. GATE-WARP FAILS as specified.** The earlier "1.43 GB/s LITERAL PASS"
+> measured the **AES-GCM AEAD primitive alone**, not the gate's full sealed-payload datapath — it was an
+> over-claim. The bottleneck is the **per-cofre asymmetric crypto (X25519 wrap + Ed25519 sign)**, exactly as the
+> adversarial audit predicted; it does not amortize to ~1 GiB/s/core even batched at 128. VAES gives the AEAD a
+> real ~1.25× but the AEAD was never the limiter. (Aggregate ceiling is healthy — ~2.3 GB/s on 32 cores — but
+> PER-CORE the sealed datapath is ~70–134 MB/s.) The 1 GiB/s/core target was set optimistically; either it is
+> revised, or the per-cofre crypto is restructured (e.g. amortize the wrap/sign over larger batches). **Status:
+> RED / FAILS.** BACKED (CI, committed `loadgen.yml` th=1).
+
+### (historical) the deleted-job "PASS" below measured the AEAD primitive, not the gate's datapath
 
 > **Lastro flag (2026-06-26):** the numbers below are a **single (n=1)** run on a one-off Northflank VAES core
 > whose job was **deleted** — there is NO committed artifact reproducing them, and this laptop has no VAES. The

@@ -32,7 +32,7 @@
 | FASP "16.3/29.6/42.1×" *specific* multipliers | DOD-01, scorecard | `fasp_vs_lossbased.rs` asserts only **>1.5× + widening** | one seed | **SINGLE-SAMPLE** → flagged |
 | throughput: sealed engine **~1.4 GB/s @1KB (TIE, ~0.87× Kafka)** | THROUGHPUT-RESULTS | `loadgen.yml` ×3 | **n=3, tight** | **BACKED** — n=3 corrected the n=1 "1900/WINS" down to a TIE |
 | **cold-start: datarail p50 2 ms vs Kafka p50 5.1 s** | COLD-START-RESULTS | `bench/cold-start/cold-start.sh` + `cold-start.yml` | **n=30/5 controlled CI, datarail spread=0** | **BACKED** (gap closed 2026-06-26) |
-| GATE-WARP "LITERAL PASS 1.43 GB/s" | BENCH-01, DOD-01 | `loadgen.yml --vaes` (harness only; cited job **deleted**) | n=1, no committed artifact | **OVERCLAIMED** → downgraded to PENDING-RIGOR |
+| GATE-WARP per-core sealed throughput | BENCH-01 | `loadgen.yml` th=1 (VAES, committed) | measured ~134 MB/s/core vs 1024 target | **FAILS** — the '1.43 GB/s PASS' was the AEAD primitive, not the datapath; corrected |
 | Run 11 "~67×, 13 MB vs 877 MB" | OMB Run 11 | OMB harness | n=1 (self-stated) | **STALE** → superseded by Run 12 (n=3) |
 | "124× / 7 MB" loaded RAM | OMB Run 10 | OMB harness | single light-load sample | **STALE** → self-corrected to ~40× then n=3 ~72× |
 | "3.4× faster" / 2-core "25×" | DOD-01 AC-10 | none (self-configured Kafka) | retracted | **STALE** → retracted in-doc |
