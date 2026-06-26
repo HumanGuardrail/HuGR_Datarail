@@ -89,6 +89,12 @@ impl core::fmt::Debug for Once {
 /// Sized to comfortably exceed a bounded reorder window + replay horizon for v1.
 pub const DEFAULT_GC_LAG: u64 = 1024;
 
+/// Max parked (above-watermark) seqs before the reorder horizon seals the lowest gap (audit D-5). A permanently
+/// missing `seq` must not pin the watermark forever and grow the dedup index without bound; past this horizon the
+/// gap is sealed (the watermark advances across the missing `seq`, which is thereafter reject-below'd). This is a
+/// deliberate availability-over-completeness bound for a stuck gap; it is far above any real reorder window.
+pub const MAX_REORDER_HORIZON: usize = 1 << 20;
+
 impl Once {
     /// Create an admission gate signing watermark tokens under the destination Ed25519 `seed`, with the
     /// [`DEFAULT_GC_LAG`].
@@ -159,6 +165,17 @@ impl Once {
         } else {
             // seq > low_watermark: a gap remains; park it on the reorder horizon.
             st.ahead.insert(seq);
+            // (3b) Bound the reorder horizon (audit D-5): a permanently-missing seq must not pin the watermark
+            // and grow `ahead`/`seen` without bound. Past the horizon, seal the lowest gap — advance the
+            // watermark across the missing seq (sealed-skip; it is thereafter reject-below'd) and drain any now-
+            // contiguous parked run. Availability-over-completeness for a stuck gap; never triggers in normal
+            // reorder. (The subsequent GC step then trims `seen` as the watermark moves.)
+            while st.ahead.len() > MAX_REORDER_HORIZON {
+                st.low_watermark += 1;
+                while st.ahead.remove(&st.low_watermark) {
+                    st.low_watermark += 1;
+                }
+            }
         }
 
         // (4) GC the dedup index up to a floor that LAGS the dest watermark (BLK-6) — never a source

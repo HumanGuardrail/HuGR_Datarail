@@ -101,6 +101,12 @@ pub struct FileOffsets {
     records: usize,
 }
 
+/// fsync a directory so a `create`/`rename` within it is durable across a power loss (the file's own data fsync
+/// does NOT guarantee its directory entry is persisted). Unix-targeted; the project runs on macOS/Linux.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
 impl FileOffsets {
     /// Open (creating if absent) the durable offset store in directory `dir`,
     /// recovering the latest committed offset for every group.
@@ -117,6 +123,9 @@ impl FileOffsets {
         let path: PathBuf = dir.join(LOG_NAME);
         let mut file = OpenOptions::new().read(true).append(true).create(true).open(path)?;
         let (map, records) = Self::replay(&mut file)?;
+        // Make the log's directory entry durable: a first-ever create must survive a power loss, else a
+        // committed offset whose file data fsync'd could vanish with the lost create (audit D-6).
+        fsync_dir(&dir)?;
         Ok(Self { file, map, dir, records })
     }
 
@@ -188,10 +197,10 @@ impl FileOffsets {
         // be silently lost on the next open.
         self.file = OpenOptions::new().read(true).append(true).open(&live_path)?;
         self.records = self.map.len();
-        // fsync the directory so the rename itself is durable across a power loss (best-effort, post-reopen).
-        if let Ok(d) = File::open(&self.dir) {
-            let _ = d.sync_all();
-        }
+        // fsync the directory so the rename itself is durable across a power loss. Done AFTER the reopen (a
+        // pre-reopen error would strand `self.file` on the dead inode); propagated now (audit D-6) so a caller
+        // learns the rename may not be durable rather than silently assuming it is.
+        fsync_dir(&self.dir)?;
         Ok(())
     }
 

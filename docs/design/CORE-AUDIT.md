@@ -42,8 +42,8 @@ interaction, offsets recovery parse-safety (CRC + torn-tail truncation, no panic
 | D-2 | **Fsync'd committed offset outlived un-synced topic** → resume wedges + loss. PROVEN. | CRIT | **FIXED** `741b803`: same fsync makes the topic at least as durable as the offset pointing into it. |
 | D-3 | **Dedup index in-memory only + not wired into the broker** → restart = duplicate flood; "effectively-once across crashes" false. PROVEN. | CRIT | **TRACKED** + claim corrected (above). Fix = persist the dedup index (signed watermark + on-disk map per SPEC) and wire the `once` gate into the broker. Substantial; next arc. **Until then the broker is honestly at-least-once.** |
 | D-4 | **Same `seq` above the watermark with a different key → delivered twice.** PROVEN. | HIGH | **FIXED** `741b803`: seq-level dedup (`delivered_keys`, never GC'd above watermark) — a seq is committed once regardless of key. Regression test added. |
-| D-5 | A permanent gap pins the watermark → `seen`/`ahead`/`delivered_keys` grow without bound (RAM DoS). | MED | **TRACKED** (D-S5): add a max reorder horizon → seal/skip the gap (dead-letter) and advance. |
-| D-6 | `FileOffsets` doesn't fsync the parent dir on create / re-fsync after compaction (rename durability). | MED | **TRACKED** (fs-dependent; SUSPECTED): fsync the dir after create + every rename, propagate the error. |
+| D-5 | A permanent gap pins the watermark → `seen`/`ahead`/`delivered_keys` grow without bound (RAM DoS). | MED | **FIXED**: `MAX_REORDER_HORIZON` (1<<20) — past it the lowest gap is sealed-skipped (watermark advances, the missing seq is thereafter reject-below'd). Availability-over-completeness; never triggers in normal reorder. |
+| D-6 | `FileOffsets` doesn't fsync the parent dir on create / re-fsync after compaction (rename durability). | MED | **FIXED**: `fsync_dir` helper — fsync the dir on `open` (first-create durable) and (propagated, not swallowed) after the compaction rename. |
 | D-7 | `Commit` accepted an arbitrary offset (past tail → wedge). | LOW | **FIXED** `741b803`: reject a commit past the durable topic tail. |
 
 ## Honest status after this pass
@@ -52,8 +52,10 @@ interaction, offsets recovery parse-safety (CRC + torn-tail truncation, no panic
 - **No-loss:** the broker is now **durability-before-ack** — acked records survive power loss. FIXED.
 - **Effectively-once:** holds **within a process run**; **NOT yet across crashes** (dedup not persisted/wired) —
   honestly TRACKED, not claimed. The broker is at-least-once across restarts.
-- Remaining TRACKED: dedup persistence (D-3), sealed-sender epoch (S-2), gap horizon (D-5), offsets dir-fsync
-  (D-6), X25519 low-order defense-in-depth (S-3). None is a wire-adversary confidentiality/integrity break.
+- Remaining TRACKED: **dedup persistence (D-3)** — the big one, effectively-once cross-crash; **sealed-sender
+  epoch (S-2)**; X25519 low-order defense-in-depth (S-3). (D-5 gap horizon and D-6 offsets dir-fsync are now
+  FIXED.) None is a wire-adversary confidentiality/integrity break. D-3 is a correctness-critical durable
+  component scoped for its own careful arc + audit, not a tail-of-session rush.
 
 This pass is the methodology working: the auditors proved the scary lenses *safe* (signatures, verify-before-
 decrypt, panic-safety) and found the real defects (a crypto clone-reuse + the durability/dedup gaps), which were
