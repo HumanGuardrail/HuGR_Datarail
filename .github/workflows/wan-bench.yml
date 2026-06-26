@@ -5,9 +5,9 @@ name: WAN bench — FASP vs kernel TCP under tc-netem
 on:
   workflow_dispatch:
     inputs:
-      mib:
-        description: "Payload size per run (MiB)"
-        default: "32"
+      secs:
+        description: "Seconds per transfer (fixed-duration, iperf-style)"
+        default: "5"
       delay_ms:
         description: "One-way netem delay on lo (ms); RTT ≈ 2×"
         default: "25"
@@ -25,4 +25,4 @@ jobs:
         run: sudo modprobe sch_netem || true
       - name: Run the FASP-vs-TCP tc-netem sweep
         run: |
-          bash bench/wan/netem-fasp-vs-tcp.sh "${{ inputs.mib }}" "${{ inputs.delay_ms }}" | tee "$GITHUB_STEP_SUMMARY"
+          bash bench/wan/netem-fasp-vs-tcp.sh "${{ inputs.secs }}" "${{ inputs.delay_ms }}" | tee "$GITHUB_STEP_SUMMARY"
