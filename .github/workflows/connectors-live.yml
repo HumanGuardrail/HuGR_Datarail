@@ -1,0 +1,60 @@
+name: Connectors live — v1 product flow (HTTP API → sealed rail → Postgres)
+
+# Turns the v1 product proof into a CONTINUOUSLY-VERIFIED gate (LASTRO rule: no claim without a committed repro).
+# Runs the hand-rolled PostgresSink against a real Postgres service container, then the full end-to-end CLI flow:
+# an HTTP source → the sealed rail → rows landed in Postgres.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/datarail-connectors/**"
+      - "crates/datarail-cli/**"
+      - ".github/workflows/connectors-live.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Live PostgresSink — hand-rolled wire protocol vs real Postgres 16 (trust auth)
+        run: |
+          psql -h localhost -U postgres -c "CREATE TABLE datarail_events (data text);"
+          DATARAIL_PG_HOST=localhost DATARAIL_PG_PORT=5432 \
+            cargo test -p datarail-connectors --test postgres_live -- --ignored --nocapture
+          ROWS=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_events;")
+          echo "PostgresSink landed rows=$ROWS"
+          [ "$ROWS" = "4" ] || { echo "::error::expected 4 rows, got $ROWS"; exit 1; }
+
+      - name: End-to-end — datarail run --source-http → sealed rail → --sink-postgres
+        run: |
+          psql -h localhost -U postgres -c "CREATE TABLE datarail_e2e (data text);"
+          cargo build -p datarail-cli --release
+          printf 'evt:order-1\nevt:order-2\nevt:order-3\n' > events.ndjson
+          python3 -m http.server 8799 >/dev/null 2>&1 &
+          HTTP_PID=$!
+          sleep 2
+          ./target/release/datarail run examples/rail.toml \
+            --source-http http://127.0.0.1:8799/events.ndjson \
+            --sink-postgres "host=localhost,port=5432,user=postgres,db=postgres,table=datarail_e2e,column=data"
+          kill "$HTTP_PID" 2>/dev/null || true
+          ROWS=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_e2e;")
+          echo "e2e sealed rows landed=$ROWS"
+          [ "$ROWS" = "3" ] || { echo "::error::expected 3 e2e rows, got $ROWS"; exit 1; }
+          echo "## v1 product flow ✅ — HTTP API → sealed rail → Postgres (3 sealed rows landed)" >> "$GITHUB_STEP_SUMMARY"
