@@ -28,11 +28,12 @@
   minutes. The finding stands on n=2; firming to n≥3 needs a per-transfer timeout in the harness (future).
 
 ## The honest reading (the SHAPE, not the gaudy ratio)
-- **FASP goodput is nearly FLAT as loss climbs** — 18.95 → 12.59 MB/s across 0→30% loss. The delay-based window
-  ignores loss (recovers by retransmission, Karn-gated RTT), so packet loss barely dents it. **This is the moat,
-  and it now holds on a real socket with real kernel loss, not just in a simulation.**
-- **Kernel single-stream TCP COLLAPSES under loss** — 15% → 0.14 MB/s, 30% → 0.02 MB/s. This is the textbook
-  loss-based-AIMD collapse, and it's exactly what Kafka's MirrorMaker (single-stream TCP) suffers on a lossy WAN.
+- **FASP goodput is nearly FLAT as loss climbs** — ~13–19 MB/s across 0→30% loss, tight across both runs. The
+  delay-based window ignores loss (recovers by retransmission, Karn-gated RTT), so packet loss barely dents it.
+  **This is the moat, and it now holds on a real socket with real kernel loss, not just in a simulation.**
+- **Kernel single-stream TCP COLLAPSES under loss** — to ~0.1–1.3 MB/s at 15% and ~0.02–0.33 MB/s at 30% (the
+  magnitude varies run-to-run, but the collapse itself is consistent). This is the textbook loss-based-AIMD
+  collapse, and it's exactly what Kafka's MirrorMaker (single-stream TCP) suffers on a lossy WAN.
 
 ## What is NOT claimed / the caveats (no spin)
 - **Absolute FASP throughput is modest (~19 MB/s)** — our mover is a single-threaded, user-space, one-syscall-
