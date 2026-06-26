@@ -598,6 +598,45 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   moat = the intersection, not any single attribute. Next credible step offered: a datarail **OMB driver** so
   anyone runs the industry-standard throughput fight independently on equal HW.
 
+- 2026-06-24 — **OMB driver + the durable efficiency headline, MEASURED (the un-riggable number).** Built the
+  datarail OpenMessaging Benchmark driver + a `kafka_fsync` (acks=all) mode so the comparison is same-ruler:
+  equal fsync durability, identical OMB workload. **Run 12 (n=3): ~72× less RAM (range 69–73×, σ1.6; 12 vs 883
+  MB, both fsync-durable), ~92× idle** — committed harness (`bench/omb/` + `omb-benchmark.yml`). This replaced
+  the earlier n=1 Run 11 (~67×) and the retracted "124×/7 MB" light-load sample. The headline is no longer
+  asserted — it is a variance-bounded CI number against real Kafka. Also shipped the durable WAL substrate
+  (`datarail-substrate-wal`, O(1)-RAM fsync-durable, power-loss + torn-tail tested) that makes the same-ruler
+  comparison honest.
+
+- 2026-06-26 — **THE LASTRO PASS — systematic evidence audit; every soft claim caught + corrected (owner asked
+  "are the benchmarks documented with reproducible backing?").** A read-only audit swept every load-bearing
+  number against committed harnesses. Findings, all corrected at the root (no number left over-labelled):
+  (1) **cold-start** was an n=1 noisy laptop sample → re-measured on a clean CI runner (`cold-start.yml`, n=30/5):
+  **datarail p50 2 ms (zero spread) vs Kafka 5.1 s → BACKED**, gap CLOSED, number got *tighter* AND rigorous.
+  (2) **throughput** "engine 1900 MB/s / WINS ~1.2×" was n=1 inflated → re-ran ×3 (`THROUGHPUT-RESULTS.md`):
+  **~1.4 GB/s @1KB, a TIE (~0.87× Kafka)** — corrected WINS→TIE (matches the standing "moat is efficiency, not
+  throughput" position). (3) **GATE-WARP** "PROVEN 1.43 GB/s/core" was an n=1 *deleted* Northflank job that
+  measured the AEAD primitive, not the gate's full sealed datapath → measured properly (engine_bench th=1, VAES
+  CI): **~134 MB/s/core, ~7.6× BELOW target → FAILS.** The batch-amortization curve (128→8192, FLAT) proved the
+  bottleneck is **per-record dedup+commit, not per-cofre crypto** (refuting "fixable by bigger batches"). (4)
+  Run 11/124× → marked STALE; EFFICIENCY-TCO re-pointed to Run 12. Built `LASTRO-MATRIX.md` (the evidence source
+  of truth: claim → committed repro → rigor → verdict) + a standing rule (no PROVEN/MEASURED label without a
+  committed n>1 gate/harness). **The lesson, lived: every time a number was measured with rigor, an inflated
+  claim fell to the truth — the project now carries only claims that survive a skeptic.**
+
+- 2026-06-26 — **System-level CHAOS test + full-workspace green.** Added `datarail-system/tests/chaos.rs`: the
+  broker is killed + reopened over the same durable state at seeded-random points (mid-consume, before/after
+  commit) until 2000 records are durably consumed — invariant: **no produced record is ever lost** across the
+  crashes (durable log + durable offsets + commit-resume = at-least-once survives arbitrary crash timing). The
+  component audits stressed each crate; the capstone proved ONE clean restart; this proves the SYSTEM under
+  arbitrary crash chaos. **Full workspace at this point: 33 crates, 246 tests green across 45 binaries, clippy
+  `deny(all+pedantic)` clean, `forbid(unsafe)` (one audited shmem waiver).**
+
+- 2026-06-26 — **GATE-WARP #13 RESOLVED (owner-ratified re-scope) — the last RED gate honestly closed.** See §6.
+  Honest open items now: only the **WAN real-field number** (needs physical multi-hop hosts; netem-loopback n=3
+  is the controlled max in CI; stays DIRECTIONAL) and the **optional** per-record throughput optimization
+  (tracked, low-ROI — the product is not throughput-limited). Every buildable + measurable item is done, tested,
+  audited, and honestly labelled; the evidence base is the `LASTRO-MATRIX`.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
@@ -639,3 +678,13 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
     documented post-v1.
   Until adjudicated, **#24 is blocked-on-owner**; I am NOT halting the line — continuing on the non-conflicting
   rungs (QUIC #25, AC-8 WAN #26, bao #27, FASP/DoS #28, P5 #30). My recommendation is **(A)**.
+
+- 2026-06-26 — **✅ OWNER RATIFIED — GATE-WARP #13 re-scope (the disposition record is `DECISION-GATE-WARP.md`).**
+  Measured properly (engine_bench th=1, full sealed datapath, VAES CI), GATE-WARP's original metric (≥1 GiB/s/core)
+  FAILS at ~134 MB/s (~7.6× short); the batch curve proved the bottleneck is per-record dedup+commit, not the
+  crypto — disproving the metric's AEAD-dominated premise. I did NOT move the goalpost to pass (rigor-compact
+  §0.6): I left the failure on the record and escalated the spec change. **The owner ratified re-scope (a):**
+  GATE-WARP now measures its INTENT — *aggregate sealed throughput ≥ 10× the max workload rate* — which **PASSES**
+  honestly (~2.3 GB/s aggregate ÷ 51 MB/s OMB ≈ 45×). The original per-core metric is RETIRED (disproven premise),
+  the ~134 MB/s/core is recorded as a known characteristic, and the per-record optimization is tracked optional
+  future work. This closes the last RED gate; #13 no longer needs external VAES HW (measured on a VAES CI runner).
