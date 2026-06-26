@@ -1,0 +1,10 @@
+[package]
+name = "datarail-netblob"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-netblob — a BlobStore served over TCP: a tiny server exposing any BlobStore + a NetBlob client implementing BlobStore over the wire (the cold tier can be remote)."
+[lints]
+workspace = true
+[dependencies]
+datarail-blobstore = { path = "../datarail-blobstore" }

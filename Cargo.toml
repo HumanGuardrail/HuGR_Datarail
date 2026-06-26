@@ -18,6 +18,8 @@ members = [
     "crates/datarail-offsets",
     "crates/datarail-replication",
     "crates/datarail-broker",
+    "crates/datarail-replicated-topic",
+    "crates/datarail-netblob",
     "crates/datarail-substrate-quic",
     "crates/datarail-substrate-shmem",
     "crates/datarail-terminal",
