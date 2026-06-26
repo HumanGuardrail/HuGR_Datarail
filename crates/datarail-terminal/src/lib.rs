@@ -319,6 +319,7 @@ fn validate_sender_cert(
     bytes: &[u8],
     eph_pk: &[u8; 32],
     pinned_issuer_vk: &[u8; 32],
+    min_epoch: u64,
 ) -> Option<[u8; 32]> {
     if bytes.len() != SENDER_CERT_LEN {
         return None;
@@ -326,6 +327,11 @@ fn validate_sender_cert(
     let sender_id: [u8; 32] = bytes[0..32].try_into().ok()?;
     let sender_vk: [u8; 32] = bytes[32..64].try_into().ok()?;
     let epoch = u64::from_le_bytes(bytes[64..72].try_into().ok()?);
+    // Revocation floor (audit S-2): reject a cert minted before the accepted epoch — without this a rotated/
+    // revoked sender's old (validly-issued) cert would be honored forever.
+    if epoch < min_epoch {
+        return None;
+    }
     let issuer_sig: [u8; 64] = bytes[72..136].try_into().ok()?;
     let sender_sig: [u8; 64] = bytes[136..200].try_into().ok()?;
 
@@ -726,6 +732,10 @@ pub struct DestTerminal {
     /// Optional pinned **issuer** verifying key for sealed-sender (SPEC-02 A4). A cofre with `sender_present`
     /// is validated against this; if `None`, such a cofre is dead-lettered (can't validate the claimed sender).
     sender_issuer_vk: Option<[u8; 32]>,
+    /// Minimum acceptable sealed-sender cert `epoch` (audit S-2): a cert with `epoch < min_sender_epoch` is
+    /// rejected, giving revocation a real floor. Default `0` accepts any epoch (backward-compatible); raise it
+    /// after a key rotation so a revoked sender's old-epoch cert stops being honored.
+    min_sender_epoch: u64,
     /// The `sender_id` validated on the most recent `Delivered` sealed-sender cofre (observability; dest-only).
     last_sender_id: Option<[u8; 32]>,
     once: Once,
@@ -743,6 +753,7 @@ impl core::fmt::Debug for DestTerminal {
             .field("pinned_source_vk", &self.pinned_source_vk)
             .field("dest_x25519_secret", &"<redacted>")
             .field("sender_issuer_vk", &self.sender_issuer_vk)
+            .field("min_sender_epoch", &self.min_sender_epoch)
             .field("last_sender_id", &self.last_sender_id)
             .field("once", &self.once)
             .field("sink", &self.sink)
@@ -768,11 +779,20 @@ impl DestTerminal {
             pinned_source_vk,
             dest_x25519_secret,
             sender_issuer_vk: None,
+            min_sender_epoch: 0,
             last_sender_id: None,
             once: Once::new(dest_seed),
             sink: Sink::new(),
             dead_letters: DeadLetterSiding::new(),
         }
+    }
+
+    /// Set the minimum acceptable sealed-sender cert `epoch` (audit S-2): a `sender_present` cofre whose cert
+    /// `epoch < min` is dead-lettered, so a rotated/revoked sender's old-epoch cert is no longer honored. Builder.
+    #[must_use]
+    pub fn with_min_sender_epoch(mut self, min_epoch: u64) -> Self {
+        self.min_sender_epoch = min_epoch;
+        self
     }
 
     /// Pin the sealed-sender **issuer** verifying key (SPEC-02 A4): cofres with `sender_present` are validated
@@ -877,7 +897,9 @@ impl DestTerminal {
                 return Ok(Disposition::DeadLettered);
             }
             let (cert, rest) = batch.split_at(SENDER_CERT_LEN);
-            if let Some(sid) = validate_sender_cert(cert, &cofre.etiqueta.eph_pk, &issuer_vk) {
+            if let Some(sid) =
+                validate_sender_cert(cert, &cofre.etiqueta.eph_pk, &issuer_vk, self.min_sender_epoch)
+            {
                 (rest, Some(sid))
             } else {
                 self.dead_letters.push(cofre.clone(), DeadLetterReason::SenderCertInvalid);

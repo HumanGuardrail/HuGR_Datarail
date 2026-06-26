@@ -293,6 +293,22 @@ mod sealed_sender {
     }
 
     #[test]
+    fn sealed_sender_below_min_epoch_is_dead_lettered() {
+        // audit S-2: once the dest pins a higher epoch floor (a key rotation / revocation), a cert minted at the
+        // old EPOCH must stop being honored — even though the issuer signature is still valid.
+        let mut src = sealed_source();
+        let mut dst = dest_with_issuer(verifying_key(&ISSUER_SEED)).with_min_sender_epoch(EPOCH + 1);
+        let cofre = src.board(&[b"OK:hello"], b"rk").expect("board");
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+        assert!(dst.last_sender_id().is_none(), "a below-floor sender is never accepted");
+        // At exactly the floor the same sender is accepted again.
+        let mut at_floor = dest_with_issuer(verifying_key(&ISSUER_SEED)).with_min_sender_epoch(EPOCH);
+        let cofre2 = src.board(&[b"OK:world"], b"rk2").expect("board");
+        assert_eq!(at_floor.offload(&cofre2).expect("offload"), Disposition::Delivered);
+        assert_eq!(at_floor.last_sender_id(), Some(SENDER_ID));
+    }
+
+    #[test]
     fn the_rail_never_sees_the_sender_id_in_cleartext() {
         // INV-OPAQUE-CARGO for the sender: the plaintext sender_id must appear NOWHERE on the wire — it rides
         // inside the AEAD-encrypted carga, so its raw bytes cannot occur in the encoded cofre.

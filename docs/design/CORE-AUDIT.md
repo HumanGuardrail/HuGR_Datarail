@@ -27,7 +27,7 @@ panic-safety on hostile cofre bytes, constant-time (no secret-dependent compare)
 | # | Finding | Sev | Disposition |
 |---|---|---|---|
 | S-1 | **DRBG reseed keyed on PID → VM-snapshot/clone replays identical `(eph_secret, nonce)`** (catastrophic under opt-in `Gcm256`, plaintext-equality leak under GCM-SIV default). PROVEN. | HIGH | **FIXED** `675d70d`: every DRBG draw now mixes fresh OS entropy → clone-immune by construction, not by PID detection. Regression test: identical-state clones diverge every draw. |
-| S-2 | **Sealed-sender `epoch` never enforced** — a revoked sender's old cert is accepted forever (revocation is theater). PROVEN. | MED | **TRACKED** (D-S2): `DestTerminal` needs a pinned/min acceptable epoch. Not a wire-adversary break (the sender must hold a validly-issued seed); it weakens revocation. |
+| S-2 | **Sealed-sender `epoch` never enforced** — a revoked sender's old cert is accepted forever (revocation is theater). PROVEN. | MED | **FIXED**: `DestTerminal::with_min_sender_epoch(n)` — a cert with `epoch < n` is dead-lettered (default 0 = backward-compatible; raise after a rotation). Regression test added. |
 | S-3 | No X25519 contributory/low-order-point check in key-wrap. | LOW | **ACCEPTED** (not reachable): `eph_pk` is always source-generated and authenticated (lacre verified) BEFORE ECDH, so no adversary can inject a low-order point. Defense-in-depth check is TRACKED. |
 | S-4 | `idempotency_key = HMAC(tenant_secret, record_key)` rides cleartext → the rail can see which cofres share a record_key within a tenant (linkability). | LOW | **ACCEPTED** trade-off: inherent to a deterministic dedup key; `record_key` itself is NOT recoverable. Documented. |
 | S-5 | `sender_present` flag + a 200 B carga delta leak *whether* (not who) a cofre carries a sealed sender. | LOW | **ACCEPTED** trade-off: identity is correctly hidden (proven); presence-padding is optional future work. |
@@ -52,9 +52,8 @@ interaction, offsets recovery parse-safety (CRC + torn-tail truncation, no panic
 - **No-loss:** the broker is now **durability-before-ack** — acked records survive power loss. FIXED.
 - **Effectively-once:** holds **within a process run**; **NOT yet across crashes** (dedup not persisted/wired) —
   honestly TRACKED, not claimed. The broker is at-least-once across restarts.
-- Remaining TRACKED: **dedup persistence (D-3)** — the big one, effectively-once cross-crash; **sealed-sender
-  epoch (S-2)**; X25519 low-order defense-in-depth (S-3). (D-5 gap horizon and D-6 offsets dir-fsync are now
-  FIXED.) None is a wire-adversary confidentiality/integrity break. D-3 is a correctness-critical durable
+- Remaining TRACKED: **dedup persistence (D-3)** — the big one, effectively-once cross-crash; X25519 low-order
+  defense-in-depth (S-3, not reachable). (S-2 epoch, D-5 gap horizon, D-6 offsets dir-fsync are now FIXED.) None is a wire-adversary confidentiality/integrity break. D-3 is a correctness-critical durable
   component scoped for its own careful arc + audit, not a tail-of-session rush.
 
 This pass is the methodology working: the auditors proved the scary lenses *safe* (signatures, verify-before-
