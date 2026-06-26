@@ -96,3 +96,18 @@ jobs:
             done
           done
           cat "$GITHUB_STEP_SUMMARY"
+
+      - name: GATE-WARP batch-amortization curve (th=1, per-core, vs batch size)
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### per-core (th=1) sealed throughput vs BATCH size — does GATE-WARP's per-cofre crypto amortize? (vaes=${{ inputs.vaes }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "| batch | msg size | MB/s/core | vs 1 GiB/s target |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for batch in 128 512 2048 8192; do
+            OUT=$(./target/release/datarail-engine-bench 1 16384 "$batch" 15 2>&1 | grep RESULT)
+            echo "engine-batch: batch=$batch $OUT"
+            mb=$(echo "$OUT" | sed -E 's/.* ([0-9]+) MB\/s.*/\1/')
+            pct=$(awk "BEGIN{printf \"%.0f%%\", ${mb:-0}/1024*100}")
+            echo "| $batch | 16384 B | ${mb:-?} | $pct |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          cat "$GITHUB_STEP_SUMMARY"
