@@ -3,8 +3,9 @@
 > **What changed.** The FASP delay-based controller is no longer only proven against a textbook AIMD in an
 > in-process simulation — it now moves real bytes over a real `UdpSocket` (`reliable_udp::FaspLink`), measured
 > against real kernel TCP on the same loopback, under **real `tc netem` kernel packet loss + delay**. See the
-> build in `FASP-UDP-TRANSPORT.md` (S1–S3). **Confidence: MEASURED-ON-REAL-SOCKET, n=1→3, S4 audit PENDING
-> before any PROVEN label.**
+> build in `FASP-UDP-TRANSPORT.md` (S1–S4). **Confidence: MEASURED-ON-REAL-SOCKET (n=2), S4 audit DONE
+> (`AUDIT-FASP.md`) — still DIRECTIONAL; PROVEN needs a real-WAN field number (loopback `netem` + modest absolute
+> throughput remain the open caveats).**
 
 ## The sweep (ubuntu-latest, 25 ms one-way delay ≈ 50 ms RTT, 5 s/transfer; n=2 of 3 — the 3rd run hung, see below)
 
