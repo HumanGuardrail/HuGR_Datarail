@@ -84,8 +84,10 @@ jobs:
           echo "|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           CORES=$(nproc)
           IFS=',' read -ra SIZES <<< "${{ inputs.msg_sizes }}"
+          # th=1 is the PER-CORE sealed throughput = the GATE-WARP number (≥1 GiB/s/core target); the others
+          # are the aggregate ceiling. The 1-thread run is the one that banks GATE-WARP on a VAES core.
           for sz in "${SIZES[@]}"; do
-            for th in "$CORES" "$((CORES/2))"; do
+            for th in 1 "$CORES" "$((CORES/2))"; do
               OUT=$(./target/release/datarail-engine-bench "$th" "$sz" 128 15 2>&1 | grep RESULT)
               echo "engine: $OUT"
               ms=$(echo "$OUT" | sed -E 's/.*: ([0-9]+) msg\/s.*/\1/')
