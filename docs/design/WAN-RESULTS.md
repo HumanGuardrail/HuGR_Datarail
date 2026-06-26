@@ -61,3 +61,11 @@ demonstrated on a **real socket under real kernel packet loss**, not only in sim
 statement is about the **shape** (FASP flat, TCP collapses past ~15% loss), with the exact multiplier left as a
 range pending n=3, and the whole claim gated behind the S4 audit. The absolute throughput of our mover is modest
 and we say so; the moat is resilience, and it is real.
+
+## n=3 update (2026-06-26, harness hang fixed)
+A 3-run sweep (per-transfer 90 s timeout added so a collapsed-TCP drain can't hang) confirms the SHAPE but the
+magnitude is noisy: at **15% loss TCP collapses to 0.55–1.63 MB/s** while FASP holds ~6.6–11.4 — a real but
+run-dependent edge (15% ratio swung 4×–20×). At **30% loss the bench TIMES OUT** (TCP's post-shutdown drain
+exceeds 90 s even time-bounded → reported NaN), so 30% has no clean datum. FASP's absolute throughput here was
+noisier/lower (~3–12 MB/s) than the earlier favorable n=2 (~13–19). **Honest net: the loss-resilience SHAPE
+(FASP holds, TCP collapses past ~15%) reproduces; a pinned multiplier does not. Stays DIRECTIONAL.**

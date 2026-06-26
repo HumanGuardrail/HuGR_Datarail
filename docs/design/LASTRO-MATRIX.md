@@ -30,7 +30,7 @@
 | **~72× less RAM @ equal fsync durability, ~92× idle** | OMB Run 12 | `bench/omb/run-omb.sh` + `omb-benchmark.yml` (`kafka_fsync`) | **n=3, σ1.6** | **BACKED** (the headline) |
 | FASP holds flat / TCP collapses past 15% loss (real netem) | WAN-RESULTS | `bench/wan/netem-fasp-vs-tcp.sh` + `wan-bench.yml` | n=2, labelled DIRECTIONAL, no headline × | **BACKED** (honest n=2) |
 | FASP "16.3/29.6/42.1×" *specific* multipliers | DOD-01, scorecard | `fasp_vs_lossbased.rs` asserts only **>1.5× + widening** | one seed | **SINGLE-SAMPLE** → flagged |
-| throughput "engine WINS ~1.2× / 1.9 GB/s" | OMB Run 7–8 | `engine_bench.rs`/`loadgen.rs` + `loadgen.yml` | n=1, swings 2–3× | **SINGLE-SAMPLE** → flagged DIRECTIONAL |
+| throughput: sealed engine **~1.4 GB/s @1KB (TIE, ~0.87× Kafka)** | THROUGHPUT-RESULTS | `loadgen.yml` ×3 | **n=3, tight** | **BACKED** — n=3 corrected the n=1 "1900/WINS" down to a TIE |
 | **cold-start: datarail p50 2 ms vs Kafka p50 5.1 s** | COLD-START-RESULTS | `bench/cold-start/cold-start.sh` + `cold-start.yml` | **n=30/5 controlled CI, datarail spread=0** | **BACKED** (gap closed 2026-06-26) |
 | GATE-WARP "LITERAL PASS 1.43 GB/s" | BENCH-01, DOD-01 | `loadgen.yml --vaes` (harness only; cited job **deleted**) | n=1, no committed artifact | **OVERCLAIMED** → downgraded to PENDING-RIGOR |
 | Run 11 "~67×, 13 MB vs 877 MB" | OMB Run 11 | OMB harness | n=1 (self-stated) | **STALE** → superseded by Run 12 (n=3) |
