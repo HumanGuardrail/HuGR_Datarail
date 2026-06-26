@@ -484,11 +484,11 @@ fn drbg_identical_state_clones_diverge_every_draw() {
     let seed = super::os_seed_32().expect("seed");
     let mut original = super::Drbg { seed };
     let mut clone = super::Drbg { seed }; // byte-identical clone — same seed, same (preserved) PID
-    let mut seen = std::collections::HashSet::new();
+    let mut observed = std::collections::HashSet::new();
     for _ in 0..1000 {
         let from_original = original.next_32().expect("original draw");
         let from_clone = clone.next_32().expect("clone draw");
         assert_ne!(from_original, from_clone, "identical-state clones must diverge every draw (snapshot immunity)");
-        assert!(seen.insert(from_original) && seen.insert(from_clone), "no repeated output across clones");
+        assert!(observed.insert(from_original) && observed.insert(from_clone), "no repeated output across clones");
     }
 }
