@@ -197,3 +197,54 @@ fn replaylog_survives_garbage_on_disk() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// Kafka wire-protocol parsers — the network-facing codec + Produce parsing. A hostile Kafka client
+// controls every byte; these must NEVER panic on garbage (the adversarial audit proved this by
+// inspection + one test — here we hammer it over millions of inputs).
+// ---------------------------------------------------------------------------------------------------
+
+#[test]
+fn kafka_codec_never_panics_on_garbage() {
+    use datarail_kafka::codec::{Reader, RequestHeader};
+    let mut rng = Rng::new(0xCAFE_F00D_1234);
+    for _ in 0..200_000 {
+        let buf = rng.bytes(80);
+        let mut r = Reader::new(&buf);
+        // Drive every reader method over arbitrary bytes; each must return a Result, never panic.
+        let _ = r.int8();
+        let _ = r.int16();
+        let _ = r.int32();
+        let _ = r.int64();
+        let _ = r.uint32();
+        let _ = r.unsigned_varint();
+        let _ = r.varint();
+        let _ = r.varlong();
+        let _ = r.string();
+        let _ = r.nullable_string();
+        let _ = r.compact_string();
+        let _ = r.compact_nullable_string();
+        let _ = r.bytes();
+        let _ = r.nullable_bytes();
+        let _ = r.compact_bytes();
+        let _ = r.compact_nullable_bytes();
+        let _ = r.skip_tagged_fields();
+        let mut r2 = Reader::new(&buf);
+        let _ = RequestHeader::parse(&mut r2, rng.next() & 1 == 0);
+    }
+}
+
+#[test]
+fn kafka_produce_parsers_never_panic_on_garbage() {
+    use datarail_kafka::codec::Reader;
+    use datarail_kafka::produce::{parse_produce, parse_record_batch};
+    let mut rng = Rng::new(0x9E37_79B9_0F0F);
+    for _ in 0..100_000 {
+        let buf = rng.bytes(160);
+        for version in [0i16, 3, 7] {
+            let mut r = Reader::new(&buf);
+            let _ = parse_produce(&mut r, version); // must not panic / OOM / hang on hostile counts
+        }
+        let _ = parse_record_batch(&buf); // v2/legacy dispatch on arbitrary bytes
+    }
+}

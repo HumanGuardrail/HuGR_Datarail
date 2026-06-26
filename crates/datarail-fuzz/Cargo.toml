@@ -13,3 +13,4 @@ datarail-erasure = { path = "../datarail-erasure" }
 datarail-blobstore = { path = "../datarail-blobstore" }
 datarail-netblob = { path = "../datarail-netblob" }
 datarail-replaylog = { path = "../datarail-replaylog" }
+datarail-kafka = { path = "../datarail-kafka" }
