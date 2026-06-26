@@ -139,6 +139,14 @@ impl Once {
             return Disposition::Duplicate;
         }
 
+        // (2b) Seq-level dedup above the watermark (audit HIGH): a seq is committed ONCE regardless of key.
+        // Without this, a redelivery of an already-delivered (but not-yet-contiguous) seq carrying a *different*
+        // idempotency_key would slip past (2) and be Delivered twice. `delivered_keys` is never GC'd above the
+        // watermark (gc_floor < low_watermark <= seq), so this check is reliable for any at/above-watermark seq.
+        if st.delivered_keys.contains_key(&seq) {
+            return Disposition::Duplicate;
+        }
+
         // (3) Commit: record the key, then advance the contiguous floor.
         st.seen.insert(idempotency_key);
         st.delivered_keys.insert(seq, idempotency_key);
@@ -253,6 +261,17 @@ mod tests {
         assert_eq!(o.admit(S, 1, key(999)), Disposition::Duplicate);
         // And a below-watermark replay of a key that was GC'd would otherwise look "new" — still not re-committed.
         assert_eq!(o.admit(S, 0, key(0)), Disposition::Duplicate);
+    }
+
+    #[test]
+    fn same_seq_above_watermark_with_a_different_key_is_a_duplicate() {
+        // audit HIGH: a redelivery of an already-delivered (not-yet-contiguous) seq carrying a *different*
+        // idempotency_key must NOT be committed twice — a seq is committed once regardless of key. Keep the
+        // watermark pinned with a gap at 0, deliver seq 5, then re-present seq 5 under a regenerated key.
+        let mut o = Once::new(SEED);
+        assert_eq!(o.admit(S, 5, key(5)), Disposition::Delivered);
+        assert_eq!(o.low_watermark(S), 0, "the gap at 0 pins the watermark; seq 5 is merely parked");
+        assert_eq!(o.admit(S, 5, key(999)), Disposition::Duplicate, "same seq, new key -> committed once");
     }
 
     #[test]

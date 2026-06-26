@@ -326,7 +326,14 @@ impl<O: OffsetStore> Server<O> {
     pub fn handle(&mut self, req: Request) -> Response {
         match req {
             Request::Produce { key, payload } => match self.topic.produce(&key, &payload) {
-                Ok(offset) => Response::Produced(offset),
+                // DURABILITY-BEFORE-ACK (audit CRITICAL #1/#2): fsync the topic before acking. Otherwise an
+                // acked record lives only in the page cache and a power loss silently loses it — and, worse, the
+                // fsync'd committed offset could then outlive the un-synced record and wedge the consumer group.
+                // (A group-commit batching the fsync across concurrent produces is the future throughput win.)
+                Ok(offset) => match self.topic.sync() {
+                    Ok(()) => Response::Produced(offset),
+                    Err(e) => Response::Err(e.to_string()),
+                },
                 Err(e) => Response::Err(e.to_string()),
             },
             Request::Poll { group } => {
@@ -352,10 +359,17 @@ impl<O: OffsetStore> Server<O> {
                     Err(e) => Response::Err(e.to_string()),
                 }
             }
-            Request::Commit { group, offset } => match self.offsets.commit(&group, offset) {
-                Ok(()) => Response::Committed,
-                Err(e) => Response::Err(e.to_string()),
-            },
+            Request::Commit { group, offset } => {
+                // Reject a commit past the durable topic tail (audit LOW #7): otherwise a buggy/hostile client
+                // can persist an offset that, on resume, seeks past the end and wedges the group forever.
+                if offset > self.topic.end_offset() {
+                    return Response::Err("commit offset is past the topic tail".to_owned());
+                }
+                match self.offsets.commit(&group, offset) {
+                    Ok(()) => Response::Committed,
+                    Err(e) => Response::Err(e.to_string()),
+                }
+            }
         }
     }
 }
