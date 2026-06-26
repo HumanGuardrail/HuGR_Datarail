@@ -95,6 +95,11 @@
     <p class="lead">~90× less RAM idle · ~40× less under load.</p>
     <p>It's <em>architecture</em>: Kafka/Pulsar are heavyweight JVM clusters that hold their working set in RAM;
     datarail is a lean Rust mover in tens of MB. No config makes a JVM cluster fit in 22 MB.</p>
+    <p class="muted"><strong>Two cuts, don't conflate them:</strong> this 3-way table is the original
+    <em>non-durable</em> path (loopback, datarail forgets) → ~40× under load. When datarail does the
+    <em>same fsync-durable work as Kafka</em> (the WAL substrate), the under-load number is <strong>~72× (n=3),
+    measured same-ruler</strong> — see the durability section below. The headline "~70×" refers to that
+    equal-durability comparison; this table's ~40× is the lighter non-durable cut. Both are real and measured.</p>
     <p class="muted"><strong>Honest scope (corrected by the adversarial audit):</strong> these are NOT perfectly
     like-for-like rulers — datarail is a bare process (<code>/proc</code> RSS); Kafka is a container
     (<code>docker stats</code>, which on cgroup v2 <em>excludes its page cache</em>, so Kafka's true working set
