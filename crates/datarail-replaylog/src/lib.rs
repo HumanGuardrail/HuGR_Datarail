@@ -188,9 +188,16 @@ impl ReplayLog {
         Ok(())
     }
 
-    /// Start replaying from `start_offset` (which must be a record boundary returned by [`append`](Self::append),
-    /// or `0`, or [`end_offset`](Self::end_offset) for an empty tail). The returned [`Replay`] streams records
-    /// through a bounded buffer — RAM stays flat regardless of how much history is retained.
+    /// Start replaying from `start_offset`. The returned [`Replay`] streams records through a bounded buffer —
+    /// RAM stays flat regardless of how much history is retained.
+    ///
+    /// **Precondition (WP8 audit honesty):** `start_offset` MUST be a record boundary — a value returned by
+    /// [`append`](Self::append), or `0`, or [`end_offset`](Self::end_offset). Only `> end` is *validated*
+    /// (→ `BadOffset`); a mis-aligned in-range offset is a caller error that yields an empty/garbage replay, not
+    /// an error. **Known limitation:** a CRC failure in a *non-final* segment (disk rot mid-history) ends the
+    /// replay there rather than resyncing to the next intact segment — corruption is detected (never returns
+    /// wrong bytes), but later intact segments become unreachable via that replay until the segment is repaired.
+    /// A resyncing reader is tracked as future work.
     ///
     /// # Errors
     /// [`ReplayError::BadOffset`] if `start_offset` is past the end; [`ReplayError::Io`] on a filesystem error.
@@ -356,6 +363,11 @@ impl Replay {
                 continue;
             }
             let offset = self.buf_base + self.cursor as u64;
+            // WP8 audit [LOW] fix: never emit a record at/after the snapshot end (a concurrent committed append to
+            // the active segment must not leak into a reader created before it).
+            if offset >= self.end {
+                return Ok(None);
+            }
             let body = &self.buf[p + 4..p + 4 + len];
             let stored = u32::from_le_bytes([
                 self.buf[p + 4 + len],

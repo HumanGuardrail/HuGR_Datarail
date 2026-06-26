@@ -5,7 +5,7 @@ The Kafka-waste ledger is attacked at the **component** level (8/9 PROVEN, 1 DIR
 a cold tier, a network protocol — plus hardening (audits, the object-store flaw, FASP throughput). This is the
 frozen plan: disjoint work packages, frozen contracts, a 10-agent wave.
 
-## TechLead WAVE PLAN — integration-wave-01 @ main
+## TechLead WAVE PLAN — integration-wave-01 @ main — ✅ LANDED (10/10 WPs, lead-verified)
 ```
 GO/NO-GO     : PARALLEL (10 agents)
 DISJOINTNESS : shared file (workspace Cargo.toml members) eliminated — the LEAD pre-added all 4 new members + the

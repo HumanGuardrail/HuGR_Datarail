@@ -48,9 +48,11 @@ fn gf_mul(a: u8, b: u8) -> u8 {
     EXP[s % 255]
 }
 
-/// GF(2⁸) multiplicative inverse. `a` must be non-zero (callers guarantee it).
+/// GF(2⁸) multiplicative inverse. `a` must be non-zero (callers guarantee it — Cauchy never forms `x^y == 0`,
+/// and `invert` only inverts non-zero pivots). The `debug_assert` documents that contract (WP7 audit hardening).
 #[must_use]
 fn gf_inv(a: u8) -> u8 {
+    debug_assert!(a != 0, "gf_inv(0) is undefined");
     EXP[(255 - LOG[a as usize] as usize) % 255]
 }
 

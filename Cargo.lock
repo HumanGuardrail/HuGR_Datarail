@@ -303,6 +303,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-blobstore"
+version = "0.0.0"
+
+[[package]]
+name = "datarail-broker"
+version = "0.0.0"
+dependencies = [
+ "datarail-offsets",
+ "datarail-topic",
+]
+
+[[package]]
 name = "datarail-cli"
 version = "0.0.0"
 dependencies = [
@@ -351,6 +363,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "datarail-erasure"
+version = "0.0.0"
+
+[[package]]
 name = "datarail-identity"
 version = "0.0.0"
 dependencies = [
@@ -362,6 +378,10 @@ dependencies = [
  "spake2",
  "subtle",
 ]
+
+[[package]]
+name = "datarail-keyrouter"
+version = "0.0.0"
 
 [[package]]
 name = "datarail-manifest"
@@ -380,6 +400,10 @@ dependencies = [
  "datarail-rail",
  "datarail-terminal",
 ]
+
+[[package]]
+name = "datarail-offsets"
+version = "0.0.0"
 
 [[package]]
 name = "datarail-omb-shim"
@@ -410,6 +434,18 @@ dependencies = [
  "datarail-cofre",
  "datarail-core",
  "datarail-crypto",
+]
+
+[[package]]
+name = "datarail-replaylog"
+version = "0.0.0"
+
+[[package]]
+name = "datarail-replication"
+version = "0.0.0"
+dependencies = [
+ "datarail-blobstore",
+ "datarail-erasure",
 ]
 
 [[package]]
@@ -484,6 +520,14 @@ dependencies = [
  "datarail-once",
  "proptest",
  "zeroize",
+]
+
+[[package]]
+name = "datarail-topic"
+version = "0.0.0"
+dependencies = [
+ "datarail-keyrouter",
+ "datarail-replaylog",
 ]
 
 [[package]]

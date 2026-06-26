@@ -112,9 +112,14 @@ impl Router {
         let mut best: Option<(u64, u64)> = None; // (weight, node)
         for &node in &self.nodes {
             let w = weight(key_hash, node);
-            match best {
-                Some((bw, bn)) if (w, node) <= (bw, bn) => {}
-                _ => best = Some((w, node)),
+            // Highest weight wins; on a (distinct-id ⇒ impossible) tie, the smaller id — matching the doc and
+            // `rank_keyhash` so the `rank[0] == route` invariant holds even under hypothetical duplicate ids.
+            let better = match best {
+                None => true,
+                Some((bw, bn)) => w > bw || (w == bw && node < bn),
+            };
+            if better {
+                best = Some((w, node));
             }
         }
         best.map(|(_, n)| n)

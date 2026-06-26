@@ -32,8 +32,13 @@ const CRC_LEN: usize = 4;
 /// Largest per-message payload — kept well under a typical path MTU so a DATA frame is one un-fragmented IP
 /// datagram (header + payload + crc ≤ ~1217 bytes).
 pub const MAX_FASP_PAYLOAD: usize = 1200;
-/// Receive scratch buffer — comfortably larger than any single frame.
+/// Receive scratch buffer — comfortably larger than any single frame (and any coalesced ACK datagram).
 const DGRAM_BUF: usize = 2048;
+/// On-the-wire length of one ACK frame (header + empty payload + crc): used to pack many ACKs into one datagram.
+const ACK_FRAME_LEN: usize = HEADER_LEN + CRC_LEN;
+/// Budget for a single coalesced-ACK datagram. Kept ≤ [`MAX_FASP_PAYLOAD`] so a packed-ACK datagram, like a
+/// DATA frame, stays a single un-fragmented IP datagram on a typical path.
+const ACK_DGRAM_BUDGET: usize = MAX_FASP_PAYLOAD;
 
 /// Tuning for a [`FaspLink`].
 #[derive(Debug, Clone, Copy)]
@@ -169,6 +174,11 @@ pub struct FaspLink {
     sent: u64,
     retransmits: u64,
     tx_count: u64,
+    /// Seqs awaiting acknowledgement, accumulated across one `pump` drain and flushed as a few coalesced
+    /// datagrams (many ACK frames per datagram) instead of one tiny datagram per DATA frame — amortizing the
+    /// per-datagram syscall on both the receiver's send and the sender's recv. Drained every flush, so it is
+    /// bounded by the datagrams processed in a single `pump` (`INV-FASP-BOUNDED` holds).
+    pending_acks: Vec<u64>,
     // Receive side.
     next_deliver: u64,
     reorder: BTreeMap<u64, Vec<u8>>,
@@ -197,6 +207,7 @@ impl FaspLink {
             sent: 0,
             retransmits: 0,
             tx_count: 0,
+            pending_acks: Vec::new(),
             next_deliver: 0,
             reorder: BTreeMap::new(),
             ready: std::collections::VecDeque::new(),
@@ -301,60 +312,93 @@ impl FaspLink {
         let mut buf = [0u8; DGRAM_BUF];
         loop {
             match self.sock.recv_from(&mut buf) {
-                Ok((n, from)) => self.on_datagram(&buf[..n], from)?,
+                Ok((n, from)) => self.on_datagram(&buf[..n], from),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(FaspError::Io(e)),
             }
         }
+        self.flush_acks()?;
         self.retransmit_due()?;
         Ok(())
     }
 
-    fn on_datagram(&mut self, dgram: &[u8], from: SocketAddr) -> Result<(), FaspError> {
+    /// Send every ACK accumulated during this `pump`'s drain, packed into as few datagrams as fit under
+    /// [`ACK_DGRAM_BUDGET`] — one `send_to` for up to ~70 ACKs instead of one per frame. A dropped coalesced
+    /// datagram is harmless: the un-acked DATA simply retransmits on RTO and is re-ACKed, so reliability and
+    /// exactly-once are unchanged.
+    fn flush_acks(&mut self) -> Result<(), FaspError> {
+        if self.pending_acks.is_empty() {
+            return Ok(());
+        }
+        let acks = std::mem::take(&mut self.pending_acks);
+        let Some(peer) = self.peer else {
+            return Ok(()); // no peer to ACK (acks already drained, bound restored)
+        };
+        let mut dgram: Vec<u8> = Vec::with_capacity(ACK_DGRAM_BUDGET);
+        for seq in acks {
+            if !dgram.is_empty() && dgram.len() + ACK_FRAME_LEN > ACK_DGRAM_BUDGET {
+                self.wire_send(&dgram, peer)?;
+                dgram.clear();
+            }
+            encode_frame_into(&mut dgram, seq, KIND_ACK, &[]);
+        }
+        if !dgram.is_empty() {
+            self.wire_send(&dgram, peer)?;
+        }
+        Ok(())
+    }
+
+    fn on_datagram(&mut self, dgram: &[u8], from: SocketAddr) {
         // S4 fix F4: once we know our peer, drop datagrams from any other source. CRC is an error-detector, not a
         // MAC, so off-path UDP spoofing could otherwise forge an ACK (silent loss) or inject DATA. This defeats
         // blind off-path spoofing cheaply; on-path integrity comes from the sealed cofre layer above.
         if let Some(peer) = self.peer {
             if from != peer {
-                return Ok(());
+                return;
             }
         }
-        let Some((seq, kind, payload)) = decode_frame(dgram) else {
-            return Ok(()); // corrupt datagram → drop; reliability recovers it via retransmit
-        };
-        match kind {
-            KIND_DATA => {
-                // S4 fix F1/F1b: receive-window flow control. `base` is the lowest un-consumed seq (front of the
-                // ready queue); a frame outside [base, base+recv_window) is dropped WITHOUT an ACK, so the sender
-                // retransmits once the window slides. This bounds reorder + ready to O(recv_window) regardless of
-                // a hostile peer's seqs — INV-FASP-BOUNDED on the receive side.
-                let base = self.next_deliver - self.ready.len() as u64;
-                if seq >= base.saturating_add(self.cfg.recv_window as u64) {
-                    return Ok(());
-                }
-                // Always ACK an in-window frame (even a duplicate) so the sender can retire it and stop resending.
-                let ack = encode_frame(seq, KIND_ACK, &[]);
-                self.wire_send(&ack, from)?;
-                if seq >= self.next_deliver && !self.reorder.contains_key(&seq) {
-                    self.reorder.insert(seq, payload.to_vec());
-                    while let Some(bytes) = self.reorder.remove(&self.next_deliver) {
-                        self.ready.push_back(bytes);
-                        self.delivered += 1;
-                        self.next_deliver += 1;
+        // A datagram carries one or more concatenated frames (DATA is sent one-per-datagram; ACKs are coalesced
+        // many-per-datagram). Parse frame by frame; on the first malformed/corrupt frame drop the remainder —
+        // reliability recovers the lost frames via retransmit, exactly as a whole-datagram drop would.
+        let mut off = 0;
+        while off < dgram.len() {
+            let Some((seq, kind, payload, consumed)) = decode_frame_at(&dgram[off..]) else {
+                return;
+            };
+            off += consumed;
+            match kind {
+                KIND_DATA => {
+                    // S4 fix F1/F1b: receive-window flow control. `base` is the lowest un-consumed seq (front of
+                    // the ready queue); a frame outside [base, base+recv_window) is dropped WITHOUT an ACK, so the
+                    // sender retransmits once the window slides. This bounds reorder + ready to O(recv_window)
+                    // regardless of a hostile peer's seqs — INV-FASP-BOUNDED on the receive side.
+                    let base = self.next_deliver - self.ready.len() as u64;
+                    if seq >= base.saturating_add(self.cfg.recv_window as u64) {
+                        continue;
+                    }
+                    // Always ACK an in-window frame (even a duplicate) so the sender can retire it and stop
+                    // resending; the ACK is queued and flushed (coalesced) at the end of this pump.
+                    self.pending_acks.push(seq);
+                    if seq >= self.next_deliver && !self.reorder.contains_key(&seq) {
+                        self.reorder.insert(seq, payload.to_vec());
+                        while let Some(bytes) = self.reorder.remove(&self.next_deliver) {
+                            self.ready.push_back(bytes);
+                            self.delivered += 1;
+                            self.next_deliver += 1;
+                        }
                     }
                 }
-            }
-            KIND_ACK => {
-                if let Some(f) = self.inflight.remove(&seq) {
-                    if !f.retransmitted {
-                        self.cc.on_rtt_sample(f.sent_at.elapsed());
+                KIND_ACK => {
+                    if let Some(f) = self.inflight.remove(&seq) {
+                        if !f.retransmitted {
+                            self.cc.on_rtt_sample(f.sent_at.elapsed());
+                        }
                     }
                 }
+                _ => {} // unknown kind → ignore
             }
-            _ => {} // unknown kind → ignore
         }
-        Ok(())
     }
 
     fn retransmit_due(&mut self) -> Result<(), FaspError> {
@@ -421,25 +465,45 @@ impl FaspLink {
 /// (enforced by callers), so the `len` field fits a `u32`.
 fn encode_frame(seq: u64, kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut f = Vec::with_capacity(HEADER_LEN + payload.len() + CRC_LEN);
-    f.extend_from_slice(&seq.to_le_bytes());
-    f.push(kind);
-    let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
-    f.extend_from_slice(&len.to_le_bytes());
-    f.extend_from_slice(payload);
-    let crc = crc32(&f);
-    f.extend_from_slice(&crc.to_le_bytes());
+    encode_frame_into(&mut f, seq, kind, payload);
     f
 }
 
-/// Decode + verify a frame. Returns `None` on any malformed/corrupt datagram (length mismatch or bad CRC) — the
-/// caller treats that as a drop, which retransmission recovers.
-fn decode_frame(dgram: &[u8]) -> Option<(u64, u8, &[u8])> {
+/// Append one `[seq][kind][len][payload][crc]` frame to `buf` (the CRC covers only this frame's bytes), so several
+/// frames can be packed into one datagram. `payload.len()` is always ≤ [`MAX_FASP_PAYLOAD`] (enforced by callers),
+/// so the `len` field fits a `u32`.
+fn encode_frame_into(buf: &mut Vec<u8>, seq: u64, kind: u8, payload: &[u8]) {
+    let start = buf.len();
+    buf.extend_from_slice(&seq.to_le_bytes());
+    buf.push(kind);
+    let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(payload);
+    let crc = crc32(&buf[start..]);
+    buf.extend_from_slice(&crc.to_le_bytes());
+}
+
+/// Decode + verify the frame at the front of `dgram`, returning `(seq, kind, payload, bytes_consumed)` so the
+/// caller can advance to the next frame in a coalesced datagram. Returns `None` on any malformed/corrupt or
+/// truncated frame (length mismatch, bad CRC, oversize payload) — the caller treats that as a drop, which
+/// retransmission recovers.
+fn decode_frame_at(dgram: &[u8]) -> Option<(u64, u8, &[u8], usize)> {
     if dgram.len() < HEADER_LEN + CRC_LEN {
         return None;
     }
-    let body_len = dgram.len() - CRC_LEN;
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&dgram[9..13]);
+    let len = u32::from_le_bytes(len_bytes) as usize;
+    if len > MAX_FASP_PAYLOAD {
+        return None; // a peer trying to push a larger-than-spec payload (S4 fix F8)
+    }
+    let body_len = HEADER_LEN + len;
+    let frame_len = body_len + CRC_LEN;
+    if dgram.len() < frame_len {
+        return None; // truncated: the declared payload runs past the datagram
+    }
     let mut crc_bytes = [0u8; 4];
-    crc_bytes.copy_from_slice(&dgram[body_len..]);
+    crc_bytes.copy_from_slice(&dgram[body_len..frame_len]);
     if u32::from_le_bytes(crc_bytes) != crc32(&dgram[..body_len]) {
         return None;
     }
@@ -447,13 +511,7 @@ fn decode_frame(dgram: &[u8]) -> Option<(u64, u8, &[u8])> {
     seq_bytes.copy_from_slice(&dgram[..8]);
     let seq = u64::from_le_bytes(seq_bytes);
     let kind = dgram[8];
-    let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&dgram[9..13]);
-    let len = u32::from_le_bytes(len_bytes) as usize;
-    if len != body_len - HEADER_LEN || len > MAX_FASP_PAYLOAD {
-        return None; // length mismatch, or a peer trying to push a larger-than-spec payload (S4 fix F8)
-    }
-    Some((seq, kind, &dgram[HEADER_LEN..body_len]))
+    Some((seq, kind, &dgram[HEADER_LEN..body_len], frame_len))
 }
 
 #[cfg(test)]

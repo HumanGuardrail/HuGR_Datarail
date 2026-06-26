@@ -32,6 +32,8 @@ pub enum TopicError {
     Log(ReplayError),
     /// A stored record's framing was corrupt (truncated key length).
     Corrupt,
+    /// The group has no members to route to (add one and retry — no record is consumed).
+    NoMembers,
 }
 
 impl std::fmt::Display for TopicError {
@@ -39,6 +41,7 @@ impl std::fmt::Display for TopicError {
         match self {
             Self::Log(e) => write!(f, "topic log: {e}"),
             Self::Corrupt => f.write_str("topic record framing corrupt"),
+            Self::NoMembers => f.write_str("topic group has no members to route to"),
         }
     }
 }
@@ -113,6 +116,11 @@ impl Topic {
     /// # Errors
     /// [`TopicError`] on a read or framing error.
     pub fn dispatch_next(&self, group: &mut Group) -> Result<Option<Dispatched>, TopicError> {
+        // WP10 audit [HIGH] fix: fail BEFORE consuming a record if there is no one to route it to. Otherwise the
+        // cursor/reader would advance past a record that was never dispatched → silent loss when a member rejoins.
+        if group.router.is_empty() {
+            return Err(TopicError::NoMembers);
+        }
         // (Re)create the streaming reader at the group's cursor — picks up records produced since last time.
         if group.replay.is_none() {
             group.replay = Some(self.log.replay_from(group.cursor)?);
@@ -318,6 +326,34 @@ mod tests {
         let replayed = drain_all(&topic, &mut g);
         assert_eq!(replayed.len(), 400, "rewind+replay did not re-yield the retained tail");
         assert_eq!(replayed[0].offset, offsets[600]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WP10 audit [HIGH] regression: a group drained to zero members must NOT consume a record — it errors, and
+    /// after a member rejoins the record is still dispatched (no silent loss).
+    #[test]
+    fn dispatch_to_an_empty_group_consumes_nothing_then_recovers() {
+        let dir = tmpdir("nomembers");
+        let mut topic = Topic::open(&dir, 1 << 16).expect("open");
+        for i in 0..50u32 {
+            topic.produce(&key_of(i), format!("{i}").as_bytes()).expect("produce");
+        }
+        topic.sync().expect("sync");
+
+        let mut g = Group::new(&[1]);
+        // Drain a few, then the only member leaves → group is empty.
+        for _ in 0..10 {
+            topic.dispatch_next(&mut g).expect("d").expect("some");
+        }
+        assert!(g.remove_member(1));
+        match topic.dispatch_next(&mut g) {
+            Err(super::TopicError::NoMembers) => {}
+            other => panic!("expected NoMembers, got {other:?}"),
+        }
+        // A member rejoins; the 11th record (never consumed) must be the next one dispatched.
+        assert!(g.add_member(2));
+        let rest = drain_all(&topic, &mut g);
+        assert_eq!(rest.len(), 40, "records were lost across the empty-group window");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
