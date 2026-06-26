@@ -8,3 +8,6 @@
 #![forbid(unsafe_code)]
 
 pub mod codec;
+pub mod handlers;
+pub mod produce;
+pub mod serve;
