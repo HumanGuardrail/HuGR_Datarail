@@ -1,0 +1,11 @@
+[package]
+name = "datarail-kafka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "datarail-kafka — Kafka wire-protocol ingest: an unmodified Kafka producer sends to datarail (provider-blind, serverless), no code change. Zero-dependency broker-side codec + handlers."
+
+[lints]
+workspace = true
+
+[dependencies]
