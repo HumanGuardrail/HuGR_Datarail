@@ -11,20 +11,26 @@ infrastructure never sees what it carried.**
 
 ## Status
 
-**Engine + product surface built, proven, and audited** (per THE HUGR METHOD: architecture-first →
-design-before-code → freeze rituals → fleet execution). 16 crates · clippy `deny(all+pedantic)` ·
-`forbid(unsafe)` workspace-wide (one audited shared-memory waiver in the shmem substrate). Honest ledger
-of every Acceptance Criterion / gate / invariant: [`docs/design/DOD-01.md`](docs/design/DOD-01.md).
+**Engine + v1 product built, proven, and audited** (per THE HUGR METHOD: architecture-first →
+design-before-code → freeze rituals → fleet execution). **33 crates · 246 tests** · clippy
+`deny(all+pedantic)` · `forbid(unsafe)` workspace-wide (one audited shared-memory waiver in the shmem
+substrate). Honest evidence matrix — every load-bearing number → committed repro → rigor → verdict:
+[`docs/design/LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md); DoD ledger:
+[`docs/design/DOD-01.md`](docs/design/DOD-01.md).
 
 What runs today: sealed cofres with per-cofre X25519 key-wrap + sealed-sender, an offline-verifiable
 Merkle delivery proof, effectively-once delivery, smart terminals (content-contract + dead-letter), the
 three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS) behind one conformance
 harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
-`Noise_KK` + SPAKE2 identity layer, and the `datarail` CLI moving real data source→sink.
+`Noise_KK` + SPAKE2 identity layer, the **v1 product flow — an HTTP API → sealed rail → Postgres**
+(zero-dependency, hand-rolled Postgres driver), and the `datarail` CLI moving real data source→sink.
 
-**Pending only on external physical resources (not code):** the `GATE-WARP` throughput *measurement*
-needs representative x86-VAES hardware; the AC-10 fairness *bake-off* needs the real competitor engines
-(Kafka/MFT/Fivetran). The rig, the bound, and everything provable on this box are done.
+**Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
+**~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**
+(n=30 controlled CI) → scale-to-zero; raw throughput is an **honest TIE** (datarail's *sealed* engine ≈
+Kafka's *plaintext*). The moat is **efficiency + structural** (provider-blind, serverless, exactly-once
+with proof), not raw speed — and every claim carries its real confidence label, because a long adversarial
+audit of our own benchmarks corrected every over-claim that appeared.
 
 ## The doctrine
 
@@ -35,6 +41,19 @@ dumbest, cheapest substrate available. Because every vault is sealed end-to-end,
 — including ours — and a breach yields useless ciphertext.
 
 ## Try it
+
+**The v1 product — an HTTP API → Postgres, sealed end-to-end, zero-dependency** (even the Postgres driver
+is hand-rolled and provider-blind — the pipe and the database host never see plaintext):
+
+```sh
+# seal newline-delimited records from any HTTP endpoint into a Postgres table:
+datarail run examples/rail.toml \
+    --source-http https://api.example.com/events \
+    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
+# boarded → sealed cofre over the rail → COPY-landed as rows. Verified end-to-end against real Postgres 16.
+```
+
+Lower-level rehearsals (files, two-process TCP, identity pairing):
 
 ```sh
 # (toolchain note: run cargo from the stable toolchain on PATH if the rustup proxy is unavailable)
