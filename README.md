@@ -12,7 +12,7 @@ infrastructure never sees what it carried.**
 ## Status
 
 **Engine + v1 product built, proven, and audited** (per THE HUGR METHOD: architecture-first →
-design-before-code → freeze rituals → fleet execution). **33 crates · 246 tests** · clippy
+design-before-code → freeze rituals → fleet execution). **34 crates** · clippy
 `deny(all+pedantic)` · `forbid(unsafe)` workspace-wide (one audited shared-memory waiver in the shmem
 substrate). Honest evidence matrix — every load-bearing number → committed repro → rigor → verdict:
 [`docs/design/LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md); DoD ledger:
@@ -99,7 +99,8 @@ real transport: `auto`/`loopback` · `tcp` · `shmem` · `s3` · `quic` (the las
 | Proof & once | `datarail-manifest` (Merkle proof + `bao` chunk-resume) · `datarail-once` (effectively-once) |
 | Rail | `datarail-rail` (substrate trait + loopback/resumable/UDS/TCP + WAN harness + FASP CC + DoS cookie) · `datarail-substrate-{shmem,quic,objectstore}` |
 | Terminals & identity | `datarail-terminal` (contract/seal/dead-letter/sealed-sender) · `datarail-identity` (Noise_KK + SPAKE2) · `datarail-connectors` |
-| Surface & proof | `datarail-spec` (`rail.toml`) · `datarail-cli` (`datarail`) · `datarail-acceptance` · `datarail-bench` (incl. the AC-10 fairness rig) |
+| Surface & proof | `datarail-spec` (`rail.toml`) · `datarail-cli` (`datarail`) · `datarail-acceptance` · `datarail-bench` |
+| Connectors & compat | `datarail-connectors` (HTTP · Postgres · webhook · file) · `datarail-kafka` (Kafka wire-protocol ingest) |
 
 ## Map
 
