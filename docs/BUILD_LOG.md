@@ -679,6 +679,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   serverless, no code change.* Zero-dep, forbid(unsafe), clippy clean, 27 unit tests. (Open: consumer-side Fetch
   API for full read-compat; compression; SCRAM — all next-arc, not needed for produce-ingest.)
 
+- 2026-06-26 — **BRUTAL ADVERSARIAL AUDIT of the new code (kafka + connectors) — 12 findings, all closed.** Two
+  hostile background auditors attacked `datarail-kafka` and `datarail-connectors` (assume-bugs, cold-verify, PoCs).
+  Both were disciplined: the connectors auditor empirically CONFIRMED the Postgres COPY path is injection-safe
+  (escaping doubles backslashes; `\.`/`\N` can not be reconstructed) and identifier breakout is blocked; the
+  kafka auditor CONFIRMED the codec is panic-free under hostile input (no reachable panic). The real defects (DoS
+  + integrity) were fixed at root + regression-tested: **kafka** K1 unbounded offset map (PoC: 12.5M permanent
+  keys/100MiB) → capped; K2 unbounded threads + no socket timeouts (flood/slowloris) → MAX_CONNECTIONS + 30s
+  timeouts; K3 count-driven over-alloc → counts bounded by remaining bytes; K5 lock-poison recovery; K6
+  saturating offset; MAX_FRAME 100→16 MiB. **connectors** F1/F2 unbounded `read_to_end` (remote OOM) → 64/8 MiB
+  caps; F3 NUL byte → rejected up front; F4 silent Content-Length truncation → errors. Commits `c53cfb7`,
+  `06daccc`. Legit `kcat` produce re-verified post-hardening. No false positives to reject this round (the
+  auditors proved the scary lenses safe rather than inventing weak findings).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
