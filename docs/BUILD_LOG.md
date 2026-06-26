@@ -657,6 +657,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   no code change) — a dedicated arc (protocol codec → ApiVersions/Metadata → Produce + RecordBatch v2 parser →
   live-verify vs a real Kafka client).
 
+- 2026-06-26 — **Kafka wire-compat WP-A DONE: the codec foundation (`datarail-kafka` crate).** Zero-dep
+  broker-side Kafka wire codec — big-endian ints, LEB128 unsigned_varint, zigzag varint/varlong, classic +
+  KIP-482 compact strings/bytes, tagged-fields, `RequestHeader::parse` + `write_response_header` + `frame`. Fully
+  defensive reader (short/overlong/huge-length → `io::Error`, alloc capped). 23 tests, clippy clean, cold-verified
+  (committed `fe4cb70`). **Checkpoint here (tech-lead pacing call, logged):** the remaining Kafka WPs —
+  ApiVersions/Metadata handlers, the Produce + RecordBatch-v2 parser, and the TCP serve-loop wired to a Sink —
+  are version-sensitive and tightly coupled; their correctness can only be proven by ITERATING against a real
+  Kafka client (kafkacat/kafka-python/console-producer in docker), so they are a focused next arc, NOT blind
+  agent fan-out. The codec is a complete, tested sub-component (like `datarail-erasure` standing alone), not
+  half-built debt. Next increment: handlers + Produce + serve-loop + live-verify, in the iterate-against-a-real-
+  -client loop.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
