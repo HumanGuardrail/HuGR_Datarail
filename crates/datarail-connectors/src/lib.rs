@@ -14,9 +14,11 @@ use std::path::Path;
 
 pub mod http_source;
 pub mod postgres_sink;
+pub mod webhook_sink;
 
 pub use http_source::HttpSource;
 pub use postgres_sink::{PgConfig, PostgresSink};
+pub use webhook_sink::WebhookSink;
 
 /// A data **source**: the next batch of raw byte-records, or `None` once exhausted. The onboarding terminal
 /// boards each batch (contract + seal); the connector never handles keys or cofres.

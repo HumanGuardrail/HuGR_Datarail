@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use datarail_connectors::{
     HttpSource, LineFileSink, LineFileSource, PgConfig, PostgresSink, Sink, SliceSource, Source, VecSink,
+    WebhookSink,
 };
 use datarail_core::{Cofre, Disposition, Substrate};
 use datarail_crypto::{blake3_256, ctx, sign_domain, verifying_key};
@@ -57,7 +58,8 @@ USAGE:
       --sink-postgres CONN       land each delivered record as a row, via the zero-dep Postgres wire protocol.
                                  CONN = comma-separated key=value: host,user,db,table,column[,port][,password]
                                  e.g. host=db,user=rail,db=events,table=raw,column=data,port=5432,password=secret
-      (precedence: --source-http > --source-file > inline/stdin ; --sink-postgres > --sink-file > in-memory)
+      --sink-webhook URL         POST each delivered batch to an HTTP endpoint (newline-delimited records).
+      (precedence: --source-http > --source-file > inline/stdin ; --sink-postgres > --sink-webhook > --sink-file > in-memory)
     --watch        on `run`: print a live one-line speedometer per batch (no TUI; raw stdout).
     replay reads from the configured source (--source-file > inline args > stdin) and re-ships only the
     selected index slice; the once-gate dedups an already-delivered range in-process (no re-commit). True
@@ -231,6 +233,7 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
     let mut sink_file: Option<String> = None;
     let mut source_http: Option<String> = None;
     let mut sink_pg: Option<String> = None;
+    let mut sink_webhook: Option<String> = None;
     let mut watch = false;
     let mut inline: Vec<Vec<u8>> = Vec::new();
     let mut i = 1;
@@ -250,6 +253,10 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
             }
             "--sink-postgres" => {
                 sink_pg = Some(require(rest, i + 1, "conn")?.to_string());
+                i += 2;
+            }
+            "--sink-webhook" => {
+                sink_webhook = Some(require(rest, i + 1, "url")?.to_string());
                 i += 2;
             }
             "--watch" => {
@@ -276,9 +283,11 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
         Box::new(SliceSource::one(records))
     };
 
-    // Sink connector: `--sink-postgres` (seal→land as rows) > `--sink-file` (append lines) > in-memory.
+    // Sink connector: `--sink-postgres` > `--sink-webhook` (POST batches) > `--sink-file` > in-memory.
     let mut sink: Box<dyn Sink> = if let Some(conn) = sink_pg {
         Box::new(PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?)
+    } else if let Some(url) = sink_webhook {
+        Box::new(WebhookSink::post(&url).map_err(|e| CliError::Io(e.to_string()))?)
     } else if let Some(path) = sink_file {
         Box::new(LineFileSink::create(&path).map_err(|e| CliError::Io(e.to_string()))?)
     } else {
