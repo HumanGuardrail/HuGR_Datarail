@@ -1,0 +1,51 @@
+name: Kafka ingest — unmodified producer → sealed rail → Postgres
+
+# Continuously verifies the adoption bridge (LASTRO rule: no claim without a committed repro): a REAL Kafka
+# producer (kcat/librdkafka) produces to datarail's Kafka wire endpoint, which seals each record through the rail
+# and lands it in a real Postgres service container. No producer code change.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/datarail-kafka/**"
+      - "crates/datarail-cli/**"
+      - ".github/workflows/kafka-ingest.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install psql client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Real Kafka producer → datarail kafka-ingest → sealed rail → Postgres
+        run: |
+          psql -h localhost -U postgres -c "CREATE TABLE kafka_events (data text);"
+          cargo build -p datarail-cli --release
+          ./target/release/datarail kafka-ingest examples/rail.toml \
+            --listen 0.0.0.0:9092 --advertised 127.0.0.1 \
+            --sink-postgres "host=localhost,port=5432,user=postgres,db=postgres,table=kafka_events,column=data" &
+          sleep 3
+          # kcat on the host network reaches the ingest endpoint on 127.0.0.1:9092
+          printf 'evt:ci-1\nevt:ci-2\nevt:ci-3\n' \
+            | docker run --rm -i --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9092 -t events -P
+          sleep 2
+          ROWS=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM kafka_events;")
+          echo "sealed rows landed from a real Kafka producer = $ROWS"
+          [ "$ROWS" = "3" ] || { echo "::error::expected 3 rows, got $ROWS"; exit 1; }
+          echo "## Kafka ingest ✅ — unmodified producer → sealed rail → Postgres (3 sealed rows)" >> "$GITHUB_STEP_SUMMARY"

@@ -23,7 +23,8 @@ Merkle delivery proof, effectively-once delivery, smart terminals (content-contr
 three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS) behind one conformance
 harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
 `Noise_KK` + SPAKE2 identity layer, the **v1 product flow — an HTTP API → sealed rail → Postgres**
-(zero-dependency, hand-rolled Postgres driver), and the `datarail` CLI moving real data source→sink.
+(zero-dependency, hand-rolled Postgres driver), **Kafka wire-protocol ingest** (an unmodified Kafka producer →
+sealed rail → any sink, no code change), and the `datarail` CLI moving real data source→sink.
 
 **Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
 **~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**
@@ -51,6 +52,14 @@ datarail run examples/rail.toml \
     --source-http https://api.example.com/events \
     --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
 # boarded → sealed cofre over the rail → COPY-landed as rows. Verified end-to-end against real Postgres 16.
+```
+
+**Drop-in for Kafka producers** — point an existing producer at datarail, unchanged; it seals every record:
+
+```sh
+datarail kafka-ingest examples/rail.toml --advertised <reachable-host> \
+    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data"
+# an UNMODIFIED Kafka producer (kcat/librdkafka/...) → datarail seals → Postgres. Verified e2e in CI.
 ```
 
 Lower-level rehearsals (files, two-process TCP, identity pairing):

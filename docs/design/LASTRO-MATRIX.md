@@ -29,6 +29,7 @@
 | restart-resume / shard-loss / remote-tier (system) | INTEGRATION/capstone | `datarail-system/tests/e2e.rs` | asserted | **BACKED** |
 | **no-loss under crash CHAOS** (many random broker crashes) | system | `datarail-system/tests/chaos.rs` | seeded, 2000 records | **BACKED** |
 | **v1 product flow: HTTP API → sealed rail → Postgres** | connectors | `datarail run --source-http --sink-postgres` + `tests/postgres_live.rs` | live docker PG 16 (trust+md5), e2e 3 sealed rows | **BACKED** |
+| **Kafka ingest: unmodified producer → sealed → Postgres** | datarail-kafka | `kafka-ingest.yml` (kcat + PG service) | real librdkafka, e2e 3 sealed rows in CI | **BACKED** |
 | **~72× less RAM @ equal fsync durability, ~92× idle** | OMB Run 12 | `bench/omb/run-omb.sh` + `omb-benchmark.yml` (`kafka_fsync`) | **n=3, σ1.6** | **BACKED** (the headline) |
 | FASP holds flat / TCP collapses past 15% loss (real netem) | WAN-RESULTS | `bench/wan/netem-fasp-vs-tcp.sh` + `wan-bench.yml` | n=2, labelled DIRECTIONAL, no headline × | **BACKED** (honest n=2) |
 | FASP "16.3/29.6/42.1×" *specific* multipliers | DOD-01, scorecard | `fasp_vs_lossbased.rs` asserts only **>1.5× + widening** | one seed | **SINGLE-SAMPLE** → flagged |
