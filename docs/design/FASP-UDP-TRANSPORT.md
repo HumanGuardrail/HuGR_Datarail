@@ -58,8 +58,10 @@ FaspLink::stats(&self) -> FaspStats   // delivered, retransmits, rtt_base, windo
 2. **S2 — retransmit + reorder under in-process drop:** inject drops at the socket-send call (test-only) → prove
    recovery + INV-FASP-SIGNAL (window holds under loss, backs off under added RTT). Gate: 0-loss at 30% drop.
 3. **S3 — real netem bench:** the `tc netem` harness + the kernel-TCP baseline; the real ratio sweep.
-4. **S4 — adversarial audit of `FaspLink`** (crypto-not-needed lens; focus: reliability windows, int/seq overflow,
-   unbounded memory, duplicate/repartition handling) → fix at root → only then flip the claim DIRECTIONAL→PROVEN.
+4. **S4 — adversarial audit of `FaspLink`** ✅ DONE (`AUDIT-FASP.md`): 3 skeptics found 2 CRITICAL (unbounded
+   reorder buffer → OOM; `send` infinite-block) + 1 HIGH (off-path spoof) + 1 LOW — **all fixed at root with
+   regression gates** (`f1`/`f3`/`f4` in `reliable_udp::s4_gates`). Exactly-once core independently verified.
+   Claim stays DIRECTIONAL (loopback netem, n=2, modest throughput) — PROVEN still needs a real-WAN field number.
 
 ## What this deliberately is NOT (scope honesty)
 - Not a full QUIC/production transport (no path MTU discovery, no multipath, no encryption *here* — the cofre is

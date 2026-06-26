@@ -48,9 +48,11 @@
   replace this once collected.
 - **Loopback `tc netem`, not a real geographic WAN.** netem injects genuine kernel loss/delay (a real qdisc, not
   a simulation), but it is not a transcontinental path. A real multi-hop field run is still future work.
-- **S4 PENDING:** `FaspLink` has not yet had its adversarial audit. Reliable transport is bug-prone (the WAL had
-  5 data-loss windows; the S2 gate already caught a real Karn-algorithm bug here). **No PROVEN label until the
-  audit passes.**
+- **S4 DONE** (`AUDIT-FASP.md`): the `FaspLink` adversarial audit found + fixed 2 CRITICAL (unbounded reorder
+  buffer → OOM; `send` infinite-block) + 1 HIGH (off-path spoof) before any outsider saw them; exactly-once core
+  independently verified. The transport is now memory-bounded, live, and off-path-spoof-resistant. The claim
+  still stays DIRECTIONAL on the remaining caveats (modest throughput, n=2, loopback-not-WAN) — **PROVEN needs a
+  real-WAN field number**, not the audit.
 
 ## Bottom line
 The FASP thesis — *delay-based congestion control holds goodput where loss-based TCP collapses* — is now

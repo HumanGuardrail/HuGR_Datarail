@@ -6,10 +6,12 @@
 //! over a real lossy link (`tc netem`) instead of only an in-process simulation. See the design contract in
 //! `docs/design/FASP-UDP-TRANSPORT.md`.
 //!
-//! **Scope (S1+S2):** reliable framing, ACKs, in-order reassembly, retransmit-on-timeout, RTT samples feeding
-//! the controller, and loss recovery (the `loss_sim_drop_every` egress simulator proves exactly-once delivery +
-//! window-holds-under-loss at 33% drop). The real `tc netem` benchmark vs kernel TCP is S3; the adversarial
-//! audit before any PROVEN label is S4.
+//! **Scope (S1–S4):** reliable framing, ACKs, in-order reassembly, retransmit-on-timeout, RTT samples feeding
+//! the controller, loss recovery (S2), the real `tc netem` benchmark vs kernel TCP (S3), and the adversarial
+//! audit (S4 — `docs/design/AUDIT-FASP.md`): receive-window flow control (bounded memory both sides), a `send`
+//! liveness deadline (no infinite block), and an off-peer source-drop (off-path spoof resistance). The exactly-
+//! once core is independently verified. The WAN *claim* stays DIRECTIONAL (loopback `netem`, n=2, modest
+//! absolute throughput) — no PROVEN until a real-WAN field number.
 //!
 //! The mover carries **opaque bytes** (each `send` is one ≤[`MAX_FASP_PAYLOAD`] message delivered intact and in
 //! order); the cofre is already sealed above this layer, so this is a dumb, confidential-by-construction pipe.
@@ -49,6 +51,15 @@ pub struct FaspCfg {
     pub max_window: f64,
     /// Queueing-delay threshold above which the controller treats the path as congested.
     pub queue_threshold: Duration,
+    /// **Receive-window flow control (S4 fix F1/F1b):** the receiver buffers at most this many messages ahead of
+    /// the lowest un-consumed one. A DATA frame whose `seq` falls outside `[base, base+recv_window)` is dropped
+    /// and **not** acknowledged, so the sender retransmits it once the window slides — bounding the reorder +
+    /// ready buffers to O(`recv_window`) (`INV-FASP-BOUNDED` on the *receive* side too, not just send). Set ≥
+    /// `max_inflight`.
+    pub recv_window: usize,
+    /// **Send liveness deadline (S4 fix F3):** if `send` cannot make room within this long (the peer stopped
+    /// acknowledging / vanished), it returns a `TimedOut` error instead of blocking forever.
+    pub send_timeout: Duration,
     /// **Test/bench loss simulator** (0 = off): deterministically drop every Nth outgoing datagram before it
     /// hits the wire, to exercise loss recovery without a real network. Mirrors the established
     /// [`WanProfile`](crate::WanProfile)`::drop_every` pattern; the *real* loss number comes from `tc netem` (S3).
@@ -64,6 +75,8 @@ impl Default for FaspCfg {
             min_window: 1.0,
             max_window: 1024.0,
             queue_threshold: Duration::from_millis(5),
+            recv_window: 8192,
+            send_timeout: Duration::from_secs(30),
             loss_sim_drop_every: 0,
         }
     }
@@ -231,21 +244,30 @@ impl FaspLink {
         Ok(self.sock.local_addr()?)
     }
 
-    /// Reliably enqueue one ≤[`MAX_FASP_PAYLOAD`] message for in-order delivery to the peer. Blocks only to
-    /// pump the socket when the in-flight window is full (`INV-FASP-BOUNDED`); it never sleeps indefinitely —
-    /// the caller is expected to also pump the peer.
+    /// Reliably enqueue one ≤[`MAX_FASP_PAYLOAD`] message for in-order delivery to the peer. Blocks (pumping the
+    /// socket) while the in-flight window is full, up to [`FaspCfg::send_timeout`] — after which it errors rather
+    /// than blocking forever (S4 fix F3: a vanished/withholding peer must not wedge the caller). The caller is
+    /// expected to also pump the peer.
     ///
     /// # Errors
-    /// [`FaspError::TooLarge`] if the payload exceeds the limit; [`FaspError::Io`] on a socket error.
+    /// [`FaspError::TooLarge`] if the payload exceeds the limit; [`FaspError::Io`] on a socket error or if the
+    /// in-flight window cannot drain within `send_timeout` (`TimedOut` — the peer is not acknowledging).
     pub fn send(&mut self, payload: &[u8]) -> Result<(), FaspError> {
         if payload.len() > MAX_FASP_PAYLOAD {
             return Err(FaspError::TooLarge(payload.len()));
         }
         // Pace to the FASP window (soft, rate control) AND max_inflight (hard, memory bound): drain ACKs /
-        // retransmit until there is room. One pump per spin; the peer drives delivery.
+        // retransmit until there is room — but give up after send_timeout so a dead peer can't wedge us forever.
+        let block_deadline = Instant::now() + self.cfg.send_timeout;
         while !self.can_send() {
             self.pump()?;
             if !self.can_send() {
+                if Instant::now() >= block_deadline {
+                    return Err(FaspError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "fasp send blocked: in-flight window will not drain (peer not acknowledging)",
+                    )));
+                }
                 std::thread::sleep(Duration::from_micros(50));
             }
         }
@@ -290,13 +312,28 @@ impl FaspLink {
     }
 
     fn on_datagram(&mut self, dgram: &[u8], from: SocketAddr) -> Result<(), FaspError> {
+        // S4 fix F4: once we know our peer, drop datagrams from any other source. CRC is an error-detector, not a
+        // MAC, so off-path UDP spoofing could otherwise forge an ACK (silent loss) or inject DATA. This defeats
+        // blind off-path spoofing cheaply; on-path integrity comes from the sealed cofre layer above.
+        if let Some(peer) = self.peer {
+            if from != peer {
+                return Ok(());
+            }
+        }
         let Some((seq, kind, payload)) = decode_frame(dgram) else {
             return Ok(()); // corrupt datagram → drop; reliability recovers it via retransmit
         };
         match kind {
             KIND_DATA => {
-                // Always ACK (even a duplicate) so the sender can retire it and stop retransmitting. Reply to the
-                // datagram's source so ACKs route correctly even before our own peer is set.
+                // S4 fix F1/F1b: receive-window flow control. `base` is the lowest un-consumed seq (front of the
+                // ready queue); a frame outside [base, base+recv_window) is dropped WITHOUT an ACK, so the sender
+                // retransmits once the window slides. This bounds reorder + ready to O(recv_window) regardless of
+                // a hostile peer's seqs — INV-FASP-BOUNDED on the receive side.
+                let base = self.next_deliver - self.ready.len() as u64;
+                if seq >= base.saturating_add(self.cfg.recv_window as u64) {
+                    return Ok(());
+                }
+                // Always ACK an in-window frame (even a duplicate) so the sender can retire it and stop resending.
                 let ack = encode_frame(seq, KIND_ACK, &[]);
                 self.wire_send(&ack, from)?;
                 if seq >= self.next_deliver && !self.reorder.contains_key(&seq) {
@@ -361,6 +398,13 @@ impl FaspLink {
         self.inflight.len()
     }
 
+    /// Total messages buffered on the receive side (out-of-order `reorder` + delivered-but-un-consumed `ready`).
+    /// Bounded by [`FaspCfg::recv_window`] (S4 fix F1/F1b) — exposed so callers/gates can assert that bound.
+    #[must_use]
+    pub fn buffered_len(&self) -> usize {
+        self.reorder.len() + self.ready.len()
+    }
+
     /// May a new message go out now? Gated by the FASP congestion window (rate control — loss never shrinks it,
     /// RTT growth does) and the hard `max_inflight` memory bound. The in-flight count is converted to `f64`
     /// losslessly via `u32` (it never approaches `u32::MAX` in practice) so no float→int cast is needed.
@@ -406,8 +450,86 @@ fn decode_frame(dgram: &[u8]) -> Option<(u64, u8, &[u8])> {
     let mut len_bytes = [0u8; 4];
     len_bytes.copy_from_slice(&dgram[9..13]);
     let len = u32::from_le_bytes(len_bytes) as usize;
-    if len != body_len - HEADER_LEN {
-        return None;
+    if len != body_len - HEADER_LEN || len > MAX_FASP_PAYLOAD {
+        return None; // length mismatch, or a peer trying to push a larger-than-spec payload (S4 fix F8)
     }
     Some((seq, kind, &dgram[HEADER_LEN..body_len]))
+}
+
+#[cfg(test)]
+mod s4_gates {
+    //! S4 adversarial-audit regression gates: every CRITICAL/HIGH finding from the [`FaspLink`] audit, fixed at
+    //! the root and pinned here so it can never silently regress.
+    use super::{encode_frame, FaspCfg, FaspError, FaspLink, KIND_DATA};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+    use std::time::Duration;
+
+    fn loopback() -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    }
+
+    #[test]
+    fn f1_reorder_buffer_is_bounded_by_recv_window_under_hostile_gap_seqs() {
+        let cfg = FaspCfg { recv_window: 256, ..FaspCfg::default() };
+        let mut b = FaspLink::bind(loopback(), cfg).expect("bind b");
+        let b_addr = b.local_addr().expect("b addr");
+        let attacker = UdpSocket::bind(loopback()).expect("attacker bind");
+        b.set_peer(attacker.local_addr().expect("atk addr")); // pass the F4 source-check; isolate F1
+        // Flood seqs 1..10000 but never seq 0 → a permanent gap → all want to sit in `reorder`. Pre-fix this
+        // grew unbounded (OOM); post-fix only [base, base+recv_window) is accepted.
+        for seq in 1u64..10_000 {
+            let f = encode_frame(seq, KIND_DATA, &[7, 7, 7]);
+            attacker.send_to(&f, b_addr).expect("atk send");
+        }
+        for _ in 0..50 {
+            b.pump().expect("pump");
+        }
+        assert!(
+            b.buffered_len() <= cfg.recv_window,
+            "reorder unbounded: buffered {} > recv_window {}",
+            b.buffered_len(),
+            cfg.recv_window
+        );
+    }
+
+    #[test]
+    fn f4_datagram_from_a_non_peer_source_is_dropped() {
+        let mut b = FaspLink::bind(loopback(), FaspCfg::default()).expect("bind b");
+        let b_addr = b.local_addr().expect("b addr");
+        // b's peer is some OTHER address; a forged-but-valid DATA from a different source must be ignored.
+        b.set_peer(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9)));
+        let spoofer = UdpSocket::bind(loopback()).expect("spoofer bind");
+        let f = encode_frame(0, KIND_DATA, &[1, 2, 3]);
+        spoofer.send_to(&f, b_addr).expect("spoof send");
+        for _ in 0..20 {
+            b.pump().expect("pump");
+        }
+        assert_eq!(b.buffered_len(), 0, "off-peer forged DATA was accepted");
+        assert!(b.recv().expect("recv").is_none(), "off-peer forged DATA was delivered");
+    }
+
+    #[test]
+    fn f3_send_times_out_instead_of_blocking_forever_when_peer_never_acks() {
+        let cfg = FaspCfg {
+            max_inflight: 4,
+            init_window: 4.0,
+            send_timeout: Duration::from_millis(200),
+            ..FaspCfg::default()
+        };
+        let mut a = FaspLink::bind(loopback(), cfg).expect("bind a");
+        // A real bound socket that NEVER pumps/ACKs → A's window fills and can never drain.
+        let dead = UdpSocket::bind(loopback()).expect("dead bind");
+        a.set_peer(dead.local_addr().expect("dead addr"));
+        let mut err = None;
+        for _ in 0..100 {
+            if let Err(e) = a.send(&[9]) {
+                err = Some(e);
+                break;
+            }
+        }
+        match err {
+            Some(FaspError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "wrong error kind"),
+            other => panic!("send did not time out; got {other:?}"),
+        }
+    }
 }

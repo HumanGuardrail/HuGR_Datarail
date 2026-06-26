@@ -38,6 +38,8 @@ fn bench_fasp(secs: u64) -> f64 {
         min_window: 8.0,
         rto: Duration::from_millis(120),
         queue_threshold: Duration::from_millis(10),
+        recv_window: 8192, // ≥ max_inflight so the receiver accepts the full in-flight window
+        send_timeout: Duration::from_secs(60),
         loss_sim_drop_every: 0, // real loss comes from tc netem, not the simulator
     };
     let mut a = FaspLink::bind(loopback(), cfg).expect("bind a");
