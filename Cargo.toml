@@ -11,6 +11,7 @@ members = [
     "crates/datarail-substrate-objectstore",
     "crates/datarail-substrate-wal",
     "crates/datarail-erasure",
+    "crates/datarail-replaylog",
     "crates/datarail-substrate-quic",
     "crates/datarail-substrate-shmem",
     "crates/datarail-terminal",
