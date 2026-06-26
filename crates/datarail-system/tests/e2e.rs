@@ -59,7 +59,9 @@ fn durable_networked_broker_resumes_from_committed_offset_after_restart() {
     // The group resumed EXACTLY at the committed offset and replayed only the un-consumed tail — nothing lost,
     // nothing re-delivered — over the network, after a restart.
     assert_eq!(got.len(), usize::try_from(N).expect("fits") - CONSUMED, "did not resume the exact un-consumed tail");
-    assert_eq!(got[0].0, offsets[CONSUMED], "did not resume at the committed offset");
+    // The returned offset is the post-record RESUME point; correctness is in the payloads (resumed at record
+    // CONSUMED, not re-delivering CONSUMED-1, not skipping CONSUMED).
+    assert_eq!(got[0].2, format!("v{CONSUMED}").into_bytes(), "did not resume exactly at the committed record");
     for (j, rec) in got.iter().enumerate() {
         let i = CONSUMED + j;
         assert_eq!(rec.2, format!("v{i}").into_bytes(), "payload corrupted/lost across restart at record {i}");

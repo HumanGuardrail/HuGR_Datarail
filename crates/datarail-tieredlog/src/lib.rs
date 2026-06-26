@@ -167,21 +167,38 @@ impl<B: BlobStore> TieredLog<B> {
         let sealed_path = self.dir.join(seg_local_name(self.active_start));
         let mut bytes = Vec::new();
         File::open(&sealed_path)?.read_to_end(&mut bytes)?;
-        self.blob.put(&seg_blob_key(self.active_start), &bytes)?; // offload to cold tier
-        drop(std::fs::remove_file(&sealed_path)); // evict the local copy
-        self.active_start = self.write_offset;
-        self.active = OpenOptions::new()
+        self.blob.put(&seg_blob_key(self.active_start), &bytes)?; // offload to the cold tier (durable) FIRST
+        // WP1 audit CRITICAL-1 fix: create the NEW hot segment BEFORE evicting the old one, so a crash in the
+        // rotate window always leaves ≥1 local segment — `open` can never see an empty local dir and reset the
+        // offset space to 0. (If the crash lands before this create, the old sealed segment is still local AND
+        // already in cold, so `open` finds it, full, and simply re-rotates it on the next append — self-healing.)
+        let new_start = self.write_offset;
+        let new_active = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(self.dir.join(seg_local_name(self.active_start)))?;
-        Ok(())
+            .open(self.dir.join(seg_local_name(new_start)))?;
+        self.active_start = new_start;
+        self.active = new_active;
+        // Now evict the old local copy (safely in cold). WP1 audit HIGH-2 fix: a real unlink failure is SURFACED,
+        // not swallowed — otherwise orphaned sealed segments would silently break the O(1-segment) local bound.
+        match std::fs::remove_file(&sealed_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// All segment start offsets — cold (in the blob) ∪ the hot local one — sorted ascending.
     fn all_starts(&self) -> Result<Vec<u64>, TieredError> {
-        let mut starts: Vec<u64> = self.blob.list("seg/")?.iter().filter_map(|k| blob_key_start(k)).collect();
+        // WP1 audit LOW-3 fix: a `seg/`-prefixed key we can't parse would silently punch a hole in the offset
+        // stitching — treat it as a hard error (a foreign/corrupt writer into our prefix), never drop it.
+        let mut starts = Vec::new();
+        for key in self.blob.list("seg/")? {
+            let start = blob_key_start(&key).ok_or(TieredError::MissingSegment(u64::MAX))?;
+            starts.push(start);
+        }
         if !starts.contains(&self.active_start) {
             starts.push(self.active_start);
         }

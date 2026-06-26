@@ -342,7 +342,12 @@ impl<O: OffsetStore> Server<O> {
                     return Response::Err("group state vanished".to_owned());
                 };
                 match self.topic.dispatch_next(g) {
-                    Ok(Some(d)) => Response::Record(Some((d.offset, d.key, d.payload))),
+                    // WP2 audit CRITICAL fix: the offset returned is the group's RESUME point — the cursor AFTER
+                    // this record (`g.position()`), i.e. the value to `Commit` once this record is processed.
+                    // Committing it and resuming `seek`s to the NEXT record, so a restart never re-delivers the
+                    // last record (the prior code returned the record's own start offset → guaranteed dup on
+                    // every restart).
+                    Ok(Some(d)) => Response::Record(Some((g.position(), d.key, d.payload))),
                     Ok(None) => Response::Record(None),
                     Err(e) => Response::Err(e.to_string()),
                 }
@@ -516,7 +521,7 @@ mod tests {
         decode_request, decode_response, encode_request, encode_response, serve, Client, Request,
         Response, Server,
     };
-    use datarail_offsets::{MemOffsets, OffsetStore};
+    use datarail_offsets::{FileOffsets, MemOffsets, OffsetStore};
     use datarail_topic::Topic;
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
@@ -592,21 +597,34 @@ mod tests {
         };
         assert!(o1 > o0, "produced offsets must increase ({o0} -> {o1})");
 
-        // Two polls — records come back in produce order, matching what we produced.
-        let r0 = server.handle(Request::Poll { group: "g".to_owned() });
-        assert_eq!(r0, Response::Record(Some((o0, b"a".to_vec(), b"v0".to_vec()))));
-        let r1 = server.handle(Request::Poll { group: "g".to_owned() });
-        assert_eq!(r1, Response::Record(Some((o1, b"b".to_vec(), b"v1".to_vec()))));
+        // Two polls — records come back in produce order (key+payload); the returned offset is the RESUME point
+        // (the cursor AFTER the record), so resume-after-record-0 equals the START of record 1 (o1).
+        let resume0 = match server.handle(Request::Poll { group: "g".to_owned() }) {
+            Response::Record(Some((off, k, p))) => {
+                assert_eq!((k, p), (b"a".to_vec(), b"v0".to_vec()));
+                off
+            }
+            other => panic!("expected a record, got {other:?}"),
+        };
+        assert_eq!(resume0, o1, "resume point after record 0 must be the start of record 1");
+        let resume1 = match server.handle(Request::Poll { group: "g".to_owned() }) {
+            Response::Record(Some((off, k, p))) => {
+                assert_eq!((k, p), (b"b".to_vec(), b"v1".to_vec()));
+                off
+            }
+            other => panic!("expected a record, got {other:?}"),
+        };
+        assert!(resume1 > resume0, "resume offsets must increase");
 
         // Tail — no more records.
         assert_eq!(server.handle(Request::Poll { group: "g".to_owned() }), Response::Record(None));
 
-        // Commit acks, and the offset is durable in the injected store.
+        // Commit the last resume point; it is durable in the injected store.
         assert_eq!(
-            server.handle(Request::Commit { group: "g".to_owned(), offset: o1 }),
+            server.handle(Request::Commit { group: "g".to_owned(), offset: resume1 }),
             Response::Committed
         );
-        assert_eq!(server.offsets().fetch("g"), Some(o1), "committed offset not retrievable");
+        assert_eq!(server.offsets().fetch("g"), Some(resume1), "committed offset not retrievable");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -634,10 +652,11 @@ mod tests {
             produced.push((offset, key, payload));
         }
 
-        // Poll them all back for group "g" — same order, same bytes, same offsets.
+        // Poll them all back for group "g" — same order, same key + payload (the returned offset is the resume
+        // point, not the record's own start, so we match on key/payload).
         for expected in &produced {
             let got = client.poll("g").expect("poll").expect("record present");
-            assert_eq!(&got, expected, "polled record did not match produced");
+            assert_eq!((&got.1, &got.2), (&expected.1, &expected.2), "polled record key/payload mismatch");
         }
         // Tail: nothing left.
         assert_eq!(client.poll("g").expect("poll tail"), None);
@@ -647,5 +666,52 @@ mod tests {
         client.commit("g", last_offset).expect("commit acked");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WP2 audit CRITICAL regression: commit the RESUME offset, RESTART (a fresh `Server` over the same durable
+    /// topic + offset store), and the group resumes at the next record — the last consumed record is NOT
+    /// re-delivered (the prior code re-delivered it on every restart).
+    #[test]
+    fn restart_resumes_without_redelivering_the_last_record() {
+        const N: usize = 100;
+        const HALF: usize = 50;
+        let tdir = tmpdir("resume-topic");
+        let odir = tmpdir("resume-offsets");
+
+        // Phase 1: produce N, consume HALF, commit the HALF-th poll's RESUME offset.
+        let mut resume = 0u64;
+        {
+            let topic = Topic::open(&tdir, 1 << 16).expect("topic");
+            let mut server = Server::new(topic, FileOffsets::open(&odir).expect("offsets"));
+            for i in 0..N {
+                let r = server.handle(Request::Produce { key: Vec::new(), payload: format!("v{i}").into_bytes() });
+                assert!(matches!(r, Response::Produced(_)), "produce failed: {r:?}");
+            }
+            for _ in 0..HALF {
+                resume = match server.handle(Request::Poll { group: "g".to_owned() }) {
+                    Response::Record(Some((off, _, _))) => off,
+                    other => panic!("expected a record, got {other:?}"),
+                };
+            }
+            assert_eq!(
+                server.handle(Request::Commit { group: "g".to_owned(), offset: resume }),
+                Response::Committed
+            );
+        }
+
+        // Phase 2: restart over the SAME durable state; resume must start exactly at record HALF.
+        let topic2 = Topic::open(&tdir, 1 << 16).expect("reopen topic");
+        let mut server2 = Server::new(topic2, FileOffsets::open(&odir).expect("reopen offsets"));
+        let mut got = Vec::new();
+        while let Response::Record(Some((_, _, payload))) =
+            server2.handle(Request::Poll { group: "g".to_owned() })
+        {
+            got.push(payload);
+        }
+        assert_eq!(got.len(), N - HALF, "wrong count on resume — re-delivery or loss");
+        assert_eq!(got[0], format!("v{HALF}").into_bytes(), "first resumed record must be v{HALF}, not a re-delivery");
+
+        let _ = std::fs::remove_dir_all(&tdir);
+        let _ = std::fs::remove_dir_all(&odir);
     }
 }

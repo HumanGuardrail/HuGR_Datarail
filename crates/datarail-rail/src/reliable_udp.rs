@@ -39,6 +39,9 @@ const ACK_FRAME_LEN: usize = HEADER_LEN + CRC_LEN;
 /// Budget for a single coalesced-ACK datagram. Kept ≤ [`MAX_FASP_PAYLOAD`] so a packed-ACK datagram, like a
 /// DATA frame, stays a single un-fragmented IP datagram on a typical path.
 const ACK_DGRAM_BUDGET: usize = MAX_FASP_PAYLOAD;
+/// Flush queued ACKs once this many accumulate during a single `pump` drain — one datagram's worth — so the ACK
+/// buffer stays O(1) even under a sustained/duplicate DATA flood (WP6 audit HIGH fix).
+const ACK_FLUSH_THRESHOLD: usize = ACK_DGRAM_BUDGET / ACK_FRAME_LEN;
 
 /// Tuning for a [`FaspLink`].
 #[derive(Debug, Clone, Copy)]
@@ -316,6 +319,12 @@ impl FaspLink {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(FaspError::Io(e)),
+            }
+            // WP6 audit HIGH fix: flush ACKs INCREMENTALLY once a datagram's worth has accumulated, so a sustained
+            // (or duplicate) DATA flood cannot grow `pending_acks` without bound during a long drain — restoring
+            // INV-FASP-BOUNDED on the ACK buffer too (it was previously flushed only after the whole drain).
+            if self.pending_acks.len() >= ACK_FLUSH_THRESHOLD {
+                self.flush_acks()?;
             }
         }
         self.flush_acks()?;

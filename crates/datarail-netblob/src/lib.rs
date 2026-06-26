@@ -125,6 +125,9 @@ pub fn serve<B: BlobStore + Send + 'static>(store: B) -> io::Result<SocketAddr> 
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let Ok(stream) = incoming else { continue };
+            // WP4 audit M1 fix: a read timeout so a stalled/slow-loris client cannot park its connection thread
+            // forever (thread/FD exhaustion). A legit op completes well within this.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
             let store = Arc::clone(&store);
             std::thread::spawn(move || {
                 // A connection-level IO error simply ends that connection; the server keeps serving.
@@ -241,10 +244,19 @@ fn read_frame(stream: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         Err(e) => return Err(e),
     }
     let len = usize_of(u32::from_le_bytes(len_buf));
+    // WP4 audit CRITICAL C1 fix: reject an over-large advertised length BEFORE allocating, so a hostile 4-byte
+    // prefix can't make us commit gigabytes of zeroed RAM (an OOM/DoS with no body bytes sent).
+    if len > MAX_FRAME {
+        return Err(io::Error::new(ErrorKind::InvalidData, "netblob frame exceeds the maximum size"));
+    }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
     Ok(Some(body))
 }
+
+/// Largest accepted frame body (one blob op + a generous blob value). Caps `read_frame`'s pre-allocation so a
+/// lying length prefix cannot exhaust memory.
+const MAX_FRAME: usize = 256 * 1024 * 1024;
 
 /// Convert a length to `u32`, erroring if it does not fit a frame field.
 ///

@@ -182,11 +182,16 @@ impl FileOffsets {
             tmp.sync_all()?;
         }
         std::fs::rename(&tmp_path, &live_path)?;
-        // fsync the directory so the rename itself is durable across a crash.
-        File::open(&self.dir)?.sync_all()?;
-        // The old handle pointed at the now-unlinked inode; reopen the new file.
+        // WP5 audit F1 fix: reopen the live handle + reset the counter IMMEDIATELY after the rename (the old
+        // handle now points at the unlinked inode). The directory fsync is a durability nicety done AFTER, and is
+        // best-effort — if it errored before the reopen, a subsequent `commit` would write to the dead inode and
+        // be silently lost on the next open.
         self.file = OpenOptions::new().read(true).append(true).open(&live_path)?;
         self.records = self.map.len();
+        // fsync the directory so the rename itself is durable across a power loss (best-effort, post-reopen).
+        if let Ok(d) = File::open(&self.dir) {
+            let _ = d.sync_all();
+        }
         Ok(())
     }
 
