@@ -24,7 +24,9 @@ three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS)
 harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
 `Noise_KK` + SPAKE2 identity layer, the **v1 product flow — an HTTP API → sealed rail → Postgres**
 (zero-dependency, hand-rolled Postgres driver), **Kafka wire-protocol ingest** (an unmodified Kafka producer →
-sealed rail → any sink, no code change), and the `datarail` CLI moving real data source→sink.
+sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes** (the dedup
+watermark stored transactionally in your DB — `EXACTLY-ONCE-DESIGN.md`), and the `datarail` CLI moving real data
+source→sink.
 
 **Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
 **~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**

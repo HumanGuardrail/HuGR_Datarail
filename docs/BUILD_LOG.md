@@ -705,6 +705,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   persistence (D-3), sealed-sender epoch (S-2), gap horizon (D-5), offsets dir-fsync (D-6). The methodology worked:
   scary lenses proven safe, real defects fixed at root or honestly tracked.
 
+- 2026-06-26 — **THE MOAT: exactly-once INTO Postgres, cross-crash — closes audit D-3 (Tier A).** The hard problem
+  the core audit exposed (effectively-once was in-memory → restart re-landed redeliveries) is solved at root for
+  the transactional sink, and it IS the moat: the dedup **watermark lives inside the sink's own transaction**.
+  `TxnSink::commit_at` lands the records AND advances the watermark in ONE Postgres transaction → a replayed batch
+  (`watermark <= stored`) is a committed no-op; resume reads the watermark back from the DB (no external dedup
+  state to keep in sync or lose); the rail still never sees plaintext. Design `EXACTLY-ONCE-DESIGN.md` (crash
+  analysis + tiered guarantees: A transactional=exactly-once, B idempotent, C plain=at-least-once). PROVEN LIVE +
+  CI-GATED (`connectors-live.yml`): commit [a,b,c]@3 + 3 replays + [d]@4 + replay → exactly 4 rows, watermark 4,
+  zero dups. Zero-dep (hand-rolled PG query-result parsing), forbid(unsafe), clippy clean, ROLLBACK on txn error.
+  Competitors punt exactly-once-to-sink to "use a transactional consumer"; datarail delivers it with the watermark
+  in your DB. (The new txn path is itself under brutal adversarial audit — durability components always are.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
