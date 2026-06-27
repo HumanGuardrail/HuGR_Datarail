@@ -88,3 +88,23 @@ cofre's monotonic seq as the watermark — delivering Tier A exactly-once. A non
    exactly-once (the row count is correct, the watermark consistent).
 4. Wire Tier A into the offload/CLI path (feed the seq as the watermark); fall back to Tier C otherwise.
 5. **Adversarial audit** of the new transactional path (it is correctness-critical — audit it like the core).
+
+## Integration plan — wiring Tier A into the product (`datarail run` / `kafka-ingest`)
+Tier A is implemented + proven + CI-gated at the `PostgresSink` level (`commit_at`). The remaining step is making
+the product flows USE it so exactly-once is end-to-end, not just available:
+
+- **Sink selection** returns a capability-typed sink, not a bare `Box<dyn Sink>`: either `Plain(Box<dyn Sink>)`
+  (file/webhook/memory → `commit`) or `Txn(PostgresSink)` (→ `commit_at`). The CLI already knows when the sink is
+  Postgres, so no downcast/`Any` is needed.
+- **The watermark per source** (monotonic, deterministic on replay):
+  - `datarail run` over a file/replay source: a cumulative record count (`watermark += batch.len()` per batch) —
+    a replayed run re-presents the same batches in order, so `commit_at` no-ops the already-landed prefix.
+  - `kafka-ingest`: the Kafka **offset** is the natural watermark (already monotonic per topic/partition); feed
+    `base_offset + batch.len()` so a producer re-send is idempotent at the sink.
+- **The stream id** = the route's `route_id` (from `rail.toml`) so distinct rails don't collide in the watermark
+  table.
+- **Flag/auto:** Postgres sink → Tier A automatically (it's strictly better); `--at-least-once` opts out if a
+  caller wants the plain COPY path.
+
+This keeps `run_pipe`'s shape, adds one `Txn` branch, and makes "exactly-once into Postgres" the default for the
+v1 product flow — verified by extending the e2e CI gate to replay a `datarail run` and assert no double-land.
