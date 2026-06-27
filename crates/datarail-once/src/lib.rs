@@ -27,6 +27,13 @@ use std::collections::{HashMap, HashSet};
 use datarail_core::Disposition;
 use datarail_crypto::{sign_domain, verify_domain};
 
+pub mod persist;
+pub use persist::FileOnce;
+
+/// A per-stream durable checkpoint: `(stream, low_watermark, above-watermark (seq, key) entries)` — see
+/// [`Once::checkpoints`] / [`FileOnce`].
+pub type StreamCheckpoint = ([u8; 16], u64, Vec<(u64, [u8; 32])>);
+
 /// Domain-separation label for a signed low-watermark token (BLK-5 style; local to this crate — the frozen
 /// `datarail_crypto::ctx` has no watermark role).
 const WM_CTX: &[u8] = b"dr:once:wm:v1";
@@ -213,6 +220,44 @@ impl Once {
         let wm = self.low_watermark(stream);
         let sig = sign_domain(WM_CTX, &self.seed, &watermark_msg(stream, wm));
         (wm, sig)
+    }
+
+    /// Per-stream durable checkpoints for a persistent dedup index ([`crate::FileOnce`]): for each known stream,
+    /// `(stream, low_watermark, above-watermark (seq, key) entries)`. Replaying a checkpoint's watermark then its
+    /// entries reconstructs the stream's state exactly — the basis for log compaction.
+    #[must_use]
+    pub fn checkpoints(&self) -> Vec<StreamCheckpoint> {
+        self.streams
+            .iter()
+            .map(|(stream, st)| {
+                let mut entries: Vec<(u64, [u8; 32])> = st
+                    .delivered_keys
+                    .iter()
+                    .filter(|(seq, _)| **seq >= st.low_watermark)
+                    .map(|(seq, key)| (*seq, *key))
+                    .collect();
+                entries.sort_unstable_by_key(|(seq, _)| *seq);
+                (*stream, st.low_watermark, entries)
+            })
+            .collect()
+    }
+
+    /// Restore a `stream`'s contiguous low-watermark from a durable checkpoint (used by [`crate::FileOnce`] on
+    /// open, before any live traffic). Idempotent and monotonic — only advances. The above-watermark keys are
+    /// re-supplied by replaying the checkpoint's `(seq, key)` entries through [`Once::admit`].
+    pub fn restore_watermark(&mut self, stream: [u8; 16], watermark: u64) {
+        let gc_lag = self.gc_lag;
+        let st = self.streams.entry(stream).or_default();
+        if watermark > st.low_watermark {
+            st.low_watermark = watermark;
+            st.gc_floor = watermark.saturating_sub(gc_lag);
+            st.ahead.retain(|seq| *seq >= watermark);
+            st.delivered_keys.retain(|seq, _| *seq >= st.gc_floor);
+            // `seen` is rebuilt from the replayed entries; drop anything now below the floor is unnecessary here
+            // because restore runs at open before traffic, but keep `seen` consistent with `delivered_keys`:
+            let live: std::collections::HashSet<[u8; 32]> = st.delivered_keys.values().copied().collect();
+            st.seen.retain(|k| live.contains(k));
+        }
     }
 }
 
