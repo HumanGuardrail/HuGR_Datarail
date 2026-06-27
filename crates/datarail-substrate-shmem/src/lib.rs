@@ -195,7 +195,12 @@ impl Substrate for ShmemRing {
     fn recv(&mut self) -> Result<Option<Cofre>, Self::Error> {
         let write = self.cell(WRITE_OFF).load(Ordering::Acquire); // producer progress
         let read = self.cell(READ_OFF).load(Ordering::Relaxed); // our own
-        let avail = write - read;
+        // The cursors live in the shared segment and are PEER-CONTROLLABLE (a hostile/corrupt same-host writer):
+        // treat them as untrusted. `write - read` must not underflow (audit: `read > write` → usize wraparound to
+        // a huge `avail` that bypasses every gate below), so use a checked subtraction.
+        let Some(avail) = write.checked_sub(read) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursors (read > write)"));
+        };
         if avail < 4 {
             return Ok(None);
         }
@@ -206,6 +211,11 @@ impl Substrate for ShmemRing {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "ring frame exceeds the maximum cofre size"));
         }
         let total = 4 + len;
+        // Cap the frame against the ACTUAL ring capacity (the `send` side does this; `recv` must too, or a
+        // peer-declared `len > capacity` drives `read_ring` past the mapping → OOB slice panic). audit CRITICAL.
+        if total > self.capacity {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "ring frame exceeds the ring capacity"));
+        }
         if avail < total {
             return Ok(None); // frame not fully written yet
         }
@@ -240,6 +250,27 @@ mod tests {
     fn temp_path() -> std::path::PathBuf {
         let n = UNIQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("datarail-shmem-{}-{n}.ring", std::process::id()))
+    }
+
+    #[test]
+    fn recv_rejects_a_hostile_oversized_frame_without_panicking() {
+        // audit CRITICAL: the ring cursors + length are PEER-CONTROLLABLE. A len that is <= MAX_COFRE_WIRE_LEN but
+        // far exceeds the ring capacity must ERROR, not drive read_ring past the mapping (OOB slice panic).
+        let mut ring = ShmemRing::anon(64).expect("anon"); // 64-byte capacity
+        let len: u32 = 60_000;
+        ring.write_ring(0, &len.to_le_bytes());
+        ring.cell(super::WRITE_OFF).store(4 + usize::try_from(len).unwrap(), Ordering::Release);
+        ring.cell(super::READ_OFF).store(0, Ordering::Release);
+        assert!(ring.recv().is_err(), "an oversized hostile frame must error, not panic");
+    }
+
+    #[test]
+    fn recv_rejects_corrupt_cursors_with_read_past_write() {
+        // `write - read` must not underflow when a corrupt/hostile peer sets read > write (audit CRITICAL).
+        let mut ring = ShmemRing::anon(64).expect("anon");
+        ring.cell(super::READ_OFF).store(100, Ordering::Release);
+        ring.cell(super::WRITE_OFF).store(0, Ordering::Release);
+        assert!(ring.recv().is_err(), "corrupt cursors (read > write) must error, not underflow");
     }
 
     #[test]

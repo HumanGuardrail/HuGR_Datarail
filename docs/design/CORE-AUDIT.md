@@ -63,6 +63,18 @@ real breaks (both fixed + regression-tested):
 The "exactly-once PROVEN" claim was real for the happy path but FALSE under error/concurrency — exactly what the
 audit is for. It is now actually true (live C1 regression + the concurrency lock), and re-gated in CI.
 
+## Substrate/transport audit (shmem unsafe + rail/netblob) — 1 CRITICAL fixed; unsafe waiver SOUND
+A fourth auditor hit the substrate layer (the ONE `unsafe` waiver is here). It CONFIRMED the unsafe SOUND
+(memory-unsafety cannot escape — all ring DATA access is through checked safe slices; the atomic cells are
+fixed-offset + aligned), and the socket/QUIC/UDP/object-store framings hardened (length caps, timeouts, off-peer
+drop, no path traversal, INV-OPAQUE-CARGO holds).
+
+| # | Finding | Sev | Disposition |
+|---|---|---|---|
+| X-1 | **shmem `recv` trusted peer-controllable cursors + frame length** — `write - read` underflowed and `len` was not capped against the ring capacity (the `send` side caps it) → a hostile same-host peer drives `read_ring` past the mapping → OOB-slice PANIC (consumer DoS). PROVEN (OOB panic). | CRIT | **FIXED**: `recv` now `checked_sub`s the cursors (rejects `read > write`) and rejects `total > capacity` before any copy — the cursors are treated as untrusted, like a socket length prefix. 2 regression tests (hostile oversized frame + corrupt cursors → Err, not panic). |
+| X-2 | netblob accept loop spawned an unbounded thread per connection (flood DoS; slowloris already covered by the 30s timeout). | MED | **FIXED**: `MAX_CONNECTIONS` cap (excess dropped), matching the kafka/serve fix. |
+| X-3 | QUIC client accepts any server cert (transport MITM possible; confidentiality rests on the cofre seal). | LOW | **ACCEPTED** by-design (the DERP blind-relay model; `INV-OPAQUE-CARGO` — no plaintext crosses the transport). |
+
 ## Honest status after this pass
 - **Sealing / provider-blind:** HOLDS against the wire adversary (pipe/storage/MITM) in the GCM-SIV default; the
   one real weakness (snapshot/clone key reuse) is FIXED. `Gcm256` (opt-in `vaes`) is now also clone-safe.

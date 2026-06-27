@@ -14,6 +14,9 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 /// Request op tag: store/overwrite a key. Body: `[tag][u32 key_len][key][value..]`.
+/// Max concurrent connections — bounds thread/FD/memory under a connection flood (audit MED).
+const MAX_CONNECTIONS: usize = 256;
+
 const OP_PUT: u8 = 1;
 /// Request op tag: fetch a key. Body: `[tag][key..]`.
 const OP_GET: u8 = 2;
@@ -122,16 +125,26 @@ pub fn serve<B: BlobStore + Send + 'static>(store: B) -> io::Result<SocketAddr> 
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let addr = listener.local_addr()?;
     let store = Arc::new(Mutex::new(store));
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let Ok(stream) = incoming else { continue };
+            // Bound concurrency (audit MED): a connection FLOOD must not spawn unbounded threads/FDs. Drop new
+            // connections past the cap rather than spawn. (Slowloris is separately bounded by the read timeout.)
+            if active.load(std::sync::atomic::Ordering::Relaxed) >= MAX_CONNECTIONS {
+                drop(stream);
+                continue;
+            }
             // WP4 audit M1 fix: a read timeout so a stalled/slow-loris client cannot park its connection thread
             // forever (thread/FD exhaustion). A legit op completes well within this.
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let store = Arc::clone(&store);
+            let active = Arc::clone(&active);
             std::thread::spawn(move || {
                 // A connection-level IO error simply ends that connection; the server keeps serving.
                 let _ = serve_connection(&stream, &store);
+                active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             });
         }
     });
