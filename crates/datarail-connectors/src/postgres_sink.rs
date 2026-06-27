@@ -145,7 +145,14 @@ impl PostgresSink {
     }
 
     /// The transaction body for `commit_at` (between `BEGIN` and `COMMIT`/`ROLLBACK`): read the current watermark
-    /// under a row lock; if this batch already landed, no-op; otherwise land the records + advance the watermark.
+    /// under a row lock; land only the records past the stored watermark; advance the watermark.
+    ///
+    /// `watermark` is the cumulative count of records landed for this stream **through the end of `records`**, so
+    /// `records` covers the half-open landed-count interval `(watermark - records.len(), watermark]`. When the
+    /// stored watermark falls inside that interval — a **partial overlap**, reachable when a replayed source has
+    /// grown and re-presents a *larger* batch (e.g. a whole file read as one batch) — only the suffix past the
+    /// stored watermark is landed. Re-presenting an identical or smaller prefix is a clean no-op. This is what
+    /// makes the land idempotent at record granularity, not merely batch granularity.
     fn txn_body(&mut self, stream_hex: &str, lock_key: i64, watermark: i64, records: &[Vec<u8>]) -> io::Result<()> {
         // Serialize concurrent commit_at on the same stream — `SELECT … FOR UPDATE` locks NO row when the
         // watermark row does not exist yet, so two first-batches would both land (audit C2). A transaction-scoped
@@ -153,10 +160,17 @@ impl PostgresSink {
         query_simple(&mut self.stream, &format!("SELECT pg_advisory_xact_lock({lock_key})"))?;
         let current = read_watermark(&mut self.stream, stream_hex, true)?; // FOR UPDATE
         if current.is_some_and(|c| c >= watermark) {
-            return Ok(()); // already landed (idempotent replay) — the COMMIT makes it a clean no-op
+            return Ok(()); // already fully landed (idempotent replay) — the COMMIT makes it a clean no-op
         }
-        if !records.is_empty() {
-            self.copy_in(records)?;
+        // `base` = the landed-count BEFORE `records`. The stored watermark, when present and above `base`, marks
+        // how many of `records` already landed; land only the rest. (`base >= 0` because watermark is cumulative
+        // and `records` is a suffix of it; `already` is clamped into `[0, records.len())` since `current < watermark`.)
+        let len_i64 = i64::try_from(records.len()).map_err(|_| invalid("batch too large to land atomically"))?;
+        let base = watermark - len_i64;
+        let already = usize::try_from(current.map_or(0, |c| (c - base).max(0))).unwrap_or(0);
+        let to_land = records.get(already..).unwrap_or(&[]);
+        if !to_land.is_empty() {
+            self.copy_in(to_land)?;
         }
         let upsert = format!(
             "INSERT INTO datarail_watermark (stream, seq) VALUES ('\\x{stream_hex}', {watermark}) \

@@ -24,9 +24,10 @@ three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS)
 harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
 `Noise_KK` + SPAKE2 identity layer, the **v1 product flow — an HTTP API → sealed rail → Postgres**
 (zero-dependency, hand-rolled Postgres driver), **Kafka wire-protocol ingest** (an unmodified Kafka producer →
-sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes** (the dedup
-watermark stored transactionally in your DB — `EXACTLY-ONCE-DESIGN.md`), and the `datarail` CLI moving real data
-source→sink.
+sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes — end-to-end and
+on by default** (`datarail run`/`kafka-ingest --sink-postgres` land records + the dedup watermark in one atomic
+Postgres txn; a replayed run never double-lands — `--at-least-once` opts out; `EXACTLY-ONCE-DESIGN.md`), and the
+`datarail` CLI moving real data source→sink.
 
 **Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
 **~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**
@@ -53,7 +54,9 @@ is hand-rolled and provider-blind — the pipe and the database host never see p
 datarail run examples/rail.toml \
     --source-http https://api.example.com/events \
     --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
-# boarded → sealed cofre over the rail → COPY-landed as rows. Verified end-to-end against real Postgres 16.
+# boarded → sealed cofre over the rail → COPY-landed as rows. EXACTLY-ONCE by default: re-run the same command
+# and nothing double-lands (records + a dedup watermark commit in one atomic Postgres txn). Verified end-to-end
+# against real Postgres 16 — run twice → 4 rows, not 8. (--at-least-once opts back into the plain COPY path.)
 ```
 
 **Drop-in for Kafka producers** — point an existing producer at datarail, unchanged; it seals every record:

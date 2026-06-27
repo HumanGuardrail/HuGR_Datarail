@@ -60,6 +60,9 @@ USAGE:
       --sink-postgres CONN       land each delivered record as a row, via the zero-dep Postgres wire protocol.
                                  CONN = comma-separated key=value: host,user,db,table,column[,port][,password]
                                  e.g. host=db,user=rail,db=events,table=raw,column=data,port=5432,password=secret
+                                 EXACTLY-ONCE by default (Tier A): records + a dedup watermark land in ONE
+                                 atomic Postgres txn, so a crash or a replayed run never double-lands.
+      --at-least-once            opt OUT of Tier A: use the plain COPY path (at-least-once) for the Postgres sink.
       --sink-webhook URL         POST each delivered batch to an HTTP endpoint (newline-delimited records).
       (precedence: --source-http > --source-file > inline/stdin ; --sink-postgres > --sink-webhook > --sink-file > in-memory)
     --watch        on `run`: print a live one-line speedometer per batch (no TUI; raw stdout).
@@ -238,6 +241,7 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
     let mut sink_pg: Option<String> = None;
     let mut sink_webhook: Option<String> = None;
     let mut watch = false;
+    let mut at_least_once = false;
     let mut inline: Vec<Vec<u8>> = Vec::new();
     let mut i = 1;
     while i < rest.len() {
@@ -266,6 +270,10 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
                 watch = true;
                 i += 1;
             }
+            "--at-least-once" => {
+                at_least_once = true;
+                i += 1;
+            }
             other => {
                 inline.push(other.as_bytes().to_vec());
                 i += 1;
@@ -286,18 +294,11 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
         Box::new(SliceSource::one(records))
     };
 
-    // Sink connector: `--sink-postgres` > `--sink-webhook` (POST batches) > `--sink-file` > in-memory.
-    let mut sink: Box<dyn Sink> = if let Some(conn) = sink_pg {
-        Box::new(PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?)
-    } else if let Some(url) = sink_webhook {
-        Box::new(WebhookSink::post(&url).map_err(|e| CliError::Io(e.to_string()))?)
-    } else if let Some(path) = sink_file {
-        Box::new(LineFileSink::create(&path).map_err(|e| CliError::Io(e.to_string()))?)
-    } else {
-        Box::new(VecSink::new())
-    };
+    // Sink connector: `--sink-postgres` (Tier A exactly-once unless `--at-least-once`) > `--sink-webhook`
+    // (POST batches) > `--sink-file` > in-memory.
+    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once)?;
 
-    run_pipe(&spec, source.as_mut(), sink.as_mut(), watch)
+    run_pipe(&spec, source.as_mut(), &mut sink, watch)
 }
 
 /// If `inline` already has records, use them; otherwise read stdin (one record per non-empty line). Shared by
@@ -450,7 +451,7 @@ fn cmd_replay(rest: &[String]) -> Result<String, CliError> {
     // record-key is keyed on the index range, so replaying the identical range again **in this process** lands
     // as a once-gate `Duplicate` (no re-commit) — the demonstrable value of replay without a durable manifest.
     let mut pipe = Pipeline::from_spec(&spec)?;
-    let mut sink = VecSink::new();
+    let mut sink = AnySink::Plain(Box::new(VecSink::new()));
     let mut source = SliceSource::one(slice);
     let record_key = format!("datarail-replay-{}..{}", range.start, range.end);
     let mut delivered = 0usize;
@@ -556,6 +557,80 @@ impl AnyRail {
     }
 }
 
+/// The selected delivery sink, carrying its **strongest guarantee** (the capability-typed sink from
+/// `docs/design/EXACTLY-ONCE-DESIGN.md`). A Postgres sink gets **Tier A** — true exactly-once: `commit_at`
+/// lands the records *and* the dedup watermark in one atomic, idempotent transaction, so a crash or a replay
+/// never double-lands. Every other sink gets **Tier C** — plain `commit` (at-least-once). This is a closed
+/// enum, not a `Box<dyn Sink>` downcast: the CLI already knows when the sink is Postgres.
+enum AnySink {
+    Plain(Box<dyn Sink>),
+    Txn(Box<PostgresSink>),
+}
+
+impl AnySink {
+    /// Commit `fresh` records for `stream`, advancing the durable watermark to `watermark` (the cumulative
+    /// count of records landed for this stream, through the end of `fresh`). Tier A makes this atomic +
+    /// idempotent on replay (`commit_at`); Tier C simply appends (`commit`, watermark ignored).
+    fn commit(&mut self, fresh: &[Vec<u8>], stream: &[u8], watermark: u64) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.commit(fresh),
+            Self::Txn(pg) => {
+                use datarail_connectors::TxnSink as _;
+                pg.commit_at(fresh, stream, watermark)
+            }
+        }
+    }
+
+    /// The end-to-end delivery guarantee this sink provides (for the run report — honest labelling).
+    fn guarantee(&self) -> &'static str {
+        match self {
+            Self::Plain(_) => "at-least-once (Tier C)",
+            Self::Txn(_) => "exactly-once into Postgres (Tier A: records + watermark atomic)",
+        }
+    }
+
+    /// In-memory committed records when the underlying sink supports introspection (the default `VecSink`),
+    /// else `None`. Used by tests to assert what landed without a concrete-type downcast.
+    #[cfg(test)]
+    fn committed_view(&self) -> Option<&[Vec<u8>]> {
+        match self {
+            Self::Plain(s) => s.committed_view(),
+            Self::Txn(_) => None,
+        }
+    }
+}
+
+/// Build the delivery sink for a product flow, choosing the strongest guarantee the requested backend supports
+/// (shared by `run` and `kafka-ingest`). Precedence: `--sink-postgres` > `--sink-webhook` > `--sink-file` >
+/// in-memory. A Postgres sink is **Tier A exactly-once by default** (strictly better, zero external dedup
+/// state); `--at-least-once` opts back into the plain `COPY` path for callers that explicitly want it.
+fn select_sink(
+    sink_pg: Option<String>,
+    sink_webhook: Option<String>,
+    sink_file: Option<String>,
+    at_least_once: bool,
+) -> Result<AnySink, CliError> {
+    if let Some(conn) = sink_pg {
+        let pg = PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?;
+        return Ok(if at_least_once {
+            AnySink::Plain(Box::new(pg))
+        } else {
+            AnySink::Txn(Box::new(pg))
+        });
+    }
+    if let Some(url) = sink_webhook {
+        return Ok(AnySink::Plain(Box::new(
+            WebhookSink::post(&url).map_err(|e| CliError::Io(e.to_string()))?,
+        )));
+    }
+    if let Some(path) = sink_file {
+        return Ok(AnySink::Plain(Box::new(
+            LineFileSink::create(&path).map_err(|e| CliError::Io(e.to_string()))?,
+        )));
+    }
+    Ok(AnySink::Plain(Box::new(VecSink::new())))
+}
+
 /// The outcome of shipping one batch through the [`Pipeline`]: the disposition the offload terminal returned
 /// and how many *fresh* records that batch committed to the external sink (0 for a `Duplicate`/`DeadLettered`).
 struct BatchOutcome {
@@ -578,6 +653,9 @@ struct Pipeline {
     boarded: usize,
     /// The wire-hex of the most recently boarded cofre (for the human report).
     last_cofre_hex: String,
+    /// The per-stream dedup identity for a [`TxnSink`] (Tier A): the route's `route_id`, so distinct rails do
+    /// not collide in the sink's watermark table.
+    stream: Vec<u8>,
 }
 
 impl Pipeline {
@@ -602,6 +680,7 @@ impl Pipeline {
             committed_to_sink: 0,
             boarded: 0,
             last_cofre_hex: String::new(),
+            stream: spec.route.route_id.to_vec(),
         })
     }
 
@@ -615,7 +694,7 @@ impl Pipeline {
         &mut self,
         batch: &[Vec<u8>],
         record_key: &[u8],
-        sink: &mut dyn Sink,
+        sink: &mut AnySink,
     ) -> Result<Option<BatchOutcome>, CliError> {
         if batch.is_empty() {
             return Ok(None);
@@ -640,12 +719,16 @@ impl Pipeline {
         let disposition = self.dst_term.offload(&received).map_err(CliError::Terminal)?;
         self.rail.ack(received.etiqueta.cofre_id)?;
 
-        // Only Delivered grows the terminal sink; commit those fresh records to the external sink.
+        // Only Delivered grows the terminal sink; commit those fresh records to the external sink. The watermark
+        // handed to a Tier-A sink is `total` — the cumulative count of records landed for this stream, through the
+        // end of this batch. On a replay (fresh process, once-gate empty) the same prefix re-presents under the
+        // same cumulative watermark, so `commit_at` lands only what is genuinely new: end-to-end exactly-once.
         let total = self.dst_term.sink().committed().len();
         let fresh_committed = total - self.committed_to_sink;
         if fresh_committed > 0 {
             let fresh: Vec<Vec<u8>> = self.dst_term.sink().committed()[self.committed_to_sink..].to_vec();
-            sink.commit(&fresh).map_err(|e| CliError::Rail(e.to_string()))?;
+            let watermark = u64::try_from(total).unwrap_or(u64::MAX);
+            sink.commit(&fresh, &self.stream, watermark).map_err(|e| CliError::Rail(e.to_string()))?;
             self.committed_to_sink = total;
         }
         Ok(Some(BatchOutcome {
@@ -698,6 +781,7 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     let mut sink_pg: Option<String> = None;
     let mut sink_file: Option<String> = None;
     let mut sink_webhook: Option<String> = None;
+    let mut at_least_once = false;
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -721,6 +805,10 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
                 sink_webhook = Some(require(rest, i + 1, "url")?.to_string());
                 i += 2;
             }
+            "--at-least-once" => {
+                at_least_once = true;
+                i += 1;
+            }
             other => return Err(CliError::Arg(format!("kafka-ingest: unexpected arg `{other}`"))),
         }
     }
@@ -732,26 +820,19 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
         let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx);
     });
 
-    let mut sink: Box<dyn Sink> = if let Some(conn) = sink_pg {
-        Box::new(PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?)
-    } else if let Some(url) = sink_webhook {
-        Box::new(WebhookSink::post(&url).map_err(|e| CliError::Io(e.to_string()))?)
-    } else if let Some(path) = sink_file {
-        Box::new(LineFileSink::create(&path).map_err(|e| CliError::Io(e.to_string()))?)
-    } else {
-        Box::new(VecSink::new())
-    };
+    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once)?;
     eprintln!("datarail kafka-ingest on {listen} (advertised {advertised}:{port}) -> sealed rail -> sink");
     let mut source = KafkaChannelSource { rx };
-    run_pipe(&spec, &mut source, sink.as_mut(), false)
+    run_pipe(&spec, &mut source, &mut sink, false)
 }
 
 fn run_pipe(
     spec: &RailSpec,
     source: &mut dyn Source,
-    sink: &mut dyn Sink,
+    sink: &mut AnySink,
     watch: bool,
 ) -> Result<String, CliError> {
+    use std::fmt::Write as _;
     let mut pipe = Pipeline::from_spec(spec)?;
     let started = Instant::now();
     let mut batch_no = 0u64;
@@ -767,7 +848,9 @@ fn run_pipe(
     if watch {
         print_speedometer("final ", &pipe, started.elapsed());
     }
-    Ok(pipe.report())
+    let mut out = pipe.report();
+    let _ = writeln!(out, "guarantee   = {}", sink.guarantee());
+    Ok(out)
 }
 
 /// Print one speedometer line: elapsed ms, records boarded/committed/dead-lettered, and throughput
@@ -1241,10 +1324,15 @@ fn cmd_recv(rest: &[String]) -> Result<String, CliError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cmd_pair, dispatch, from_hex, parse_range, run_pipe, to_hex, AnyRail, Pipeline, SliceSource,
-        VecSink,
+        cmd_pair, dispatch, from_hex, parse_range, run_pipe, to_hex, AnyRail, AnySink, Pipeline,
+        SliceSource, VecSink,
     };
     use datarail_connectors::Source;
+
+    /// An in-memory Tier-C sink for tests, with its committed records readable via `committed_view`.
+    fn vec_sink() -> AnySink {
+        AnySink::Plain(Box::new(VecSink::new()))
+    }
     use datarail_core::Disposition;
     use datarail_crypto::verifying_key;
     use datarail_spec::RailSpec;
@@ -1287,13 +1375,15 @@ mod tests {
     fn run_pipe_delivers_a_conforming_batch_through_the_connectors() {
         let spec = RailSpec::parse(&sample()).unwrap();
         let mut source = SliceSource::one(vec![b"evt:a".to_vec(), b"evt:b".to_vec()]);
-        let mut sink = VecSink::new();
+        let mut sink = vec_sink();
         let out = run_pipe(&spec, &mut source, &mut sink, false).unwrap();
         assert!(out.contains("substrate   = loopback"), "{out}");
         assert!(out.contains("committed   = 2"), "{out}");
         assert!(out.contains("dead-letter = 0"), "{out}");
+        // An in-memory sink reports Tier C (at-least-once) — exactly-once needs a transactional sink.
+        assert!(out.contains("guarantee   = at-least-once (Tier C)"), "{out}");
         // The records actually landed in the sink connector (end-to-end through board→rail→offload→commit).
-        assert_eq!(sink.committed(), &[b"evt:a".to_vec(), b"evt:b".to_vec()]);
+        assert_eq!(sink.committed_view().unwrap(), &[b"evt:a".to_vec(), b"evt:b".to_vec()]);
     }
 
     #[test]
@@ -1301,7 +1391,7 @@ mod tests {
         let spec = RailSpec::parse(&sample()).unwrap();
         // A record without the "evt:" prefix never boards (AC-9 onboarding side).
         let mut source = SliceSource::one(vec![b"nope".to_vec()]);
-        let mut sink = VecSink::new();
+        let mut sink = vec_sink();
         assert!(run_pipe(&spec, &mut source, &mut sink, false).is_err());
     }
 
@@ -1347,7 +1437,7 @@ mod tests {
     }
 
     /// Ship one batch of `records` under `key` through `pipe`/`sink` and return its disposition.
-    fn ship_once(pipe: &mut Pipeline, sink: &mut VecSink, records: Vec<Vec<u8>>, key: &[u8]) -> Disposition {
+    fn ship_once(pipe: &mut Pipeline, sink: &mut AnySink, records: Vec<Vec<u8>>, key: &[u8]) -> Disposition {
         let mut source = SliceSource::one(records);
         let batch = source.next_batch().unwrap().unwrap();
         pipe.ship_batch(&batch, key, sink).unwrap().unwrap().disposition
@@ -1382,11 +1472,11 @@ mod tests {
         let slice = all[range.start..range.end].to_vec();
 
         let mut pipe = Pipeline::from_spec(&spec).unwrap();
-        let mut sink = VecSink::new();
+        let mut sink = vec_sink();
         let disp = ship_once(&mut pipe, &mut sink, slice, b"datarail-replay-1..3");
 
         assert_eq!(disp, Disposition::Delivered);
-        assert_eq!(sink.committed(), &[b"evt:r1".to_vec(), b"evt:r2".to_vec()]);
+        assert_eq!(sink.committed_view().unwrap(), &[b"evt:r1".to_vec(), b"evt:r2".to_vec()]);
         assert_eq!(pipe.dst_term.sink().len(), 2);
         assert_eq!(pipe.dst_term.dead_letters().len(), 0);
     }
@@ -1399,18 +1489,18 @@ mod tests {
         let slice = vec![b"evt:r1".to_vec(), b"evt:r2".to_vec()];
 
         let mut pipe = Pipeline::from_spec(&spec).unwrap();
-        let mut sink = VecSink::new();
+        let mut sink = vec_sink();
 
         // SAME record-key both passes — that is the effectively-once identity the once-gate dedups on.
         let key = b"datarail-replay-0..2";
         let first = ship_once(&mut pipe, &mut sink, slice.clone(), key);
         assert_eq!(first, Disposition::Delivered);
-        assert_eq!(sink.committed().len(), 2);
+        assert_eq!(sink.committed_view().unwrap().len(), 2);
 
         let second = ship_once(&mut pipe, &mut sink, slice, key);
         assert_eq!(second, Disposition::Duplicate);
         // Nothing new committed on the replay: the sink connector and terminal sink both stay at 2.
-        assert_eq!(sink.committed().len(), 2);
+        assert_eq!(sink.committed_view().unwrap().len(), 2);
         assert_eq!(pipe.dst_term.sink().len(), 2);
     }
 
@@ -1453,15 +1543,15 @@ mod tests {
         let recs = vec![b"evt:a".to_vec(), b"evt:b".to_vec(), b"evt:c".to_vec()];
 
         let mut plain_src = SliceSource::one(recs.clone());
-        let mut plain_sink = VecSink::new();
+        let mut plain_sink = vec_sink();
         run_pipe(&spec, &mut plain_src, &mut plain_sink, false).unwrap();
 
         let mut watch_src = SliceSource::one(recs);
-        let mut watch_sink = VecSink::new();
+        let mut watch_sink = vec_sink();
         let watched = run_pipe(&spec, &mut watch_src, &mut watch_sink, true).unwrap();
 
         assert!(watched.contains("committed   = 3"), "{watched}");
-        assert_eq!(watch_sink.committed().len(), 3);
-        assert_eq!(watch_sink.committed(), plain_sink.committed());
+        assert_eq!(watch_sink.committed_view().unwrap().len(), 3);
+        assert_eq!(watch_sink.committed_view().unwrap(), plain_sink.committed_view().unwrap());
     }
 }
