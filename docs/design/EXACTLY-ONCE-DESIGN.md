@@ -89,9 +89,35 @@ cofre's monotonic seq as the watermark — delivering Tier A exactly-once. A non
 4. Wire Tier A into the offload/CLI path (feed the seq as the watermark); fall back to Tier C otherwise.
 5. **Adversarial audit** of the new transactional path (it is correctness-critical — audit it like the core).
 
-## Integration plan — wiring Tier A into the product (`datarail run` / `kafka-ingest`)
-Tier A is implemented + proven + CI-gated at the `PostgresSink` level (`commit_at`). The remaining step is making
-the product flows USE it so exactly-once is end-to-end, not just available:
+## ✅ Integration DONE — Tier A is wired into the product and PROVEN end-to-end (2026-06-26)
+Tier A is now the **default** for the Postgres sink in both product flows. `datarail run` / `kafka-ingest` with
+`--sink-postgres` deliver exactly-once into Postgres end-to-end; `--at-least-once` opts back into the plain COPY path.
+
+**Wiring (as built):**
+- Sink selection returns a capability-typed `AnySink` — `Plain(Box<dyn Sink>)` (file/webhook/memory → `commit`,
+  Tier C) or `Txn(Box<PostgresSink>)` (→ `commit_at`, Tier A). The CLI knows when the sink is Postgres, so no
+  `Any`/downcast. Shared by `run` and `kafka-ingest` via `select_sink`.
+- **Watermark = cumulative count of records LANDED for the stream** (the `Pipeline`'s commit cursor), not boarded —
+  so it tracks the durable sink position regardless of dead-letters/dedup. Stream id = the route's `route_id`.
+- The run report prints the honest guarantee line (`guarantee = exactly-once into Postgres (Tier A …)` / `at-least-once (Tier C)`).
+
+**Correctness refinement found + fixed while wiring (record-granularity, not batch-granularity):** a `LineFileSource`
+reads the whole file as ONE batch, so a source that GREW between runs re-presents a *larger* batch under a higher
+cumulative watermark. Batch-granularity idempotency (`if watermark <= stored: no-op else land ALL`) would re-land the
+overlap. `commit_at` now lands only the suffix past the stored watermark — `base = watermark - records.len()`, land
+`records[(stored - base)..]`. Proven by the `a_grown_replay_batch_lands_only_the_new_suffix_not_the_overlap` live test.
+
+**MEASURED proof (against a real Postgres 16, independently verified at the DB level):**
+- `datarail run … --sink-postgres` run **twice** (identical replay, fresh process → empty in-memory dedup) → **4 rows,
+  not 8.** The two runs produced *different cofre_ids* yet the second landed zero new rows — the Postgres-resident
+  watermark (not in-memory state) enforces exactly-once across invocations.
+- `--at-least-once` opt-out → **8 rows** (doubles, as labelled). Both paths behave exactly as their guarantee claims.
+- Live tests: batch + 3 replays → 4 rows / watermark 4; grown-source partial-overlap → 4 (overlap not re-landed);
+  backend-error-does-not-desync → durable watermark survives. CI gate (`connectors-live.yml`) now asserts the
+  end-to-end replay (run twice → 3 rows, not 6) + the grown-batch partial-overlap.
+
+### Original integration plan (for the record)
+The remaining step was making the product flows USE Tier A so exactly-once is end-to-end, not just available:
 
 - **Sink selection** returns a capability-typed sink, not a bare `Box<dyn Sink>`: either `Plain(Box<dyn Sink>)`
   (file/webhook/memory → `commit`) or `Txn(PostgresSink)` (→ `commit_at`). The CLI already knows when the sink is

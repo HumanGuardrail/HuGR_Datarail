@@ -46,11 +46,16 @@ jobs:
           EO=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_eo;")
           echo "exactly-once rows (after replays) = $EO"
           [ "$EO" = "4" ] || { echo "::error::exactly-once broken: expected 4 rows after replays, got $EO"; exit 1; }
-          WM=$(psql -h localhost -U postgres -t -A -c "SELECT seq FROM datarail_watermark;")
+          # Watermark is per-stream now (route-xyz from the eo test, route-grow from the grown-batch test): scope it.
+          WM=$(psql -h localhost -U postgres -t -A -c "SELECT seq FROM datarail_watermark WHERE stream='\x726f7574652d78797a';")
           [ "$WM" = "4" ] || { echo "::error::watermark expected 4, got $WM"; exit 1; }
-          echo "## Exactly-once into Postgres ✅ — batch + 3 replays → 4 rows, watermark 4" >> "$GITHUB_STEP_SUMMARY"
+          # Partial-overlap (grown source re-presented as a larger batch): exactly 4 rows, the [g0,g1] overlap not re-landed.
+          GROW=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_grow;")
+          echo "grown-batch rows = $GROW"
+          [ "$GROW" = "4" ] || { echo "::error::partial-overlap broken: expected 4 grown rows, got $GROW"; exit 1; }
+          echo "## Exactly-once into Postgres ✅ — batch + 3 replays → 4 rows, watermark 4; grown-source partial-overlap → 4 (no double-land)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: End-to-end — datarail run --source-http → sealed rail → --sink-postgres
+      - name: End-to-end — datarail run --source-http → sealed rail → --sink-postgres (exactly-once across a replay)
         run: |
           psql -h localhost -U postgres -c "CREATE TABLE datarail_e2e (data text);"
           cargo build -p datarail-cli --release
@@ -58,11 +63,17 @@ jobs:
           python3 -m http.server 8799 >/dev/null 2>&1 &
           HTTP_PID=$!
           sleep 2
-          ./target/release/datarail run examples/rail.toml \
-            --source-http http://127.0.0.1:8799/events.ndjson \
-            --sink-postgres "host=localhost,port=5432,user=postgres,db=postgres,table=datarail_e2e,column=data"
-          kill "$HTTP_PID" 2>/dev/null || true
+          CONN="host=localhost,port=5432,user=postgres,db=postgres,table=datarail_e2e,column=data"
+          # RUN 1: the v1 product flow lands 3 sealed rows.
+          ./target/release/datarail run examples/rail.toml --source-http http://127.0.0.1:8799/events.ndjson --sink-postgres "$CONN"
           ROWS=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_e2e;")
-          echo "e2e sealed rows landed=$ROWS"
-          [ "$ROWS" = "3" ] || { echo "::error::expected 3 e2e rows, got $ROWS"; exit 1; }
-          echo "## v1 product flow ✅ — HTTP API → sealed rail → Postgres (3 sealed rows landed)" >> "$GITHUB_STEP_SUMMARY"
+          echo "after run 1: rows=$ROWS"
+          [ "$ROWS" = "3" ] || { echo "::error::expected 3 e2e rows after run 1, got $ROWS"; exit 1; }
+          # RUN 2: an IDENTICAL replay (a fresh process — empty in-memory dedup). Tier A's Postgres-resident watermark
+          # must make this a no-op: still 3 rows, NOT 6. This is end-to-end exactly-once through the WHOLE product.
+          ./target/release/datarail run examples/rail.toml --source-http http://127.0.0.1:8799/events.ndjson --sink-postgres "$CONN"
+          kill "$HTTP_PID" 2>/dev/null || true
+          ROWS2=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_e2e;")
+          echo "after run 2 (replay): rows=$ROWS2"
+          [ "$ROWS2" = "3" ] || { echo "::error::end-to-end exactly-once BROKEN: a replayed datarail run double-landed ($ROWS2 rows, expected 3)"; exit 1; }
+          echo "## v1 product flow ✅ — HTTP API → sealed rail → Postgres, EXACTLY-ONCE across a replayed run (3 rows after run+replay, not 6)" >> "$GITHUB_STEP_SUMMARY"

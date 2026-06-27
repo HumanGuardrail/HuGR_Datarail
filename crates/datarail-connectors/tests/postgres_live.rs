@@ -72,6 +72,60 @@ fn run_psql(sql: &str) {
     assert!(ok, "psql failed for: {sql}");
 }
 
+/// Run a scalar `SELECT` via `psql -tA` and return the single trimmed value (so a test can assert the landed
+/// row count itself, rather than relying on an external harness step).
+fn psql_scalar(sql: &str) -> String {
+    let host = std::env::var("DATARAIL_PG_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let port = std::env::var("DATARAIL_PG_PORT").unwrap_or_else(|_| "5432".to_owned());
+    let out = std::process::Command::new("psql")
+        .args(["-h", &host, "-p", &port, "-U", "postgres", "-tA", "-c", sql])
+        .output()
+        .expect("psql scalar query");
+    assert!(out.status.success(), "psql failed for: {sql}");
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+#[test]
+#[ignore = "needs a live Postgres + psql on PATH; run in the docker verification harness"]
+fn a_grown_replay_batch_lands_only_the_new_suffix_not_the_overlap() {
+    // The partial-overlap case (the realistic replay shape for `datarail run` over a file, which reads the whole
+    // file as ONE batch): run 1 lands a 2-record prefix; the source then GROWS and run 2 re-presents a LARGER
+    // 4-record batch under the higher cumulative watermark. commit_at must land ONLY the new suffix [r2,r3] —
+    // never re-land the [r0,r1] overlap. Batch-granularity idempotency would double-land; record-granularity
+    // (base = watermark - records.len()) does not. This is the property the product flow depends on.
+    run_psql("DROP TABLE IF EXISTS datarail_grow");
+    run_psql("CREATE TABLE datarail_grow (data text)");
+    // Clear any stale watermark for this stream (order-independent: create the table first if no prior test made it).
+    run_psql("CREATE TABLE IF NOT EXISTS datarail_watermark (stream bytea PRIMARY KEY, seq bigint NOT NULL)");
+    run_psql("DELETE FROM datarail_watermark WHERE stream = '\\x726f7574652d67726f77'"); // 'route-grow'
+    let mut sink = PostgresSink::connect(live_cfg("datarail_grow")).expect("connect");
+    let stream = b"route-grow";
+
+    // Run 1: land the 2-record prefix (cumulative landed = 2).
+    sink.commit_at(&[b"g:0".to_vec(), b"g:1".to_vec()], stream, 2).expect("run1 prefix");
+    assert_eq!(psql_scalar("SELECT count(*) FROM datarail_grow"), "2", "run1 landed 2 rows");
+
+    // Run 2 (fresh process semantics: once-gate empty, the GROWN source re-presents the whole 4-record batch).
+    sink.commit_at(
+        &[b"g:0".to_vec(), b"g:1".to_vec(), b"g:2".to_vec(), b"g:3".to_vec()],
+        stream,
+        4,
+    )
+    .expect("run2 grown batch");
+    assert_eq!(
+        psql_scalar("SELECT count(*) FROM datarail_grow"),
+        "4",
+        "the overlap [g:0,g:1] must NOT re-land — exactly 4 rows, not 6"
+    );
+    assert_eq!(sink.resume_watermark(stream).expect("wm"), 4, "watermark advanced to 4");
+    // And the suffix that landed is exactly g:2,g:3 (the overlap kept its single copy).
+    assert_eq!(
+        psql_scalar("SELECT count(*) FROM datarail_grow WHERE data IN ('g:2','g:3')"),
+        "2",
+        "the new suffix g:2,g:3 landed exactly once"
+    );
+}
+
 #[test]
 #[ignore = "needs a live Postgres + psql on PATH; run in the docker verification harness"]
 fn a_backend_error_does_not_desync_the_connection() {

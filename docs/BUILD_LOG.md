@@ -717,6 +717,23 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   Competitors punt exactly-once-to-sink to "use a transactional consumer"; datarail delivers it with the watermark
   in your DB. (The new txn path is itself under brutal adversarial audit — durability components always are.)
 
+- 2026-06-26 — **TIER A WIRED INTO THE PRODUCT — exactly-once is now END-TO-END + on by default (MEASURED).** The
+  moat was available at the `PostgresSink` level but the CLI still used plain `commit()`; now `datarail run` and
+  `kafka-ingest` deliver exactly-once through the WHOLE product. Sink selection became a capability-typed `AnySink`
+  (`Plain(Box<dyn Sink>)` Tier C vs `Txn(Box<PostgresSink>)` Tier A), shared by both flows via `select_sink`;
+  Postgres ⇒ Tier A by default, `--at-least-once` opts out; the run report prints the honest guarantee line. The
+  watermark fed to `commit_at` = the cumulative **landed**-record count for the stream (route_id), so it tracks the
+  durable sink position regardless of dead-letters. **Correctness refinement found while wiring:** a `LineFileSource`
+  reads the whole file as ONE batch, so a source that grew between runs re-presents a *larger* batch — batch-grained
+  idempotency would re-land the overlap. Fixed `commit_at` to be idempotent at **record** granularity (`base =
+  watermark - records.len()`; land only `records[(stored-base)..]`). PROVEN LIVE against real Postgres 16 + the
+  partial-overlap path independently verified at the DB: `datarail run` ×2 (identical replay, fresh process → empty
+  in-memory dedup, *distinct cofre_ids*) → **4 rows, not 8**; `--at-least-once` → 8 (doubles, as labelled); grown
+  batch → suffix-only (overlap not re-landed). The Postgres-resident watermark — not in-memory state — is what
+  enforces once-ness across invocations. CI gate `connectors-live.yml` now asserts the end-to-end replay (run ×2 →
+  3 rows, not 6) + the grown-batch case. New live test `a_grown_replay_batch_lands_only_the_new_suffix_not_the_overlap`.
+  Full workspace clippy(deny all+pedantic)+test green; forbid(unsafe); no #[allow]. (`EXACTLY-ONCE-DESIGN.md` §Integration DONE.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

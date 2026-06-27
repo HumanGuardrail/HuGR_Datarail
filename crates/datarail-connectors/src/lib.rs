@@ -38,6 +38,13 @@ pub trait Sink {
     /// # Errors
     /// Propagates a write error from the underlying sink.
     fn commit(&mut self, records: &[Vec<u8>]) -> io::Result<()>;
+
+    /// In-memory committed records, when the sink keeps them for introspection (the default is `None`;
+    /// only [`VecSink`] overrides it). Lets a caller assert what landed without a concrete-type downcast —
+    /// used by the CLI's run report and tests. An opaque external sink (Postgres/webhook/file) returns `None`.
+    fn committed_view(&self) -> Option<&[Vec<u8>]> {
+        None
+    }
 }
 
 /// A sink that can land a batch **and** record a monotonic watermark **atomically** — the basis for true
@@ -142,6 +149,10 @@ impl Sink for VecSink {
     fn commit(&mut self, records: &[Vec<u8>]) -> io::Result<()> {
         self.committed.extend_from_slice(records);
         Ok(())
+    }
+
+    fn committed_view(&self) -> Option<&[Vec<u8>]> {
+        Some(&self.committed)
     }
 }
 
