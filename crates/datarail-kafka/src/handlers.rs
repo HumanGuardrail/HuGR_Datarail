@@ -26,9 +26,12 @@ struct ApiRange {
 
 /// What this broker supports. A client picks, for each API, a version in `[min, max]` it also supports.
 /// `InitProducerId` is advertised at v0/v1 only (non-flexible) — enough for an idempotent (non-transactional)
-/// producer; transactional EOS (a stable `transactional.id`) is a further increment.
-const SUPPORTED: [ApiRange; 4] = [
+/// producer. `Fetch`/`ListOffsets` are the CONSUME side (only the `kafka-broker` mode serves them; advertising
+/// them is harmless for ingest-only producers). All are non-flexible versions (no KIP-482 tagged fields).
+const SUPPORTED: [ApiRange; 6] = [
     ApiRange { key: API_PRODUCE, min: 0, max: 7 },
+    ApiRange { key: crate::consume::API_FETCH, min: 0, max: 4 },
+    ApiRange { key: crate::consume::API_LIST_OFFSETS, min: 0, max: 2 },
     ApiRange { key: API_METADATA, min: 0, max: 1 },
     ApiRange { key: API_VERSIONS, min: 0, max: 3 },
     ApiRange { key: API_INIT_PRODUCER_ID, min: 0, max: 1 },

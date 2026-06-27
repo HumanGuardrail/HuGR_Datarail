@@ -62,6 +62,71 @@ fn take_varint_bytes(reader: &mut Reader) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(reader.take(n)?.to_vec()))
 }
 
+/// CRC-32C (Castagnoli, reflected) — the checksum a Kafka v2 `RecordBatch` carries and that real consumers
+/// VALIDATE on `Fetch`. Hand-rolled (zero-dep, like the `MD5` in the Postgres sink). Bitwise reflected form with
+/// polynomial `0x82F6_3B78` (the reflection of `0x1EDC_6F41`).
+#[must_use]
+pub fn crc32c(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in data {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// Build one uncompressed v2 `RecordBatch` (non-idempotent: `producer_id = -1`) carrying `values`, with a CORRECT
+/// `CRC-32C` so a real Kafka consumer accepts it on `Fetch`. `base_offset` is the logical offset of the first
+/// record. Null keys, no headers, `CreateTime` timestamps 0 (informational). The inverse of [`parse_record_batch`].
+#[must_use]
+pub fn build_record_batch(base_offset: i64, values: &[Vec<u8>]) -> Vec<u8> {
+    let mut recs = Writer::new();
+    for (i, v) in values.iter().enumerate() {
+        let mut r = Writer::new();
+        r.int8(0); // attributes
+        r.varlong(0); // timestamp delta
+        r.varint(i32::try_from(i).unwrap_or(i32::MAX)); // offset delta
+        r.varint(-1); // null key
+        r.varint(i32::try_from(v.len()).unwrap_or(i32::MAX));
+        r.raw(v);
+        r.varint(0); // header count
+        let body = r.into_bytes();
+        recs.varint(i32::try_from(body.len()).unwrap_or(i32::MAX));
+        recs.raw(&body);
+    }
+    let records = recs.into_bytes();
+
+    // Everything the CRC covers: from `attributes` to the end of the records.
+    let mut after_crc = Writer::new();
+    after_crc.int16(0); // attributes (uncompressed, CreateTime)
+    after_crc.int32(i32::try_from(values.len().saturating_sub(1)).unwrap_or(i32::MAX)); // last_offset_delta
+    after_crc.int64(0); // base_timestamp
+    after_crc.int64(0); // max_timestamp
+    after_crc.int64(-1); // producer_id (non-idempotent)
+    after_crc.int16(-1); // producer_epoch
+    after_crc.int32(-1); // base_sequence
+    after_crc.int32(i32::try_from(values.len()).unwrap_or(i32::MAX)); // record count
+    after_crc.raw(&records);
+    let after = after_crc.into_bytes();
+    let crc = crc32c(&after);
+
+    // partition_leader_epoch + magic + crc + (attributes..records) = the batch length covers all of this.
+    let mut tail = Writer::new();
+    tail.int32(-1); // partition_leader_epoch
+    tail.int8(2); // magic
+    tail.uint32(crc);
+    tail.raw(&after);
+    let tail_bytes = tail.into_bytes();
+
+    let mut full = Writer::new();
+    full.int64(base_offset);
+    full.int32(i32::try_from(tail_bytes.len()).unwrap_or(i32::MAX)); // batch_length
+    full.raw(&tail_bytes);
+    full.into_bytes()
+}
+
 /// Parse a producer's records blob into the record VALUE payloads. Handles BOTH the v2 `RecordBatch` (magic 2,
 /// modern clients) and the legacy `MessageSet` (magic 0/1, older clients and some librdkafka fallbacks) — they
 /// share a layout up to the magic byte at offset 16 (`int64`, `int32`, 4 bytes, then magic), so we read that far
@@ -367,6 +432,27 @@ mod tests {
         assert_eq!(parsed.values, vec![b"evt:one".to_vec(), b"evt:two".to_vec(), b"evt:three".to_vec()]);
         // The reference helper uses producer_id = -1 (non-idempotent) → no EOS coord.
         assert_eq!(parsed.eos, None);
+    }
+
+    #[test]
+    fn crc32c_known_answer() {
+        // The canonical CRC-32C check value for the ASCII string "123456789".
+        assert_eq!(super::crc32c(b"123456789"), 0xe306_9283);
+        assert_eq!(super::crc32c(b""), 0);
+    }
+
+    #[test]
+    fn built_record_batch_round_trips_through_the_parser() {
+        // build_record_batch is the inverse of parse_record_batch: a consumer-facing batch we build must parse
+        // back to the same values (and a real consumer accepts it because the CRC-32C is correct).
+        let values = vec![b"evt:x".to_vec(), b"evt:y".to_vec(), b"evt:z".to_vec()];
+        let blob = super::build_record_batch(0, &values);
+        let parsed = parse_record_batch(&blob).expect("parse our own batch");
+        assert_eq!(parsed.values, values);
+        // And the embedded CRC matches a recompute over the covered range (attributes..records).
+        // Layout: base_offset(8) batch_len(4) ple(4) magic(1) crc(4) then the covered bytes.
+        let crc_stored = u32::from_be_bytes([blob[17], blob[18], blob[19], blob[20]]);
+        assert_eq!(crc_stored, super::crc32c(&blob[21..]), "stored CRC-32C covers attributes..records");
     }
 
     #[test]
