@@ -697,6 +697,10 @@ struct Pipeline {
     rail: AnyRail,
     /// Total records handed to `board` (the rail's view; duplicates still board, they dedup at offload).
     boarded: usize,
+    /// Cumulative count of records landed (committed to the terminal sink) for this route — the landed-count
+    /// watermark for the file/replay Tier-A path. Tracked in a counter because the terminal sink is now DRAINED
+    /// every batch (so a long-running daemon does not retain every record in memory — the streaming fix).
+    landed_total: usize,
     /// The wire-hex of the most recently boarded cofre (for the human report).
     last_cofre_hex: String,
     /// The per-stream dedup identity for a [`TxnSink`] (Tier A): the route's `route_id`, so distinct rails do
@@ -724,6 +728,7 @@ impl Pipeline {
             dst_term,
             rail,
             boarded: 0,
+            landed_total: 0,
             last_cofre_hex: String::new(),
             stream: spec.route.route_id.to_vec(),
         })
@@ -819,11 +824,6 @@ impl Pipeline {
         self.boarded += refs.len();
         self.last_cofre_hex = to_hex(&datarail_cofre::encode(&cofre));
 
-        // Snapshot the terminal-sink length BEFORE offload; only a `Delivered` offload grows it. The fresh records
-        // are EXACTLY this batch's new slice `[before, after)` — a per-batch snapshot, NOT a global cursor. This
-        // keeps each batch's commit self-contained, so a commit failure on one batch (the ingest loop continues,
-        // audit E) never mis-attributes its records to a later batch of another substream (audit follow-up).
-        let before = self.dst_term.sink().committed().len();
         self.rail.send(&cofre)?;
         let mut received = None;
         for _ in 0..1_000_000 {
@@ -836,9 +836,20 @@ impl Pipeline {
         let disposition = self.dst_term.offload(&received).map_err(CliError::Terminal)?;
         self.rail.ack(received.etiqueta.cofre_id)?;
 
-        let after = self.dst_term.sink().committed().len();
-        let fresh: Vec<Vec<u8>> = self.dst_term.sink().committed().get(before..after).unwrap_or(&[]).to_vec();
-        Ok(Some((disposition, fresh, after)))
+        // DRAIN the terminal sink: only a `Delivered` offload appended to it, and the sink was emptied by the
+        // previous batch, so `take_committed` yields EXACTLY this batch's freshly-landed records and leaves the
+        // sink empty — the streaming fix (a long-running daemon never retains every record). Each batch's commit
+        // is thus self-contained, so a commit failure on one batch (the ingest loop continues, audit E) cannot
+        // mis-attribute its records to a later batch. The cumulative landed count lives in `landed_total`.
+        let fresh = self.dst_term.sink_mut().take_committed();
+        self.landed_total += fresh.len();
+        Ok(Some((disposition, fresh, self.landed_total)))
+    }
+
+    /// Cumulative count of records landed for this route (the terminal sink is drained each batch, so this
+    /// counter — not the sink length — is the authoritative landed total).
+    fn landed_total(&self) -> usize {
+        self.landed_total
     }
 
     /// The human-readable end-of-run report (substrate, totals, last cofre).
@@ -847,7 +858,7 @@ impl Pipeline {
             "substrate   = {}\nboarded     = {} record(s)\ncommitted   = {}\ndead-letter = {}\nlast cofre  = 0x{}\n",
             self.rail.name(),
             self.boarded,
-            self.dst_term.sink().len(),
+            self.landed_total,
             self.dst_term.dead_letters().len(),
             self.last_cofre_hex,
         )
@@ -993,7 +1004,7 @@ fn run_pipe(
 /// `records · 1000 / elapsed_ms`, so the line stays cast-free (no float precision lint to silence).
 fn print_speedometer(tag: &str, pipe: &Pipeline, elapsed: std::time::Duration) {
     let elapsed_ms = elapsed.as_millis();
-    let committed = pipe.dst_term.sink().len();
+    let committed = pipe.landed_total();
     let dead = pipe.dst_term.dead_letters().len();
     let boarded = u128::try_from(pipe.boarded).unwrap_or(u128::MAX);
     let rate = (boarded * 1000).checked_div(elapsed_ms).unwrap_or(0);
@@ -1640,7 +1651,7 @@ mod tests {
 
         assert_eq!(disp, Disposition::Delivered);
         assert_eq!(sink.committed_view().unwrap(), &[b"evt:r1".to_vec(), b"evt:r2".to_vec()]);
-        assert_eq!(pipe.dst_term.sink().len(), 2);
+        assert_eq!(pipe.landed_total(), 2); // the terminal sink is drained each batch; the counter is authoritative
         assert_eq!(pipe.dst_term.dead_letters().len(), 0);
     }
 
@@ -1662,9 +1673,9 @@ mod tests {
 
         let second = ship_once(&mut pipe, &mut sink, slice, key);
         assert_eq!(second, Disposition::Duplicate);
-        // Nothing new committed on the replay: the sink connector and terminal sink both stay at 2.
+        // Nothing new committed on the replay: the external sink stays at 2, and the cumulative landed count too.
         assert_eq!(sink.committed_view().unwrap().len(), 2);
-        assert_eq!(pipe.dst_term.sink().len(), 2);
+        assert_eq!(pipe.landed_total(), 2);
     }
 
     #[test]

@@ -455,10 +455,17 @@ pub struct DeadLetter {
     pub reason: DeadLetterReason,
 }
 
-/// The offloading dead-letter siding: a reason-coded, append-only list of diverted cofres (D3).
+/// Max dead-letters RETAINED in memory. Past this, the OLDEST is evicted (its count kept in `dropped`) so a
+/// hostile producer flooding contract-violating cofres cannot grow the siding without bound (a long-running
+/// destination must not OOM on diverted cofres). 1024 is ample for inspection; the all-time total is preserved.
+const MAX_DEAD_LETTERS_RETAINED: usize = 1024;
+
+/// The offloading dead-letter siding: a reason-coded list of diverted cofres (D3), **bounded** to the most
+/// recent [`MAX_DEAD_LETTERS_RETAINED`] (older ones are counted in `dropped`, not retained).
 #[derive(Debug, Default, Clone)]
 pub struct DeadLetterSiding {
     entries: Vec<DeadLetter>,
+    dropped: u64,
 }
 
 impl DeadLetterSiding {
@@ -468,26 +475,42 @@ impl DeadLetterSiding {
         Self::default()
     }
 
-    /// Number of diverted cofres on the siding.
+    /// Number of diverted cofres CURRENTLY RETAINED on the siding (≤ [`MAX_DEAD_LETTERS_RETAINED`]).
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Whether the siding is empty.
+    /// Whether the siding currently retains no cofres.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
-    /// The diverted entries, in arrival order.
+    /// Count of older diverted cofres evicted to keep the siding bounded (not retained).
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// All-time count of diverted cofres (retained + evicted).
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.dropped.saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX))
+    }
+
+    /// The diverted entries currently retained, in arrival order (oldest first).
     #[must_use]
     pub fn entries(&self) -> &[DeadLetter] {
         &self.entries
     }
 
-    /// Divert a cofre to the siding with its reason-code.
+    /// Divert a cofre to the siding with its reason-code, evicting the oldest if at the retention cap.
     fn push(&mut self, cofre: Cofre, reason: DeadLetterReason) {
+        if self.entries.len() >= MAX_DEAD_LETTERS_RETAINED {
+            self.entries.remove(0); // evict oldest (bounded flood; O(n) only past the cap)
+            self.dropped = self.dropped.saturating_add(1);
+        }
         self.entries.push(DeadLetter { cofre, reason });
     }
 }

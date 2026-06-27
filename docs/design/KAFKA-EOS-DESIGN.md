@@ -24,10 +24,13 @@
 > epoch bump (sequence resets to 0) forms a fresh substream instead of being wrongly no-op'd (loss). Proven by
 > the extended `kafka_eos_live.rs` (sink failure → retriable error + daemon survives + recovers).
 >
-> **Known limitation (honest):** the offload terminal's in-memory sink + once-gate **retain all records for the
-> daemon's lifetime** (pre-existing across all kafka-ingest, worsened by re-delivered retries) → a long-running
-> ingest grows in memory. A streaming/draining terminal sink is a tracked separate arc; today's proof is correct,
-> production-longevity needs that arc.
+> **Long-running memory (FIXED 2026-06-27 — the streaming-terminal arc):** the offload terminal's sink used to
+> **retain every landed record for the daemon's lifetime** → OOM under sustained load. Now the pipeline **drains
+> the terminal sink every batch** (`sink_mut().take_committed()`, cumulative count kept in a `landed_total`
+> counter), so memory is bounded by one batch. The **dead-letter siding is also bounded** (`MAX_DEAD_LETTERS_
+> RETAINED = 1024`; older diversions evicted + counted) so a producer flooding contract-violations can't OOM the
+> destination (regression `dead_letter_siding_is_bounded_under_a_flood`). The once-gate stays bounded by its
+> existing watermark+GC (seqs are contiguous in-order per source terminal). The EOS daemon is now long-running-safe.
 
 
 > The audit (F1/F2) correctly demoted `kafka-ingest` to at-least-once: it funnelled all partitions into one

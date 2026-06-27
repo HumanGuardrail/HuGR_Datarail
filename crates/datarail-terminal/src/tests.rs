@@ -98,6 +98,29 @@ fn ac9_board_refuses_contract_violating_record() {
     assert_eq!(src.next_seq(), 0);
 }
 
+#[test]
+fn dead_letter_siding_is_bounded_under_a_flood() {
+    // A hostile producer flooding contract-violating cofres must NOT grow the siding without bound (a long-running
+    // destination would OOM). Past the retention cap the OLDEST is evicted (counted, not retained); the all-time
+    // total is preserved. Boards under a permissive source, dead-letters at the strict dest (fingerprint mismatch).
+    let permissive = ContentContract::new(MAX_LEN, Vec::new());
+    let mut src = SourceTerminal::new(config(), permissive, SOURCE_SEED);
+    let mut dst = dest();
+    let cap = super::MAX_DEAD_LETTERS_RETAINED;
+    let n = cap + 100;
+    for i in 0..n {
+        let rk = format!("flood-{i}");
+        let rec = format!("NO-PREFIX-{i}");
+        let recs: [&[u8]; 1] = [rec.as_bytes()];
+        let cofre = src.board(&recs, rk.as_bytes()).expect("board");
+        assert_eq!(dst.offload(&cofre).expect("offload"), Disposition::DeadLettered);
+    }
+    assert_eq!(dst.dead_letters().len(), cap, "retained count is capped");
+    assert_eq!(dst.dead_letters().dropped(), 100, "older diversions evicted + counted");
+    assert_eq!(dst.dead_letters().total(), u64::try_from(n).unwrap(), "all-time total preserved");
+    assert!(dst.sink().is_empty(), "no dead-lettered cofre is ever committed");
+}
+
 // ---- AC-9 (b): offload of contract-violating records ⇒ dead-lettered, NOT committed ----------------------
 
 #[test]
