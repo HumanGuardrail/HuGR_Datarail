@@ -9,7 +9,10 @@
 > (`kafka_broker_wire.rs`: the real binary, produce 3 → fetch back the plaintext, suffix fetch, ListOffsets → 3).
 > **Honest scope:** the store is **in-memory** (provider-blind but not durable across restart) — durable
 > `datarail-topic` backing is increment 2; single partition; no consumer groups; produce hop plaintext (seal-on-
-> ingest). Next: increment 2 (durability) + adversarial audit of the un-seal-on-fetch path.
+> ingest). **AUDITED CLEAN (2026-06-27, `CORE-AUDIT.md` §Kafka-CONSUME):** a brutal adversarial pass found NO
+> exploitable bug — cross-route read, forged-cofre injection, malformed-request panic/over-alloc, bad-CRC, and
+> plaintext-leak all DEFEATED; the `offload`→`open_records` refactor is behavior-preserving (every check, same
+> order). Next: increment 2 (durability).
 
 
 > Today `kafka-ingest` is one-way: a Kafka producer → datarail seals → an external sink. This adds the **consume**

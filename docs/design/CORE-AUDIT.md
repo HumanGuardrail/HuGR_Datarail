@@ -140,3 +140,31 @@ every landed record for the daemon's lifetime (pre-existing). The pipeline now D
 (`take_committed` + a `landed_total` counter), and the dead-letter siding is BOUNDED (`MAX_DEAD_LETTERS_RETAINED`,
 evict-oldest + counted) so a contract-violation flood can't OOM the destination. Regression:
 `dead_letter_siding_is_bounded_under_a_flood`; live re-proof (file Tier A + Kafka EOS) unchanged.
+
+## Kafka-CONSUME audit (2026-06-27) — brutal adversarial pass on the un-seal-on-fetch path — CLEAN
+
+A sixth brutal auditor attacked the `kafka-broker` consume path (`consume` codec, `crc32c`/`build_record_batch`,
+`serve_broker`, the `DestTerminal::open`/`open_records` refactor, the CLI sealed store) at HEAD `b7bfe1d`.
+**Verdict: no exploitable bug.** Every key attack DEFEATED (lead cold-verified each):
+
+- **Cross-route / cross-tenant read** — `open_records` rejects a `route_id`/`stream_id` mismatch (`RouteMismatch`):
+  a cofre sealed for another route never opens.
+- **Forged cofre injected into the store** — `open_records` runs `datarail_cofre::verify` against the pinned
+  source vk first (parse-before-verify): a forged lacre fails.
+- **Malformed Fetch/ListOffsets → panic/over-alloc** — every count is bounded by `remaining()`; the `Reader` is
+  fully bounds-checked; varints length-capped. No panic / over-read / over-alloc (the fuzz suite agrees).
+- **Bad CRC** — `crc32c(b"123456789") == 0xe3069283` (canonical Castagnoli) and the CRC covers exactly
+  `attributes..records` per spec → a real consumer accepts the batch.
+- **Plaintext recoverable from storage** — `encode` = etiqueta ‖ AEAD-`carga` ‖ lacre; plaintext lives only inside
+  the sealed `carga`. The store holds ciphertext only — **provider-blind** (the store unit test asserts the
+  plaintext is absent from the stored bytes).
+
+**Refactor integrity:** the `offload`→`open_records` extraction preserves every check in the SAME order (verify
+→ route → contract_fp → key-wrap → AEAD-open → sealed-sender → un-frame → per-record contract); nothing dropped,
+reordered, or weakened; `open`/`open_records` are `&self` and touch no dedup/sink/dead-letter state (re-fetch is
+idempotent). The 26 terminal tests (incl every dead-letter reason) guard it.
+
+Findings: 3, all INFO/LOW, none a defect — a v0 `ListOffsets` path reachable only by a client that ignores
+`ApiVersions` (format correct); unknown-`api_key` drops the connection (fail-safe, no desync); the Fetch `Err`
+arm is effectively dead with the in-memory store (correct defensive code for a future fallible backend). No fix
+required. The security-critical un-seal-on-fetch path holds up to violent probing.
