@@ -6,21 +6,36 @@
 use std::collections::HashMap;
 use std::io::{self, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::codec::{Reader, Writer};
 use crate::handlers::{
-    api_versions_response, metadata_response, parse_metadata_topics, API_METADATA, API_PRODUCE, API_VERSIONS,
+    api_versions_response, init_producer_id_response, metadata_response, parse_metadata_topics,
+    API_INIT_PRODUCER_ID, API_METADATA, API_PRODUCE, API_VERSIONS,
 };
 use crate::produce::{parse_produce, produce_response, EosCoord};
 
-/// A produced batch handed to the integration layer: `(topic, partition, record values, EOS coord)`. The
-/// `EosCoord` (when present) carries the idempotent producer's stable sequence range — the basis for exactly-once
-/// ingest (see `KAFKA-EOS-DESIGN.md`); `None` ⇒ the batch is not EOS-eligible (→ at-least-once).
-pub type ProducedBatch = (String, i32, Vec<Vec<u8>>, Option<EosCoord>);
+/// A produced batch handed to the integration layer for **durable** landing. The producer is **not acked until
+/// `done` reports the landing result** (ack-after-durable — audit A: a broker that acks before the record is
+/// durable loses acked records on a crash, and an idempotent producer never resends an acked batch). `done`
+/// carries `Ok(())` on a durable land or `Err(msg)` on a sink failure (the producer then gets a retriable error
+/// code, never a false ack). The `EosCoord` (when present) carries the idempotent producer's stable sequence
+/// range — the basis for exactly-once ingest (`KAFKA-EOS-DESIGN.md`); `None` ⇒ at-least-once.
+pub struct ProducedBatch {
+    /// Topic the batch was produced to.
+    pub topic: String,
+    /// Partition index.
+    pub partition: i32,
+    /// Record value payloads, in order.
+    pub values: Vec<Vec<u8>>,
+    /// The idempotent-producer EOS coordinate, if present.
+    pub eos: Option<EosCoord>,
+    /// The integration layer signals the durable-landing result here; the serve loop acks only after it arrives.
+    pub done: Sender<Result<(), String>>,
+}
 
 /// Max bytes in a single framed request — a hostile peer cannot make us allocate a giant buffer.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -37,6 +52,9 @@ struct Shared {
     tx: Sender<ProducedBatch>,
     host: String,
     port: i32,
+    /// Monotonic source of `producer_id`s handed out by `InitProducerId` — each idempotent producer gets a
+    /// distinct id, so distinct producers form distinct exactly-once substreams in the sink.
+    next_producer_id: AtomicI64,
 }
 
 /// Serve Kafka ingest on `listener`, advertising this broker as `advertised_host:advertised_port` (the address a
@@ -55,6 +73,7 @@ pub fn serve(
         tx,
         host: advertised_host.to_owned(),
         port: advertised_port,
+        next_producer_id: AtomicI64::new(1),
     });
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
@@ -124,29 +143,55 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             }
             API_PRODUCE => {
                 let topics = parse_produce(&mut reader, api_version)?;
-                let response = {
-                    // Recover from a poisoned lock (the protected state is plain data) so one panicked
-                    // connection can't brick produce for the broker's lifetime (audit K5).
-                    let mut offsets = shared.offsets.lock().unwrap_or_else(PoisonError::into_inner);
-                    produce_response(api_version, correlation_id, &topics, &mut |name, part, count| {
-                        let key = (name.to_owned(), part);
-                        let base = *offsets.get(&key).unwrap_or(&0);
-                        // Bound the map: past the cap, don't retain new keys (they restart at 0) — no unbounded
-                        // growth from attacker-chosen (topic, partition) identities (audit K1). saturating add (K6).
-                        if offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS {
-                            offsets.insert(key, base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)));
-                        }
-                        base
-                    })
-                };
+                // ACK-AFTER-DURABLE (audit A): land every partition batch through the integration layer and wait
+                // for its durable-landing result BEFORE building the ack. A landing failure becomes a retriable
+                // error code for that partition — never a false NONE ack that would lose the records on a crash.
+                let mut codes: HashMap<(String, i32), i16> = HashMap::new();
                 for t in &topics {
                     for p in &t.partitions {
-                        if !p.values.is_empty() {
-                            let _ = shared.tx.send((t.name.clone(), p.partition, p.values.clone(), p.eos));
+                        if p.values.is_empty() {
+                            continue; // nothing to land → NONE
                         }
+                        let (done, done_rx) = std::sync::mpsc::channel();
+                        let sent = shared.tx.send(ProducedBatch {
+                            topic: t.name.clone(),
+                            partition: p.partition,
+                            values: p.values.clone(),
+                            eos: p.eos,
+                            done,
+                        });
+                        // 56 = KAFKA_STORAGE_ERROR (retriable): the integration layer is gone or the land failed,
+                        // so the producer retries rather than treating the records as durably stored.
+                        let code = match sent {
+                            Err(_) => 56,
+                            Ok(()) => match done_rx.recv() {
+                                Ok(Ok(())) => 0,
+                                Ok(Err(_)) | Err(_) => 56,
+                            },
+                        };
+                        codes.insert((t.name.clone(), p.partition), code);
                     }
                 }
-                response
+                // Recover from a poisoned lock (the protected state is plain data) so one panicked
+                // connection can't brick produce for the broker's lifetime (audit K5).
+                let mut offsets = shared.offsets.lock().unwrap_or_else(PoisonError::into_inner);
+                produce_response(api_version, correlation_id, &topics, &mut |name, part, count| {
+                    let key = (name.to_owned(), part);
+                    let base = *offsets.get(&key).unwrap_or(&0);
+                    let code = codes.get(&key).copied().unwrap_or(0); // read before the insert moves `key`
+                    // Bound the map: past the cap, don't retain new keys (they restart at 0) — no unbounded
+                    // growth from attacker-chosen (topic, partition) identities (audit K1). saturating add (K6).
+                    if offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS {
+                        offsets.insert(key, base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)));
+                    }
+                    (base, code)
+                })
+            }
+            API_INIT_PRODUCER_ID => {
+                // Hand out a fresh producer_id so the client can enable idempotence; the request body
+                // (transactional_id / timeout) needs no parsing — each producer just needs a distinct id.
+                let pid = shared.next_producer_id.fetch_add(1, Ordering::Relaxed);
+                init_producer_id_response(correlation_id, pid)
             }
             other => {
                 return Err(io::Error::other(format!("unsupported Kafka api_key {other}")));

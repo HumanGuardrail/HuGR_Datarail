@@ -1,5 +1,35 @@
 # KAFKA-EOS-DESIGN — exactly-once Kafka ingest into a transactional sink (the v2 moat; upgrades F2's at-least-once)
 
+> **STATUS: BUILT + PROVEN (2026-06-27).** All 7 build-plan steps below are done. `InitProducerId` (API 22) is
+> served, the EOS coord is surfaced + threaded, `commit_at_seq` + the per-batch CLI routing land it, and it is
+> proven LIVE against real Postgres 16: a duplicated idempotent `Produce` through the real `datarail kafka-ingest`
+> binary lands **exactly 3 rows, not 6** (`crates/datarail-cli/tests/kafka_eos_live.rs`); the wire path
+> (InitProducerId grant + identical coord on retry) is proven over a real socket
+> (`crates/datarail-kafka/tests/eos_wire.rs`); `commit_at_seq` idempotency + dead-letter-gap is proven in
+> `postgres_live.rs`. **Honest limit:** exactly-once is *within an idempotent producer session* (same
+> `producer_id`) — Kafka's own idempotence guarantee. Cross-session EOS (a stable `transactional.id`) is a
+> further increment.
+>
+> **Adversarial audit + fixes (2026-06-27, see `CORE-AUDIT.md` §Kafka-EOS):** a brutal audit caught a CRITICAL
+> **ack-before-durable** hole (the broker acked the producer the instant it enqueued, before the sink landed the
+> record → a crash lost acked records, and an idempotent producer never resends an acked batch — the same D-1
+> lesson regressed). FIXED: **ack-after-durable** — the serve loop waits for the integration layer's
+> durable-landing result before acking; a sink failure becomes a **retriable error code** (KAFKA_STORAGE_ERROR),
+> never a false NONE ack, and the daemon **keeps serving** (one failure must not tear down ingest). The fix
+> required two follow-ons, both done: (a) **per-batch snapshot** of fresh records (not a global cursor) so a
+> failed batch never mis-attributes its records to a later batch now that the loop continues on error; (b) a
+> **unique in-process record_key per received batch** so the offload once-gate never short-circuits a retry — the
+> sink's durable watermark is the SOLE EOS authority (a retry re-delivers and is idempotently no-op'd at the sink;
+> a prior commit failure re-commits). Also: **`producer_epoch` folded into the substream id** (audit D) so an
+> epoch bump (sequence resets to 0) forms a fresh substream instead of being wrongly no-op'd (loss). Proven by
+> the extended `kafka_eos_live.rs` (sink failure → retriable error + daemon survives + recovers).
+>
+> **Known limitation (honest):** the offload terminal's in-memory sink + once-gate **retain all records for the
+> daemon's lifetime** (pre-existing across all kafka-ingest, worsened by re-delivered retries) → a long-running
+> ingest grows in memory. A streaming/draining terminal sink is a tracked separate arc; today's proof is correct,
+> production-longevity needs that arc.
+
+
 > The audit (F1/F2) correctly demoted `kafka-ingest` to at-least-once: it funnelled all partitions into one
 > `route_id` stream whose cross-restart interleave is not a stable position. This is the honest fix — genuine
 > exactly-once for an **idempotent Kafka producer**, keyed on the producer's own stable per-record identity.

@@ -24,11 +24,12 @@ three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS)
 harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
 `Noise_KK` + SPAKE2 identity layer, the **v1 product flow — an HTTP API → sealed rail → Postgres**
 (zero-dependency, hand-rolled Postgres driver), **Kafka wire-protocol ingest** (an unmodified Kafka producer →
-sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes for an
-append-ordered source** (`datarail run --source-file`/replay → `--sink-postgres` lands records + the dedup
-watermark in one atomic Postgres txn; a replayed or appended run never double-lands; HTTP and Kafka-ingest are
-honestly at-least-once — a GET / merged-partition stream is not a stable position; `EXACTLY-ONCE-DESIGN.md`), and
-the `datarail` CLI moving real data source→sink.
+sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes** — for an
+append-ordered source (`datarail run --source-file`/replay → `--sink-postgres`, `EXACTLY-ONCE-DESIGN.md`) AND for
+an **idempotent Kafka producer** (kafka-ingest keys dedup on the producer's own `(producer_id, partition,
+sequence)`, `KAFKA-EOS-DESIGN.md`); both land records + the dedup watermark in one atomic Postgres txn so a retry
+/ replay never double-lands. HTTP (a non-stable GET) and a non-idempotent producer are honestly at-least-once.
+And the `datarail` CLI moving real data source→sink.
 
 **Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
 **~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**
@@ -70,6 +71,9 @@ datarail run examples/rail.toml --source-file events.ndjson \
 datarail kafka-ingest examples/rail.toml --advertised <reachable-host> \
     --sink-postgres "host=db,user=rail,db=events,table=raw,column=data"
 # an UNMODIFIED Kafka producer (kcat/librdkafka/...) → datarail seals → Postgres. Verified e2e in CI.
+# EXACTLY-ONCE for an IDEMPOTENT producer (enable.idempotence=true): datarail honors InitProducerId and keys
+# dedup on the producer's own (producer_id, partition, sequence), stored transactionally in Postgres — a
+# producer retry / ingest restart never double-lands. A non-idempotent producer is at-least-once (Kafka parity).
 ```
 
 Lower-level rehearsals (files, two-process TCP, identity pairing):

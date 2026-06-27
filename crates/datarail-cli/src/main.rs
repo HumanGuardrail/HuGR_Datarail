@@ -674,9 +674,10 @@ fn select_sink(
     Ok(AnySink::Plain(Box::new(VecSink::new())))
 }
 
-/// What [`Pipeline::deliver_batch`] returns: the offload disposition plus the records this batch freshly landed
-/// in the terminal sink (the slice the caller then commits to the external sink).
-type Delivered = (Disposition, Vec<Vec<u8>>);
+/// What [`Pipeline::deliver_batch`] returns: the offload disposition, the records this batch freshly landed in
+/// the terminal sink (the per-batch slice the caller commits to the external sink), and the cumulative count of
+/// records landed for this route so far (the landed-count watermark for the file/replay Tier-A path).
+type Delivered = (Disposition, Vec<Vec<u8>>, usize);
 
 /// The outcome of shipping one batch through the [`Pipeline`]: the disposition the offload terminal returned
 /// and how many *fresh* records that batch committed to the external sink (0 for a `Duplicate`/`DeadLettered`).
@@ -694,8 +695,6 @@ struct Pipeline {
     src_term: SourceTerminal,
     dst_term: DestTerminal,
     rail: AnyRail,
-    /// Count of records already mirrored from the terminal sink to the external sink (commit cursor).
-    committed_to_sink: usize,
     /// Total records handed to `board` (the rail's view; duplicates still board, they dedup at offload).
     boarded: usize,
     /// The wire-hex of the most recently boarded cofre (for the human report).
@@ -724,7 +723,6 @@ impl Pipeline {
             src_term,
             dst_term,
             rail,
-            committed_to_sink: 0,
             boarded: 0,
             last_cofre_hex: String::new(),
             stream: spec.route.route_id.to_vec(),
@@ -743,17 +741,16 @@ impl Pipeline {
         record_key: &[u8],
         sink: &mut AnySink,
     ) -> Result<Option<BatchOutcome>, CliError> {
-        let Some((disposition, fresh)) = self.deliver_batch(batch, record_key)? else {
+        let Some((disposition, fresh, landed_total)) = self.deliver_batch(batch, record_key)? else {
             return Ok(None);
         };
-        // Tier-A (file/replay) landed-count model: the watermark is `total` — the cumulative count of records
-        // landed for this stream through the end of this batch. On a replay the same prefix re-presents under the
-        // same cumulative watermark, so `commit_at` lands only what is genuinely new (end-to-end exactly-once).
+        // Tier-A (file/replay) landed-count model: the watermark is `landed_total` — the cumulative count of
+        // records landed for this stream through the end of this batch. On a replay the same prefix re-presents
+        // under the same cumulative watermark, so `commit_at` lands only what is genuinely new (exactly-once).
         let fresh_committed = fresh.len();
         if !fresh.is_empty() {
-            let watermark = u64::try_from(self.committed_to_sink + fresh.len()).unwrap_or(u64::MAX);
+            let watermark = u64::try_from(landed_total).unwrap_or(u64::MAX);
             sink.commit(&fresh, &self.stream, watermark).map_err(|e| CliError::Rail(e.to_string()))?;
-            self.committed_to_sink += fresh.len();
         }
         Ok(Some(BatchOutcome { disposition, fresh_committed }))
     }
@@ -771,14 +768,13 @@ impl Pipeline {
         stream: &[u8],
         high: u64,
     ) -> Result<Option<BatchOutcome>, CliError> {
-        let Some((disposition, fresh)) = self.deliver_batch(batch, record_key)? else {
+        let Some((disposition, fresh, _landed_total)) = self.deliver_batch(batch, record_key)? else {
             return Ok(None);
         };
         let fresh_committed = fresh.len();
         // Always advance the watermark for a processed range, even with 0 fresh records (all dead-lettered) — a
         // replay must then no-op. `commit_seq` itself no-ops when `high <= stored`, so a retry is safe.
         sink.commit_seq(&fresh, stream, high).map_err(|e| CliError::Rail(e.to_string()))?;
-        self.committed_to_sink += fresh.len();
         Ok(Some(BatchOutcome { disposition, fresh_committed }))
     }
 
@@ -790,13 +786,12 @@ impl Pipeline {
         record_key: &[u8],
         sink: &mut AnySink,
     ) -> Result<Option<BatchOutcome>, CliError> {
-        let Some((disposition, fresh)) = self.deliver_batch(batch, record_key)? else {
+        let Some((disposition, fresh, _landed_total)) = self.deliver_batch(batch, record_key)? else {
             return Ok(None);
         };
         let fresh_committed = fresh.len();
         if !fresh.is_empty() {
             sink.commit_plain(&fresh).map_err(|e| CliError::Rail(e.to_string()))?;
-            self.committed_to_sink += fresh.len();
         }
         Ok(Some(BatchOutcome { disposition, fresh_committed }))
     }
@@ -824,6 +819,11 @@ impl Pipeline {
         self.boarded += refs.len();
         self.last_cofre_hex = to_hex(&datarail_cofre::encode(&cofre));
 
+        // Snapshot the terminal-sink length BEFORE offload; only a `Delivered` offload grows it. The fresh records
+        // are EXACTLY this batch's new slice `[before, after)` — a per-batch snapshot, NOT a global cursor. This
+        // keeps each batch's commit self-contained, so a commit failure on one batch (the ingest loop continues,
+        // audit E) never mis-attributes its records to a later batch of another substream (audit follow-up).
+        let before = self.dst_term.sink().committed().len();
         self.rail.send(&cofre)?;
         let mut received = None;
         for _ in 0..1_000_000 {
@@ -836,14 +836,9 @@ impl Pipeline {
         let disposition = self.dst_term.offload(&received).map_err(CliError::Terminal)?;
         self.rail.ack(received.etiqueta.cofre_id)?;
 
-        // Only Delivered grows the terminal sink; the fresh records are those past the commit cursor.
-        let total = self.dst_term.sink().committed().len();
-        let fresh: Vec<Vec<u8>> = if total > self.committed_to_sink {
-            self.dst_term.sink().committed()[self.committed_to_sink..].to_vec()
-        } else {
-            Vec::new()
-        };
-        Ok(Some((disposition, fresh)))
+        let after = self.dst_term.sink().committed().len();
+        let fresh: Vec<Vec<u8>> = self.dst_term.sink().committed().get(before..after).unwrap_or(&[]).to_vec();
+        Ok(Some((disposition, fresh, after)))
     }
 
     /// The human-readable end-of-run report (substrate, totals, last cofre).
@@ -919,38 +914,47 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     let mut pipe = Pipeline::from_spec(&spec)?;
     let route_id = spec.route.route_id;
     let mut batch_no = 0u64;
-    // Drain produced batches until the endpoint closes. Each carries its (topic, partition) and, for an
-    // idempotent producer, the EOS coordinate (producer_id, base_sequence, count).
-    for (topic, partition, values, eos) in rx {
+    // Drain produced batches until the endpoint closes. Each carries a `done` channel: we report the DURABLE
+    // landing result so the serve loop acks only after the records are committed (ack-after-durable, audit A).
+    for batch in rx {
+        let datarail_kafka::serve::ProducedBatch { topic, partition, values, eos, done } = batch;
         if values.is_empty() {
+            let _ = done.send(Ok(()));
             continue;
         }
-        if let Some(c) = eos {
-            // Exactly-once substream: stream = route_id ++ topic ++ partition ++ producer_id; the watermark is
-            // the producer sequence after this batch. The record_key is stable across retries (same coord).
-            let stream = eos_stream_id(&route_id, &topic, partition, c.producer_id);
+        // Each received batch gets a UNIQUE in-process key (`batch_no`) so the offload once-gate never short-
+        // circuits a producer RETRY — the sink's durable watermark (`commit_at_seq`) is the SOLE EOS authority,
+        // so a retry re-delivers and is idempotently no-op'd at the sink (and a prior commit FAILURE re-commits).
+        let result: Result<(), CliError> = if let Some(c) = eos {
+            let stream = eos_stream_id(&route_id, &topic, partition, c.producer_id, c.producer_epoch);
             let high = u64::try_from(i64::from(c.base_sequence) + i64::from(c.count)).unwrap_or(u64::MAX);
-            let key = format!("kafka-{topic}-{partition}-pid{}-seq{}", c.producer_id, c.base_sequence);
-            pipe.ship_batch_seq(&values, key.as_bytes(), &mut sink, &stream, high)?;
+            let key = format!("kafka-eos-{batch_no}");
+            pipe.ship_batch_seq(&values, key.as_bytes(), &mut sink, &stream, high).map(|_| ())
         } else {
             // No stable idempotent identity → honest at-least-once (plain commit, even on a Txn sink).
             let key = format!("kafka-{topic}-{partition}-n{batch_no}");
-            pipe.ship_batch_plain(&values, key.as_bytes(), &mut sink)?;
-        }
+            pipe.ship_batch_plain(&values, key.as_bytes(), &mut sink).map(|_| ())
+        };
+        // Signal the result back: Ok ⇒ the broker acks NONE; Err ⇒ a retriable error code (producer retries).
+        // The daemon KEEPS SERVING on a sink error — one failure must not tear down ingest for all (audit E).
+        let _ = done.send(result.map_err(|e| e.to_string()));
         batch_no += 1;
     }
     Ok(pipe.report())
 }
 
-/// The exactly-once dedup stream id for a Kafka `(topic, partition)` from an idempotent `producer_id`:
-/// `route_id ++ topic ++ partition ++ producer_id`. Distinct substreams never collide in the sink's watermark
-/// table; the same substream is stable across producer retries and broker/daemon restarts.
-fn eos_stream_id(route_id: &[u8], topic: &str, partition: i32, producer_id: i64) -> Vec<u8> {
-    let mut s = Vec::with_capacity(route_id.len() + topic.len() + 12);
+/// The exactly-once dedup stream id for a Kafka `(topic, partition)` from an idempotent producer:
+/// `route_id ++ topic ++ partition ++ producer_id ++ producer_epoch`. Distinct substreams never collide in the
+/// sink's watermark table; the same substream is stable across producer retries and broker/daemon restarts. The
+/// **epoch is included** (audit D): on an epoch bump the producer's sequence resets to 0, so a new-epoch batch
+/// must form a fresh substream rather than be wrongly no-op'd against the old epoch's higher watermark (loss).
+fn eos_stream_id(route_id: &[u8], topic: &str, partition: i32, producer_id: i64, producer_epoch: i16) -> Vec<u8> {
+    let mut s = Vec::with_capacity(route_id.len() + topic.len() + 14);
     s.extend_from_slice(route_id);
     s.extend_from_slice(topic.as_bytes());
     s.extend_from_slice(&partition.to_be_bytes());
     s.extend_from_slice(&producer_id.to_be_bytes());
+    s.extend_from_slice(&producer_epoch.to_be_bytes());
     s
 }
 
@@ -1534,14 +1538,15 @@ mod tests {
     fn eos_stream_id_separates_distinct_substreams() {
         use super::eos_stream_id;
         let route = [1u8; 16];
-        let base = eos_stream_id(&route, "events", 0, 7);
-        // Different partition, producer, topic, or route ⇒ a different stream id (no watermark collision).
-        assert_ne!(base, eos_stream_id(&route, "events", 1, 7), "partition must matter");
-        assert_ne!(base, eos_stream_id(&route, "events", 0, 8), "producer_id must matter");
-        assert_ne!(base, eos_stream_id(&route, "orders", 0, 7), "topic must matter");
-        assert_ne!(base, eos_stream_id(&[2u8; 16], "events", 0, 7), "route_id must matter");
+        let base = eos_stream_id(&route, "events", 0, 7, 0);
+        // Different partition, producer, topic, route, or epoch ⇒ a different stream id (no watermark collision).
+        assert_ne!(base, eos_stream_id(&route, "events", 1, 7, 0), "partition must matter");
+        assert_ne!(base, eos_stream_id(&route, "events", 0, 8, 0), "producer_id must matter");
+        assert_ne!(base, eos_stream_id(&route, "orders", 0, 7, 0), "topic must matter");
+        assert_ne!(base, eos_stream_id(&[2u8; 16], "events", 0, 7, 0), "route_id must matter");
+        assert_ne!(base, eos_stream_id(&route, "events", 0, 7, 1), "producer_epoch must matter (audit D)");
         // Same coordinates ⇒ same id (stable across retries / restarts).
-        assert_eq!(base, eos_stream_id(&route, "events", 0, 7));
+        assert_eq!(base, eos_stream_id(&route, "events", 0, 7, 0));
     }
 
     #[test]

@@ -13,6 +13,9 @@ pub const API_PRODUCE: i16 = 0;
 pub const API_METADATA: i16 = 3;
 /// `ApiVersions` API key.
 pub const API_VERSIONS: i16 = 18;
+/// `InitProducerId` API key — a client enabling idempotence calls this first to obtain a `producer_id` before it
+/// can stamp `(producer_id, base_sequence)` on its record batches (the basis for exactly-once ingest).
+pub const API_INIT_PRODUCER_ID: i16 = 22;
 
 /// One advertised API range.
 struct ApiRange {
@@ -22,11 +25,27 @@ struct ApiRange {
 }
 
 /// What this broker supports. A client picks, for each API, a version in `[min, max]` it also supports.
-const SUPPORTED: [ApiRange; 3] = [
+/// `InitProducerId` is advertised at v0/v1 only (non-flexible) — enough for an idempotent (non-transactional)
+/// producer; transactional EOS (a stable `transactional.id`) is a further increment.
+const SUPPORTED: [ApiRange; 4] = [
     ApiRange { key: API_PRODUCE, min: 0, max: 7 },
     ApiRange { key: API_METADATA, min: 0, max: 1 },
     ApiRange { key: API_VERSIONS, min: 0, max: 3 },
+    ApiRange { key: API_INIT_PRODUCER_ID, min: 0, max: 1 },
 ];
+
+/// Build the full `InitProducerId` response (response header v0 + body v0) granting `producer_id` with epoch 0.
+/// The producer then stamps this `producer_id` (and an incrementing `base_sequence`) on its idempotent batches.
+#[must_use]
+pub fn init_producer_id_response(correlation_id: i32, producer_id: i64) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false); // v0/v1 InitProducerId response header is v0
+    w.int32(0); // throttle_time_ms
+    w.int16(0); // error_code = NONE
+    w.int64(producer_id);
+    w.int16(0); // producer_epoch (fresh)
+    w.into_bytes()
+}
 
 /// Build the full `ApiVersions` response (response header + body) for a request of `req_version`. The response
 /// header is always v0; the body is flexible (compact + tagged fields) when `req_version >= 3`.
