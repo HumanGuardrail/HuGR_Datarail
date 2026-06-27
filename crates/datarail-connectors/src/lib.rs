@@ -60,6 +60,20 @@ pub trait TxnSink {
     /// Propagates the underlying sink/transaction error (the transaction is rolled back).
     fn commit_at(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()>;
 
+    /// Like [`TxnSink::commit_at`], but for a source whose watermark is a **monotonic sequence position supplied
+    /// by the source** (e.g. a Kafka idempotent producer's `base_sequence + count`) rather than a cumulative
+    /// landed count. The batch occupies a contiguous sequence range ending at `watermark` and is treated as a
+    /// WHOLE, atomic unit: if `watermark <= the stored watermark`, do nothing (already processed — an
+    /// idempotent-producer retry or a post-crash replay); otherwise land `records` and set the stored watermark
+    /// to `watermark`, all-or-nothing. Unlike `commit_at` there is **no** partial-suffix landing: the source
+    /// guarantees whole-batch, in-order presentation, so the stored watermark is always a clean batch boundary
+    /// (see `KAFKA-EOS-DESIGN.md`). Dead-lettered records still advance the watermark (the sequence range is
+    /// processed) so a replay does not resurrect them.
+    ///
+    /// # Errors
+    /// Propagates the underlying sink/transaction error (the transaction is rolled back).
+    fn commit_at_seq(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()>;
+
     /// The sink's durable watermark for `stream` (`0` if none) — where to resume after a restart. No external
     /// dedup state is consulted: the sink IS the dedup store.
     ///

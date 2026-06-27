@@ -15,10 +15,12 @@ use crate::codec::{Reader, Writer};
 use crate::handlers::{
     api_versions_response, metadata_response, parse_metadata_topics, API_METADATA, API_PRODUCE, API_VERSIONS,
 };
-use crate::produce::{parse_produce, produce_response};
+use crate::produce::{parse_produce, produce_response, EosCoord};
 
-/// A produced batch handed to the integration layer: `(topic, partition, record values)`.
-pub type ProducedBatch = (String, i32, Vec<Vec<u8>>);
+/// A produced batch handed to the integration layer: `(topic, partition, record values, EOS coord)`. The
+/// `EosCoord` (when present) carries the idempotent producer's stable sequence range — the basis for exactly-once
+/// ingest (see `KAFKA-EOS-DESIGN.md`); `None` ⇒ the batch is not EOS-eligible (→ at-least-once).
+pub type ProducedBatch = (String, i32, Vec<Vec<u8>>, Option<EosCoord>);
 
 /// Max bytes in a single framed request — a hostile peer cannot make us allocate a giant buffer.
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -140,7 +142,7 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                 for t in &topics {
                     for p in &t.partitions {
                         if !p.values.is_empty() {
-                            let _ = shared.tx.send((t.name.clone(), p.partition, p.values.clone()));
+                            let _ = shared.tx.send((t.name.clone(), p.partition, p.values.clone(), p.eos));
                         }
                     }
                 }
