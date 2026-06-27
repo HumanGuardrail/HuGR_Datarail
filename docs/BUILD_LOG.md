@@ -753,6 +753,35 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   fix at root the moment a claim outruns its proof. No silent loss ever shipped past CI (the bug was caught by the
   auditor before the over-claim could mislead anyone, but the honest fix lands regardless).
 
+- 2026-06-27 — **THE KAFKA EOS MOAT — exactly-once Kafka ingest for an idempotent producer, BUILT + PROVEN LIVE.**
+  The honest upgrade of kafka-ingest from at-least-once (F2) to exactly-once. Design-first (`KAFKA-EOS-DESIGN.md`).
+  Key insight: our broker's offset is non-durable + retry-unstable, so it CANNOT be the dedup key — but Kafka's
+  **idempotent producer** stamps a stable `(producer_id, partition, base_sequence)` on every v2 RecordBatch,
+  identical on retry. Datarail keys exactly-once on THAT. Built: (1) `produce.rs` surfaces the `EosCoord` (single
+  idempotent v2 batch only); (2) broker serves **`InitProducerId`** (API 22) so a real idempotent producer can
+  connect + get a `producer_id`; (3) `TxnSink::commit_at_seq` — whole-batch idempotent (if `wm <= stored` no-op
+  else land + advance, atomic; dead-letters advance the wm so a replay never resurrects them); (4) per-batch CLI
+  routing: EOS coord present → `ship_batch_seq` (exactly-once, stream = route_id++topic++partition++producer_id),
+  absent → at-least-once. PROVEN at every layer: unit (coord surfaced/withheld); **wire** (`eos_wire.rs` — real
+  `serve` over TCP: InitProducerId grants a pid, an idempotent Produce + retry surface the IDENTICAL coord);
+  **sink** (`postgres_live.rs` — `commit_at_seq` idempotent retry + dead-letter gap → 4 rows); **FULL CHAIN**
+  (`kafka_eos_live.rs` — the real `datarail kafka-ingest` BINARY + InitProducerId + a duplicated idempotent Produce
+  → **exactly 3 rows in Postgres, not 6**, independently verified). CI gate extended (`kafka-ingest.yml`). Honest
+  scope: exactly-once *within an idempotent producer session* (Kafka's own guarantee); cross-session/transactional
+  EOS (stable `transactional.id`) tracked. Full workspace clippy(deny all+pedantic)+test green; forbid(unsafe);
+  no #[allow].
+  **AUDITED (5th brutal pass, same day) — found + FIXED a CRITICAL**: the ingest broker acked the producer BEFORE
+  the sink landed the record (ack-before-durable — the D-1 lesson regressed: a crash loses acked records, and an
+  idempotent producer never resends an acked batch). FIXED with **ack-after-durable** (serve waits for the durable
+  land before acking; a sink failure → retriable error code, never a false ack; the daemon keeps serving — audit
+  A/E). Two follow-ons: a **per-batch snapshot** of fresh records replaced the global commit cursor (so a failed
+  batch can't mis-attribute to a later one now that the loop survives errors), and a **unique in-process
+  record_key per batch** makes the sink watermark the sole EOS authority (retries re-deliver + are idempotently
+  no-op'd; a prior failure re-commits). Also folded **`producer_epoch`** into the substream id (audit D — avoids
+  loss on an epoch bump). Proven by the extended `kafka_eos_live.rs` (sink failure → retriable error + daemon
+  survives + recovers). Known honest limitation: the terminal sink/once-gate retain in memory for the daemon's
+  life (tracked: a streaming terminal-sink arc). `CORE-AUDIT.md` §Kafka-EOS records all findings + dispositions.
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

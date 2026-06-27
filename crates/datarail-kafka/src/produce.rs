@@ -197,14 +197,15 @@ pub fn parse_produce(reader: &mut Reader, version: i16) -> io::Result<Vec<Produc
     Ok(topics)
 }
 
-/// Build the full `Produce` response (header v0 + body) at `version`. `base_offset_for` yields the base offset
-/// assigned to each `(topic, partition)` — the offset of that batch's first record.
+/// Build the full `Produce` response (header v0 + body) at `version`. `outcome_for` yields, per
+/// `(topic, partition)`, the `(base_offset, error_code)` — the offset of that batch's first record and the
+/// DURABLE landing result (`0` = NONE only once the records are committed; non-zero ⇒ retriable).
 #[must_use]
 pub fn produce_response(
     version: i16,
     correlation_id: i32,
     topics: &[ProducedTopic],
-    base_offset_for: &mut dyn FnMut(&str, i32, usize) -> i64,
+    outcome_for: &mut dyn FnMut(&str, i32, usize) -> (i64, i16),
 ) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false); // Produce response header is v0 for versions ≤ 8
@@ -216,9 +217,11 @@ pub fn produce_response(
         let pcount = i32::try_from(topic.partitions.len()).unwrap_or(0);
         w.int32(pcount);
         for part in &topic.partitions {
-            let base = base_offset_for(&topic.name, part.partition, part.values.len());
+            // `outcome_for` returns (base_offset, error_code) — the error_code reflects the DURABLE landing
+            // result (0 = NONE only after the records are durably committed; non-zero ⇒ retriable, audit A).
+            let (base, error_code) = outcome_for(&topic.name, part.partition, part.values.len());
             w.int32(part.partition);
-            w.int16(0); // error_code NONE
+            w.int16(error_code);
             w.int64(base); // base_offset
             if version >= 2 {
                 w.int64(-1); // log_append_time = -1 (CreateTime)

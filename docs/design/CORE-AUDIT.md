@@ -113,3 +113,28 @@ comes from source *ordering*, not dead-letter flapping); the `gap` (stored < bas
 
 Lesson reinforced: the hardening (locks, drains, arithmetic) was solid; the *guarantee's scope* was the defect.
 Attack the headline, not just the code.
+
+## Kafka-EOS audit (2026-06-27) — brutal adversarial pass on the exactly-once ingest path
+
+A fifth brutal auditor attacked the Kafka EOS path (`InitProducerId`, `EosCoord`, `commit_at_seq`, the per-batch
+CLI routing). It audited a stale commit (worktrees branch from committed state, so it saw `cbe829b` = increment 1,
+before `InitProducerId` was added — its finding [B] "InitProducerId missing" was thus STALE). The lead
+cold-verified each finding against the real tree.
+
+| # | finding | sev | PROVEN? | disposition |
+|---|---|---|---|---|
+| A | **ack-before-durable**: the broker acked the producer (`error_code=NONE`) the instant it enqueued the batch on the in-memory channel, BEFORE the sink landed it. A crash between ack and land loses acked records; an idempotent producer never resends an acked batch → permanent loss. (The D-1 lesson regressed in the ingest path.) | **CRIT** | **YES** | **FIXED**: ack-after-durable — `serve` waits for the integration layer's landing result before acking (`ProducedBatch.done`); a sink failure → retriable error code (KAFKA_STORAGE_ERROR), never a false NONE. |
+| E | a single sink error tore down the whole ingest loop (`?`) while `serve` kept acking → amplifies A. | **HIGH** | **YES** | **FIXED**: the ingest loop reports the error back (retriable code) and KEEPS SERVING; proven by `kafka_eos_live.rs` (drop table → retriable error + daemon survives + recovers). |
+| (follow-on) | the [E] continue-on-error would let a failed batch's uncommitted records mis-attribute to a later batch via the GLOBAL `committed_to_sink` cursor (the auditor confirmed the cursor was safe ONLY because errors previously killed the loop). | HIGH | derived | **FIXED**: replaced the global cursor with a **per-batch snapshot** (`committed()[before..after]`) so each batch's commit is self-contained; + a **unique in-process record_key per batch** so the sink watermark is the sole EOS authority (retries re-deliver, prior failures re-commit). |
+| D | `eos_stream_id` dropped `producer_epoch` → an epoch bump (sequence resets to 0) could be no-op'd against the old epoch's higher watermark (loss). | LOW | SUSPECTED | **FIXED**: `producer_epoch` folded into the substream id; regression in `eos_stream_id_separates_distinct_substreams`. |
+| C | `commit_at_seq` whole-batch precondition (stored is a clean boundary) is enforced by nothing — a malformed producer resending a bigger batch with the same `base_sequence` could double-land the prefix; i32 sequence wrap at 2^31. | LOW | SUSPECTED | **ACCEPTED**: the idempotent-producer contract guarantees identical resends + in-order whole-batch delivery (like a forged `producer_id`, a non-conformant producer is outside the trust model); 2^31 records/session is not a practical concern. Documented. |
+| B | "InitProducerId not implemented" | — | STALE | Implemented (the auditor saw a pre-`InitProducerId` commit); proven by `eos_wire.rs` + `kafka_eos_live.rs`. |
+
+**Confirmed SOUND (auditor + lead, found nothing):** `count` vs null-value records (range width is `record_count`,
+correct); multi-batch/legacy → no `eos`; `high = base_sequence + count` no overflow (i64 math); the once-gate
+`record_key` uniqueness; `commit_at_seq` idempotent retry + replay-after-restart + dead-letter advance; the
+per-batch snapshot under interleaved substreams + partial dead-letter (traced, correct).
+
+**Known limitation (honest, tracked):** the offload terminal's in-memory sink + once-gate retain all records for the
+daemon's lifetime (pre-existing; worsened by re-delivered retries) → long-running ingest grows in memory; a
+streaming/draining terminal sink is a separate arc.

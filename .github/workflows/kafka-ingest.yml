@@ -49,3 +49,13 @@ jobs:
           echo "sealed rows landed from a real Kafka producer = $ROWS"
           [ "$ROWS" = "3" ] || { echo "::error::expected 3 rows, got $ROWS"; exit 1; }
           echo "## Kafka ingest ✅ — unmodified producer → sealed rail → Postgres (3 sealed rows)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: EXACTLY-ONCE Kafka ingest — an idempotent producer's retry lands once (full chain + wire)
+        run: |
+          # Wire path: serve grants a producer_id (InitProducerId) and surfaces the same EosCoord on a retry.
+          cargo test -p datarail-kafka --test eos_wire
+          # Full chain: the real `datarail kafka-ingest` binary + InitProducerId + a DUPLICATED idempotent Produce
+          # must land EXACTLY 3 rows in Postgres (the sink-resident watermark no-ops the retry), never 6.
+          DATARAIL_PG_HOST=localhost DATARAIL_PG_PORT=5432 DATARAIL_PG_USER=postgres DATARAIL_PG_DB=postgres \
+            cargo test -p datarail-cli --test kafka_eos_live -- --ignored --nocapture
+          echo "## Kafka EXACTLY-ONCE ✅ — idempotent producer retry lands once (3 rows, not 6) through the real binary" >> "$GITHUB_STEP_SUMMARY"

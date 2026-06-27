@@ -18,11 +18,12 @@ fn main() -> std::io::Result<()> {
     println!("datarail-kafka ingest on {listen} (advertised {advertised}:{port})");
     let (tx, rx) = mpsc::channel::<datarail_kafka::serve::ProducedBatch>();
     std::thread::spawn(move || {
-        for (topic, partition, values, eos) in rx {
-            let seq = eos.map_or_else(|| "-".to_owned(), |e| format!("pid={} seq={}", e.producer_id, e.base_sequence));
-            for v in &values {
-                println!("RECV topic={topic} partition={partition} [{seq}] value={}", String::from_utf8_lossy(v.as_slice()));
+        for b in rx {
+            let seq = b.eos.map_or_else(|| "-".to_owned(), |e| format!("pid={} seq={}", e.producer_id, e.base_sequence));
+            for v in &b.values {
+                println!("RECV topic={} partition={} [{seq}] value={}", b.topic, b.partition, String::from_utf8_lossy(v.as_slice()));
             }
+            let _ = b.done.send(Ok(())); // this demo "lands" by printing; ack so the producer is acked
         }
     });
     serve(&listener, advertised, port, tx)
