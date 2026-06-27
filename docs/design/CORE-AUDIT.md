@@ -92,3 +92,24 @@ drop, no path traversal, INV-OPAQUE-CARGO holds).
 This pass is the methodology working: the auditors proved the scary lenses *safe* (signatures, verify-before-
 decrypt, panic-safety) and found the real defects (a crypto clone-reuse + the durability/dedup gaps), which were
 fixed at root or honestly tracked — and two over-claims were corrected.
+
+## Tier-A wiring audit (2026-06-27) — brutal adversarial pass on `commit_at` + the `AnySink` product wiring
+
+Run right after Tier A was wired end-to-end (commit 5c79d5e), an isolated-worktree auditor was told to assume the
+exactly-once scheme is broken and prove it. Findings (each cold-verified by the lead before acting):
+
+| # | finding | sev | PROVEN? | disposition |
+|---|---|---|---|---|
+| F1 | The watermark is a cumulative **position** (landed-count) and `commit_at` lands `records[stored-base..]` **positionally**, never by record identity. Sound only for an append-ordered source; shipped on-by-default for HTTP (a GET can reorder / mid-stream-insert) and Kafka-ingest. PoC: run1 `[A,B]`, run2 `[A,C,B]` → DB `[A,B,B]` (C lost, B doubled). | **CRIT** | **YES** | **FIXED**: Tier A gated on BOTH opt-in AND an append-ordered source (`wants_tier_a`); HTTP & Kafka-ingest → at-least-once (Tier C, no loss). Over-claims corrected across README/LASTRO/EXACTLY-ONCE-DESIGN/BUILD_LOG. |
+| F2 | Kafka-ingest funnels all `(topic,partition)`s into one `route_id` watermark/lock; cross-restart interleave is not a stable position (root of F1-S2). | **HIGH** | **YES** | **FIXED (scoped)**: kafka-ingest forced to at-least-once. Genuine per-(topic,partition)-offset exactly-once tracked future work (needs the broker offset threaded through + dead-letter-gap handling). |
+| F3 | In-place edits/shrink within the already-landed prefix are silently masked (corollary of F1; out of the append-only contract). | LOW | SUSPECTED | **ACCEPTED** (documented append-only file contract — a log only grows; reordering a source file mid-stream is an operator contract violation, not a default path). |
+
+**Confirmed SOUND (auditor looked, found nothing):** `commit_at` error/rollback paths (no txn left open, no
+connection desync — every path drains to `'Z'`); the `pg_advisory_xact_lock` first-batch-race serialization (no
+TOCTOU); the integer math (`i64::try_from`, `base = watermark - len` cannot go negative, `already` clamped — no
+panic/overflow); the single-run multi-batch cursor (Duplicate/DeadLettered batches correctly skip the commit);
+deterministic per-process `board` seq (so `fresh` IS deterministic for a fixed-order source — the F1 non-determinism
+comes from source *ordering*, not dead-letter flapping); the `gap` (stored < base) case unreachable + clamped.
+
+Lesson reinforced: the hardening (locks, drains, arithmetic) was solid; the *guarantee's scope* was the defect.
+Attack the headline, not just the code.

@@ -89,9 +89,26 @@ cofre's monotonic seq as the watermark — delivering Tier A exactly-once. A non
 4. Wire Tier A into the offload/CLI path (feed the seq as the watermark); fall back to Tier C otherwise.
 5. **Adversarial audit** of the new transactional path (it is correctness-critical — audit it like the core).
 
-## ✅ Integration DONE — Tier A is wired into the product and PROVEN end-to-end (2026-06-26)
-Tier A is now the **default** for the Postgres sink in both product flows. `datarail run` / `kafka-ingest` with
-`--sink-postgres` deliver exactly-once into Postgres end-to-end; `--at-least-once` opts back into the plain COPY path.
+## ⚠️ Scope correction (audit F1/F2, 2026-06-27) — the watermark is POSITIONAL; Tier A needs an append-ordered source
+A brutal self-audit of the wiring caught a real over-claim. The watermark is a cumulative **position** (count of
+records landed), and `commit_at` lands `records[stored-base..]` **positionally** — it never compares record
+identity. That is sound only when the source re-presents records in a **stable, append-ordered** sequence on
+replay (record N is always the same record). It is NOT sound for:
+- **an arbitrary HTTP GET** — the endpoint may return rows reordered or with mid-stream insertions between runs;
+- **Kafka ingest as wired** — all `(topic,partition)`s funnel into one `route_id` stream whose cross-restart
+  interleave is not a stable position (F2).
+
+For those, a positional watermark could **skip a genuinely-new record (loss) or re-land one (dup)** — PROVEN by a
+PoC (run1 `[A,B]`, run2 `[A,C,B]` → DB `[A,B,B]`, C lost). **Resolution:** Tier A is gated on BOTH opt-in (default
+on) AND an **append-ordered source** (`wants_tier_a` in the CLI). File / replay / inline → Tier A exactly-once.
+**HTTP and Kafka-ingest → at-least-once (Tier C)** — no false guarantee, and Tier C never loses a record. Genuine
+per-partition-offset Kafka exactly-once (and append-only-feed HTTP exactly-once) are tracked future increments.
+The append-only file contract is the natural one (a log only grows); reordering a source file mid-stream between
+runs is an operator contract violation, not a default product path.
+
+## ✅ Integration DONE — Tier A wired into the product, PROVEN end-to-end for append-ordered sources (2026-06-26, scoped 06-27)
+Tier A is the **default** for the Postgres sink **when the source is append-ordered** (`datarail run --source-file`
+/ replay / inline). `datarail run --source-http` and `kafka-ingest` are at-least-once. `--at-least-once` opts out.
 
 **Wiring (as built):**
 - Sink selection returns a capability-typed `AnySink` — `Plain(Box<dyn Sink>)` (file/webhook/memory → `commit`,
@@ -108,9 +125,10 @@ overlap. `commit_at` now lands only the suffix past the stored watermark — `ba
 `records[(stored - base)..]`. Proven by the `a_grown_replay_batch_lands_only_the_new_suffix_not_the_overlap` live test.
 
 **MEASURED proof (against a real Postgres 16, independently verified at the DB level):**
-- `datarail run … --sink-postgres` run **twice** (identical replay, fresh process → empty in-memory dedup) → **4 rows,
-  not 8.** The two runs produced *different cofre_ids* yet the second landed zero new rows — the Postgres-resident
-  watermark (not in-memory state) enforces exactly-once across invocations.
+- `datarail run --source-file … --sink-postgres` run **twice** (identical replay, fresh process → empty in-memory
+  dedup) → **4 rows, not 8**; append one line + re-run → **4, not 7**. The runs produced *different cofre_ids* yet
+  the replays landed zero/only-new rows — the Postgres-resident watermark (not in-memory state) enforces
+  exactly-once across invocations. `--source-http` reports `at-least-once (Tier C)` (proven: guarantee line + 3 rows).
 - `--at-least-once` opt-out → **8 rows** (doubles, as labelled). Both paths behave exactly as their guarantee claims.
 - Live tests: batch + 3 replays → 4 rows / watermark 4; grown-source partial-overlap → 4 (overlap not re-landed);
   backend-error-does-not-desync → durable watermark survives. CI gate (`connectors-live.yml`) now asserts the

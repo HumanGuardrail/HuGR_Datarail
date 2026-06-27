@@ -60,9 +60,11 @@ USAGE:
       --sink-postgres CONN       land each delivered record as a row, via the zero-dep Postgres wire protocol.
                                  CONN = comma-separated key=value: host,user,db,table,column[,port][,password]
                                  e.g. host=db,user=rail,db=events,table=raw,column=data,port=5432,password=secret
-                                 EXACTLY-ONCE by default (Tier A): records + a dedup watermark land in ONE
-                                 atomic Postgres txn, so a crash or a replayed run never double-lands.
-      --at-least-once            opt OUT of Tier A: use the plain COPY path (at-least-once) for the Postgres sink.
+                                 EXACTLY-ONCE (Tier A) for an APPEND-ORDERED source (--source-file / replay /
+                                 inline): records + a dedup watermark land in ONE atomic Postgres txn, so a
+                                 crash or a replayed run never double-lands. --source-http and kafka-ingest are
+                                 AT-LEAST-ONCE (a GET/merged-partition stream is not a stable position).
+      --at-least-once            opt OUT of Tier A: force the plain COPY path (at-least-once) for the Postgres sink.
       --sink-webhook URL         POST each delivered batch to an HTTP endpoint (newline-delimited records).
       (precedence: --source-http > --source-file > inline/stdin ; --sink-postgres > --sink-webhook > --sink-file > in-memory)
     --watch        on `run`: print a live one-line speedometer per batch (no TUI; raw stdout).
@@ -282,6 +284,9 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
     }
 
     // Source connector: `--source-http` (one GET = one batch) > `--source-file` > inline > stdin > demo.
+    // An HTTP GET is NOT an append-ordered/replayable stream (it may return rows reordered or with mid-stream
+    // insertions between runs), so it does not qualify for Tier A exactly-once; file/replay/inline/stdin do.
+    let source_ordered = source_http.is_none();
     let mut source: Box<dyn Source> = if let Some(url) = source_http {
         Box::new(HttpSource::get(&url).map_err(|e| CliError::Io(e.to_string()))?)
     } else if let Some(path) = source_file {
@@ -294,9 +299,9 @@ fn cmd_run(rest: &[String]) -> Result<String, CliError> {
         Box::new(SliceSource::one(records))
     };
 
-    // Sink connector: `--sink-postgres` (Tier A exactly-once unless `--at-least-once`) > `--sink-webhook`
-    // (POST batches) > `--sink-file` > in-memory.
-    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once)?;
+    // Sink connector: `--sink-postgres` (Tier A exactly-once for an append-ordered source unless
+    // `--at-least-once`) > `--sink-webhook` (POST batches) > `--sink-file` > in-memory.
+    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once, source_ordered)?;
 
     run_pipe(&spec, source.as_mut(), &mut sink, watch)
 }
@@ -600,22 +605,37 @@ impl AnySink {
     }
 }
 
+/// Whether the Postgres sink should use **Tier A exactly-once** (`commit_at`) rather than the plain `COPY`
+/// (Tier C, at-least-once). Tier A's watermark is a cumulative **position** (count of landed records), so it is
+/// only sound when the source re-presents records in a **stable, append-ordered** sequence on replay — record N
+/// is always the same record. That holds for a file / replay / inline source (append-only or identical replay).
+/// It does NOT hold for an arbitrary HTTP endpoint (a GET may return rows reordered or with mid-stream
+/// insertions) or for Kafka ingest as wired today (all partitions funnel into one `route_id` stream whose
+/// cross-restart interleave is not stable) — for those a positional watermark could skip a genuinely-new record
+/// or re-land one (audit F1/F2, 2026-06-27). So Tier A requires BOTH an opt-in (default-on) AND an ordered
+/// source; everything else falls back to honest at-least-once (Tier C never loses a record).
+fn wants_tier_a(at_least_once: bool, source_ordered: bool) -> bool {
+    !at_least_once && source_ordered
+}
+
 /// Build the delivery sink for a product flow, choosing the strongest guarantee the requested backend supports
-/// (shared by `run` and `kafka-ingest`). Precedence: `--sink-postgres` > `--sink-webhook` > `--sink-file` >
-/// in-memory. A Postgres sink is **Tier A exactly-once by default** (strictly better, zero external dedup
-/// state); `--at-least-once` opts back into the plain `COPY` path for callers that explicitly want it.
+/// AND the source can soundly back (shared by `run` and `kafka-ingest`). Precedence: `--sink-postgres` >
+/// `--sink-webhook` > `--sink-file` > in-memory. A Postgres sink with an **append-ordered source** is **Tier A
+/// exactly-once by default**; `--at-least-once`, or a non-ordered source (HTTP / Kafka ingest), uses the plain
+/// `COPY` path (at-least-once — no silent loss). See [`wants_tier_a`].
 fn select_sink(
     sink_pg: Option<String>,
     sink_webhook: Option<String>,
     sink_file: Option<String>,
     at_least_once: bool,
+    source_ordered: bool,
 ) -> Result<AnySink, CliError> {
     if let Some(conn) = sink_pg {
         let pg = PostgresSink::connect(parse_pg_conn(&conn)?).map_err(|e| CliError::Io(e.to_string()))?;
-        return Ok(if at_least_once {
-            AnySink::Plain(Box::new(pg))
-        } else {
+        return Ok(if wants_tier_a(at_least_once, source_ordered) {
             AnySink::Txn(Box::new(pg))
+        } else {
+            AnySink::Plain(Box::new(pg))
         });
     }
     if let Some(url) = sink_webhook {
@@ -820,8 +840,12 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
         let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx);
     });
 
-    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once)?;
-    eprintln!("datarail kafka-ingest on {listen} (advertised {advertised}:{port}) -> sealed rail -> sink");
+    // Kafka ingest is NOT eligible for Tier A as wired today: all (topic, partition)s funnel into one route_id
+    // stream whose cross-restart interleave is not a stable position, so a positional watermark is unsound
+    // (audit F2). Force at-least-once (no silent loss). Genuine per-partition-offset exactly-once is tracked
+    // future work (it needs the broker's per-partition offset threaded through + dead-letter-gap handling).
+    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once, /* source_ordered */ false)?;
+    eprintln!("datarail kafka-ingest on {listen} (advertised {advertised}:{port}) -> sealed rail -> sink (at-least-once)");
     let mut source = KafkaChannelSource { rx };
     run_pipe(&spec, &mut source, &mut sink, false)
 }
@@ -1384,6 +1408,19 @@ mod tests {
         assert!(out.contains("guarantee   = at-least-once (Tier C)"), "{out}");
         // The records actually landed in the sink connector (end-to-end through board→rail→offload→commit).
         assert_eq!(sink.committed_view().unwrap(), &[b"evt:a".to_vec(), b"evt:b".to_vec()]);
+    }
+
+    #[test]
+    fn tier_a_requires_an_append_ordered_source_and_opt_in() {
+        use super::wants_tier_a;
+        // Tier A only when NOT --at-least-once AND the source is append-ordered (file/replay/inline).
+        assert!(wants_tier_a(false, true), "ordered source, default => Tier A exactly-once");
+        // A non-ordered source (HTTP / Kafka ingest) is NEVER Tier A — a positional watermark would be unsound
+        // (audit F1/F2): it must fall back to at-least-once (Tier C never loses a record).
+        assert!(!wants_tier_a(false, false), "non-ordered source => at-least-once even by default");
+        // --at-least-once always forces Tier C, even for an ordered source.
+        assert!(!wants_tier_a(true, true), "--at-least-once opts out");
+        assert!(!wants_tier_a(true, false));
     }
 
     #[test]

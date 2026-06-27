@@ -55,25 +55,45 @@ jobs:
           [ "$GROW" = "4" ] || { echo "::error::partial-overlap broken: expected 4 grown rows, got $GROW"; exit 1; }
           echo "## Exactly-once into Postgres ✅ — batch + 3 replays → 4 rows, watermark 4; grown-source partial-overlap → 4 (no double-land)" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: End-to-end — datarail run --source-http → sealed rail → --sink-postgres (exactly-once across a replay)
+      - name: End-to-end — datarail run --source-file (append-ordered) → sealed rail → --sink-postgres (exactly-once across a replay)
         run: |
           psql -h localhost -U postgres -c "CREATE TABLE datarail_e2e (data text);"
           cargo build -p datarail-cli --release
           printf 'evt:order-1\nevt:order-2\nevt:order-3\n' > events.ndjson
-          python3 -m http.server 8799 >/dev/null 2>&1 &
-          HTTP_PID=$!
-          sleep 2
           CONN="host=localhost,port=5432,user=postgres,db=postgres,table=datarail_e2e,column=data"
-          # RUN 1: the v1 product flow lands 3 sealed rows.
-          ./target/release/datarail run examples/rail.toml --source-http http://127.0.0.1:8799/events.ndjson --sink-postgres "$CONN"
+          # Tier A exactly-once requires an APPEND-ORDERED source — a file (record N is always the same record on
+          # replay). RUN 1: the v1 product flow lands 3 sealed rows.
+          ./target/release/datarail run examples/rail.toml --source-file events.ndjson --sink-postgres "$CONN"
           ROWS=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_e2e;")
           echo "after run 1: rows=$ROWS"
           [ "$ROWS" = "3" ] || { echo "::error::expected 3 e2e rows after run 1, got $ROWS"; exit 1; }
           # RUN 2: an IDENTICAL replay (a fresh process — empty in-memory dedup). Tier A's Postgres-resident watermark
-          # must make this a no-op: still 3 rows, NOT 6. This is end-to-end exactly-once through the WHOLE product.
-          ./target/release/datarail run examples/rail.toml --source-http http://127.0.0.1:8799/events.ndjson --sink-postgres "$CONN"
-          kill "$HTTP_PID" 2>/dev/null || true
+          # must make this a no-op: still 3 rows, NOT 6. End-to-end exactly-once through the WHOLE product.
+          ./target/release/datarail run examples/rail.toml --source-file events.ndjson --sink-postgres "$CONN"
           ROWS2=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_e2e;")
           echo "after run 2 (replay): rows=$ROWS2"
           [ "$ROWS2" = "3" ] || { echo "::error::end-to-end exactly-once BROKEN: a replayed datarail run double-landed ($ROWS2 rows, expected 3)"; exit 1; }
-          echo "## v1 product flow ✅ — HTTP API → sealed rail → Postgres, EXACTLY-ONCE across a replayed run (3 rows after run+replay, not 6)" >> "$GITHUB_STEP_SUMMARY"
+          # GROWN source (append-only): a 4th record is appended; the replay must land ONLY the new row → 4, not 7.
+          printf 'evt:order-4\n' >> events.ndjson
+          ./target/release/datarail run examples/rail.toml --source-file events.ndjson --sink-postgres "$CONN"
+          ROWS3=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_e2e;")
+          echo "after run 3 (grown +1): rows=$ROWS3"
+          [ "$ROWS3" = "4" ] || { echo "::error::grown-source exactly-once BROKEN: expected 4 rows, got $ROWS3"; exit 1; }
+          echo "## v1 product flow ✅ — file API → sealed rail → Postgres, EXACTLY-ONCE across replay + append-grow (4 rows, not 7)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: End-to-end — datarail run --source-http → sealed rail → --sink-postgres (at-least-once, honest)
+        run: |
+          psql -h localhost -U postgres -c "CREATE TABLE datarail_http (data text);"
+          printf 'evt:h-1\nevt:h-2\nevt:h-3\n' > http_events.ndjson
+          python3 -m http.server 8799 >/dev/null 2>&1 &
+          HTTP_PID=$!
+          sleep 2
+          CONN="host=localhost,port=5432,user=postgres,db=postgres,table=datarail_http,column=data"
+          # An HTTP GET is not an append-ordered/replayable stream, so it is AT-LEAST-ONCE by default (Tier C) —
+          # NOT exactly-once. One run lands the 3 rows; the guarantee line in the report must say at-least-once.
+          OUT=$(./target/release/datarail run examples/rail.toml --source-http http://127.0.0.1:8799/http_events.ndjson --sink-postgres "$CONN")
+          kill "$HTTP_PID" 2>/dev/null || true
+          echo "$OUT" | grep -q "guarantee   = at-least-once" || { echo "::error::HTTP source must report at-least-once, got: $OUT"; exit 1; }
+          ROWS=$(psql -h localhost -U postgres -t -A -c "SELECT count(*) FROM datarail_http;")
+          [ "$ROWS" = "3" ] || { echo "::error::expected 3 HTTP rows, got $ROWS"; exit 1; }
+          echo "## HTTP source ✅ — honestly at-least-once (Tier C), 3 rows landed (exactly-once needs an append-ordered source)" >> "$GITHUB_STEP_SUMMARY"

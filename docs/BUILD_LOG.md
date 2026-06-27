@@ -734,6 +734,25 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   3 rows, not 6) + the grown-batch case. New live test `a_grown_replay_batch_lands_only_the_new_suffix_not_the_overlap`.
   Full workspace clippy(deny all+pedantic)+test green; forbid(unsafe); no #[allow]. (`EXACTLY-ONCE-DESIGN.md` §Integration DONE.)
 
+- 2026-06-27 — **HONESTY CORRECTION (brutal self-audit caught my own over-claim) — Tier A scoped to append-ordered
+  sources; F1/F2 fixed at root.** Right after wiring Tier A I launched a brutal adversarial auditor on the new
+  code (isolated worktree). It found — and I cold-verified (own trace + the doc's PoC) — that the watermark is a
+  cumulative **position** (landed-count) and `commit_at` lands records **positionally**, never by identity. That is
+  sound ONLY for an append-ordered/replayable source. I had shipped it on-by-default for **HTTP** (a GET can return
+  rows reordered / mid-stream-inserted) and **Kafka-ingest** (all partitions funnel into one `route_id` stream
+  whose cross-restart interleave is not stable, F2) — where a positional watermark can **silently lose a new
+  record and re-land an old one** (PROVEN: run1 `[A,B]`, run2 `[A,C,B]` → DB `[A,B,B]`, C lost). My prior log/README
+  entries over-claimed "exactly-once end-to-end on by default". **Fix:** Tier A is now gated on BOTH opt-in AND an
+  append-ordered source (`wants_tier_a`): file/replay/inline → Tier A exactly-once (proven); **HTTP & kafka-ingest
+  → at-least-once (Tier C)** — Tier C never loses a record. Corrected every over-claim (README, LASTRO-MATRIX,
+  EXACTLY-ONCE-DESIGN, this log) and the CI gate (the e2e exactly-once test now uses `--source-file` + asserts
+  append-grow → 4 not 7; a separate HTTP step asserts the guarantee line says at-least-once). Genuine
+  per-partition-offset Kafka exactly-once is tracked future work. PROVEN LIVE (Postgres 16): file ×2 → 3 rows,
+  append +1 → 4 (not 7); HTTP → at-least-once + 3 rows. New unit test `tier_a_requires_an_append_ordered_source`.
+  This is the LASTRO discipline working as intended: attack our own headline harder than the world will, concede +
+  fix at root the moment a claim outruns its proof. No silent loss ever shipped past CI (the bug was caught by the
+  auditor before the over-claim could mislead anyone, but the honest fix lands regardless).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
