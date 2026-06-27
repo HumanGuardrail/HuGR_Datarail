@@ -49,6 +49,9 @@ USAGE:
     datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]   (cross-process dest)
     datarail kafka-ingest <rail.toml> [--listen ADDR] [--advertised HOST] [--sink-postgres CONN|--sink-webhook URL|--sink-file F]
                      a Kafka wire-protocol endpoint: an UNMODIFIED Kafka producer sends -> datarail seals -> sink
+    datarail kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST]
+                     BIDIRECTIONAL Kafka drop-in: an UNMODIFIED producer writes AND an UNMODIFIED consumer reads
+                     back; datarail's storage holds only SEALED cofres (provider-blind), un-sealed at the fetch edge
     datarail send <rail.toml> --connect ADDR [--source-file F | record ...] (cross-process source)
 
     keygen --noise   mint a Noise_KK static keypair (X25519) for the encrypted hop.
@@ -100,6 +103,7 @@ fn dispatch(args: &[String]) -> Result<String, CliError> {
         "send" => cmd_send(rest),
         "recv" => cmd_recv(rest),
         "kafka-ingest" => cmd_kafka_ingest(rest),
+        "kafka-broker" => cmd_kafka_broker(rest),
         "help" | "-h" | "--help" => Ok(USAGE.to_owned()),
         other => Err(CliError::UnknownCommand(other.to_owned())),
     }
@@ -954,6 +958,131 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     Ok(pipe.report())
 }
 
+/// The in-memory **sealed** store behind `datarail kafka-broker` (the consume side, `KAFKA-FETCH-DESIGN.md`).
+/// Produce seals each record into a cofre and appends its wire bytes to a per-`(topic, partition)` log (logical
+/// offset = index); Fetch un-seals at the edge. The log holds only ciphertext → provider-blind. Everything is
+/// behind one `Mutex` so the type is `Send + Sync` for the connection-threaded `serve_broker`.
+struct KafkaBrokerStore {
+    inner: std::sync::Mutex<BrokerInner>,
+}
+
+struct BrokerInner {
+    src: SourceTerminal,
+    dst: DestTerminal,
+    /// Sealed cofre bytes per `(topic, partition)`; the vec index is the Kafka logical offset.
+    logs: std::collections::HashMap<(String, i32), Vec<Vec<u8>>>,
+    /// Monotonic counter for a unique per-record board key (the store appends; it does not dedup).
+    seq: u64,
+}
+
+impl KafkaBrokerStore {
+    fn from_spec(spec: &RailSpec) -> Self {
+        let cfg = spec.terminal_config();
+        let source_vk = verifying_key(&spec.keys.source_seed);
+        let src = SourceTerminal::new(cfg.clone(), spec.onboarding_contract(), spec.keys.source_seed);
+        let dst = DestTerminal::new(
+            cfg,
+            spec.offloading_contract(),
+            source_vk,
+            spec.keys.dest_seed,
+            spec.keys.dest_x25519_secret,
+        );
+        Self {
+            inner: std::sync::Mutex::new(BrokerInner { src, dst, logs: std::collections::HashMap::new(), seq: 0 }),
+        }
+    }
+}
+
+impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
+    fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = &mut *g;
+        let key = (topic.to_owned(), partition);
+        let base = i64::try_from(inner.logs.get(&key).map_or(0, Vec::len)).unwrap_or(i64::MAX);
+        for rec in records {
+            // A UNIQUE board key per record (the store appends; dedup is not its job) → distinct cofres/offsets.
+            let rkey = format!("kbroker-{partition}-{}", inner.seq);
+            inner.seq = inner.seq.wrapping_add(1);
+            let refs = [rec.as_slice()];
+            let cofre = inner
+                .src
+                .board(&refs, rkey.as_bytes())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            inner.logs.entry(key.clone()).or_default().push(datarail_cofre::encode(&cofre));
+        }
+        Ok(base)
+    }
+
+    fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {
+        let g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(log) = g.logs.get(&(topic.to_owned(), partition)) else {
+            return Ok(Vec::new());
+        };
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        let Some(slice) = log.get(start..) else {
+            return Ok(Vec::new()); // offset past the end → empty (consumer waits / retries)
+        };
+        let mut out = Vec::new();
+        let mut bytes = 0i64;
+        for sealed in slice {
+            // Un-seal at the edge: decode + open with the dest key. A record we wrote always opens; a corrupt
+            // entry is skipped defensively. (open is read-only → re-fetching the same offset is idempotent.)
+            if let Ok(cofre) = datarail_cofre::decode(sealed) {
+                if let Some(records) = g.dst.open(&cofre) {
+                    for r in records {
+                        bytes = bytes.saturating_add(i64::try_from(r.len()).unwrap_or(i64::MAX));
+                        out.push(r);
+                    }
+                }
+            }
+            // Bound by max_bytes, but always return at least one record (Kafka semantics).
+            if !out.is_empty() && bytes >= i64::from(max_bytes) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    fn bounds(&self, topic: &str, partition: i32) -> (i64, i64) {
+        let g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let len = g.logs.get(&(topic.to_owned(), partition)).map_or(0, Vec::len);
+        (0, i64::try_from(len).unwrap_or(i64::MAX))
+    }
+}
+
+/// `kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST]` — the BIDIRECTIONAL Kafka drop-in: an unmodified
+/// Kafka producer writes, an unmodified Kafka consumer reads back, and datarail's storage holds only sealed cofres
+/// (provider-blind; un-sealed only at the Fetch edge). Blocks as a daemon until killed. See `KAFKA-FETCH-DESIGN.md`.
+fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
+    let spec = load_spec(require(rest, 0, "rail.toml")?)?;
+    let mut listen = "0.0.0.0:9092".to_owned();
+    let mut advertised = "127.0.0.1".to_owned();
+    let mut i = 1;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--listen" => {
+                listen = require(rest, i + 1, "addr")?.to_string();
+                i += 2;
+            }
+            "--advertised" => {
+                advertised = require(rest, i + 1, "host")?.to_string();
+                i += 2;
+            }
+            other => return Err(CliError::Arg(format!("kafka-broker: unexpected arg `{other}`"))),
+        }
+    }
+    let port: i32 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(9092);
+    let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
+    let store = std::sync::Arc::new(KafkaBrokerStore::from_spec(&spec));
+    eprintln!(
+        "datarail kafka-broker on {listen} (advertised {advertised}:{port}) — produce sealed, store sealed, \
+         un-seal on fetch (provider-blind bidirectional Kafka)"
+    );
+    datarail_kafka::serve::serve_broker(&listener, &advertised, port, &store)
+        .map_err(|e| CliError::Io(e.to_string()))?;
+    Ok(String::new())
+}
+
 /// The exactly-once dedup stream id for a Kafka `(topic, partition)` from an idempotent producer:
 /// `route_id ++ topic ++ partition ++ producer_id ++ producer_epoch`. Distinct substreams never collide in the
 /// sink's watermark table; the same substream is stable across producer retries and broker/daemon restarts. The
@@ -1543,6 +1672,49 @@ mod tests {
         // --at-least-once always forces Tier C, even for an ordered source.
         assert!(!wants_tier_a(true, true), "--at-least-once opts out");
         assert!(!wants_tier_a(true, false));
+    }
+
+    #[test]
+    fn kafka_broker_store_seals_storage_and_unseals_on_fetch() {
+        use datarail_kafka::serve::KafkaBroker as _;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let store = super::KafkaBrokerStore::from_spec(&spec);
+        let recs = vec![b"evt:secret-a".to_vec(), b"evt:secret-b".to_vec()];
+
+        let base = store.produce("events", 0, &recs).unwrap();
+        assert_eq!(base, 0, "first produce lands at logical offset 0");
+
+        // Provider-blind: the STORED bytes are sealed cofres — they must NOT contain the plaintext payload.
+        {
+            let g = store.inner.lock().unwrap();
+            let log = g.logs.get(&("events".to_owned(), 0)).expect("topic log");
+            assert_eq!(log.len(), 2, "one sealed cofre per record");
+            for sealed in log {
+                assert!(
+                    !contains(sealed, b"secret-a") && !contains(sealed, b"secret-b"),
+                    "stored cofre must be sealed ciphertext, never plaintext (provider-blind)"
+                );
+            }
+        }
+
+        // Fetch un-seals at the edge → the original plaintext, in order.
+        assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), recs);
+        // Re-fetching the SAME offset is idempotent (no dedup) — a consumer may re-read.
+        assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), recs);
+        // A partial fetch from offset 1 returns the suffix.
+        assert_eq!(store.fetch("events", 0, 1, 1_000_000).unwrap(), vec![b"evt:secret-b".to_vec()]);
+        // Fetch past the end → empty (the consumer waits / retries), never a panic.
+        assert!(store.fetch("events", 0, 5, 1_000_000).unwrap().is_empty());
+        // ListOffsets bounds: earliest 0, latest = record count.
+        assert_eq!(store.bounds("events", 0), (0, 2));
+        // A second produce appends (logical offset continues).
+        assert_eq!(store.produce("events", 0, &[b"evt:secret-c".to_vec()]).unwrap(), 2);
+        assert_eq!(store.bounds("events", 0), (0, 3));
+    }
+
+    /// True if `haystack` contains `needle` as a contiguous subslice (test helper for the seal check).
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 
     #[test]

@@ -794,6 +794,23 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   1024, dropped 100, total preserved); live re-proof unchanged (file Tier A → 4 rows; Kafka EOS full chain → 3).
   Full workspace clippy(deny all+pedantic)+test green; forbid(unsafe); no #[allow].
 
+- 2026-06-27 — **KAFKA CONSUME — datarail is now a provider-blind BIDIRECTIONAL Kafka drop-in (owner-chosen arc).**
+  Owner picked "Kafka Fetch (consumer)". Design-first (`KAFKA-FETCH-DESIGN.md`), built + proven in increments:
+  (1) hand-rolled **CRC-32C** (Castagnoli, KAT `0xe3069283`) + `build_record_batch` — a v2 RecordBatch with a
+  CORRECT CRC so a real consumer accepts it (inverse of the parser, round-trip tested); (2) `consume.rs` — Fetch
+  (API 1, v0–4) + ListOffsets (API 2, v0–2) wire codec; (3) `serve_broker` + the `KafkaBroker` trait (a
+  request/response loop — ingest's one-way channel can't Fetch); (4) `DestTerminal::open` — extracted the
+  read-only verify+decrypt core out of `offload` (DRY; offload's dead-letter tests guard the refactor) so a
+  consumer can re-fetch an offset idempotently (no dedup); (5) the CLI `kafka-broker` mode with an in-memory
+  **sealed** store (produce seals → stores ciphertext; fetch un-seals at the edge). The moat: **a Kafka broker
+  whose storage never holds plaintext.** PROVEN: store unit test (storage is sealed ciphertext, fetch round-trips
+  the plaintext, idempotent re-fetch, bounds) + FULL wire test `kafka_broker_wire.rs` (the real `datarail
+  kafka-broker` binary: produce 3 → fetch back the plaintext, suffix fetch, ListOffsets → 3; no external deps so
+  it runs in normal CI). Honest scope (increment 1): in-memory store (durable `datarail-topic` backing tracked),
+  single partition, no consumer groups, produce hop plaintext (seal-on-ingest). Docs: KAFKA-FETCH-DESIGN,
+  KAFKA-COMPAT, README, LASTRO-MATRIX. forbid(unsafe); no #[allow]. (Next: increment 2 durability + adversarial
+  audit of the un-seal-on-fetch path — security-critical.)
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

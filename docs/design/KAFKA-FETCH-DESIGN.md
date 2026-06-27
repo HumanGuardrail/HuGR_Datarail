@@ -1,5 +1,17 @@
 # KAFKA-FETCH-DESIGN — provider-blind Kafka CONSUME (the bidirectional drop-in)
 
+> **STATUS: increment 1 BUILT + PROVEN (2026-06-27).** `datarail kafka-broker` serves Produce (seal+store) +
+> Fetch (un-seal at the edge) + ListOffsets over the real Kafka wire. Built: a hand-rolled `CRC-32C` +
+> `build_record_batch` (a real consumer accepts the batch), the `consume` codec (Fetch v0–4 / ListOffsets v0–2),
+> `serve_broker` + the `KafkaBroker` trait, `DestTerminal::open` (read-only verify+decrypt, no dedup so re-fetch
+> is idempotent), and the CLI sealed in-memory store. PROVEN: the store unit test (storage holds sealed
+> ciphertext — provider-blind — and un-seals on fetch; idempotent re-fetch; bounds) + the FULL wire test
+> (`kafka_broker_wire.rs`: the real binary, produce 3 → fetch back the plaintext, suffix fetch, ListOffsets → 3).
+> **Honest scope:** the store is **in-memory** (provider-blind but not durable across restart) — durable
+> `datarail-topic` backing is increment 2; single partition; no consumer groups; produce hop plaintext (seal-on-
+> ingest). Next: increment 2 (durability) + adversarial audit of the un-seal-on-fetch path.
+
+
 > Today `kafka-ingest` is one-way: a Kafka producer → datarail seals → an external sink. This adds the **consume**
 > side: a `datarail kafka-broker` that STORES the sealed records in an offset log and serves the Kafka `Fetch`
 > (API 1) + `ListOffsets` (API 2) APIs, so an **unmodified Kafka consumer** reads them back — **un-sealed only at

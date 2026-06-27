@@ -13,6 +13,8 @@ datarail presents itself as a **single-broker, single-partition-per-topic** Kafk
 | `ApiVersions` | 18 | v0–v3 | responds in the client's version (flexible body for v3; response header always v0 per KIP-482) |
 | `Metadata` | 3 | v0–v1 | advertises this process as broker `node 0` (`--advertised HOST:port`), the leader of every requested topic's single partition |
 | `Produce` | 0 | v0–v7 | parses the request envelope + the records blob (incl. the idempotent producer's `producer_id`/`base_sequence`) |
+| `Fetch` | 1 | v0–v4 | CONSUME side (`kafka-broker` mode): returns un-sealed records as a v2 `RecordBatch` with a correct `CRC-32C` (`KAFKA-FETCH-DESIGN.md`) |
+| `ListOffsets` | 2 | v0–v2 | earliest/latest logical offsets for a consumer (`kafka-broker` mode) |
 | `InitProducerId` | 22 | v0–v1 | grants a `producer_id` so a client can `enable.idempotence=true` → exactly-once ingest (`KAFKA-EOS-DESIGN.md`) |
 
 **Record formats:** both the modern **v2 `RecordBatch`** AND the legacy **v0/v1 `MessageSet`** are parsed
@@ -35,8 +37,11 @@ service container, asserting the sealed rows land; plus the EOS gate — a dupli
 the real binary lands exactly once (3 rows, not 6). Continuously gated, not a one-off (`LASTRO-MATRIX`).
 
 ## What is NOT implemented (honest limits — do not claim these)
-- **No consumer side (`Fetch`, `ListOffsets`, group coordination).** This is **produce-ingest only** — a one-way
-  bridge INTO datarail. Reading back via the Kafka protocol is the next arc.
+- **Consumer side EXISTS now** (`kafka-broker` mode: `Fetch`, `ListOffsets`) — an unmodified consumer reads back,
+  un-sealed at the edge, from a provider-blind (sealed) store. **Honest limits of increment 1:** the store is
+  **in-memory** (not durable across restart — durable `datarail-topic` backing is the next increment); **single
+  partition** per topic; **no consumer-group coordination** (`OffsetCommit`/`OffsetFetch`/group join) — the
+  consumer tracks its own offset (`auto.offset.reset`/seek).
 - **No compression** (gzip/snappy/lz4/zstd). A compressed batch is rejected with a clear error. Producers must
   send uncompressed (`compression.type=none`) for now.
 - **No TRANSACTIONAL producer** (the `AddPartitionsToTxn` / `EndTxn` / transaction-coordinator APIs, a stable
@@ -65,8 +70,9 @@ infrastructure never see plaintext. With Kafka ingest, the trust boundary is:
   until hop (1) gets TLS.**
 
 ## Roadmap (next arcs, in rough value order)
-1. **`Fetch` consumer side** → datarail becomes a full Kafka drop-in (produce AND consume), un-sealing on read for
-   authorized consumers.
+1. ✅ **`Fetch` consumer side — DONE** (2026-06-27, `kafka-broker` mode, `KAFKA-FETCH-DESIGN.md`): datarail is a
+   bidirectional Kafka drop-in (produce AND consume), un-sealing on read. Next within this line: **durable store**
+   (datarail-topic backing) + **consumer groups** + **multi-partition**.
 2. **TLS on the Kafka hop** → closes hop (1), making Kafka ingest end-to-end sealed.
 3. **Compression** (at least the common codecs) for throughput parity.
 4. ✅ **Idempotent producer (`InitProducerId`) → exactly-once from idempotent producers — DONE** (2026-06-27,
