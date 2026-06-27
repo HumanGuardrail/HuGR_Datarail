@@ -24,10 +24,11 @@ three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS)
 harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
 `Noise_KK` + SPAKE2 identity layer, the **v1 product flow — an HTTP API → sealed rail → Postgres**
 (zero-dependency, hand-rolled Postgres driver), **Kafka wire-protocol ingest** (an unmodified Kafka producer →
-sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes — end-to-end and
-on by default** (`datarail run`/`kafka-ingest --sink-postgres` land records + the dedup watermark in one atomic
-Postgres txn; a replayed run never double-lands — `--at-least-once` opts out; `EXACTLY-ONCE-DESIGN.md`), and the
-`datarail` CLI moving real data source→sink.
+sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes for an
+append-ordered source** (`datarail run --source-file`/replay → `--sink-postgres` lands records + the dedup
+watermark in one atomic Postgres txn; a replayed or appended run never double-lands; HTTP and Kafka-ingest are
+honestly at-least-once — a GET / merged-partition stream is not a stable position; `EXACTLY-ONCE-DESIGN.md`), and
+the `datarail` CLI moving real data source→sink.
 
 **Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
 **~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**
@@ -50,13 +51,17 @@ dumbest, cheapest substrate available. Because every vault is sealed end-to-end,
 is hand-rolled and provider-blind — the pipe and the database host never see plaintext):
 
 ```sh
-# seal newline-delimited records from any HTTP endpoint into a Postgres table:
+# seal newline-delimited records from any HTTP endpoint into a Postgres table (at-least-once):
 datarail run examples/rail.toml \
     --source-http https://api.example.com/events \
     --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
-# boarded → sealed cofre over the rail → COPY-landed as rows. EXACTLY-ONCE by default: re-run the same command
-# and nothing double-lands (records + a dedup watermark commit in one atomic Postgres txn). Verified end-to-end
-# against real Postgres 16 — run twice → 4 rows, not 8. (--at-least-once opts back into the plain COPY path.)
+# boarded → sealed cofre over the rail → COPY-landed as rows. An HTTP GET is not an append-ordered/replayable
+# stream, so this path is AT-LEAST-ONCE (no silent loss; a re-run may duplicate). For EXACTLY-ONCE, use an
+# append-ordered source (a file / replay), which lands records + a dedup watermark in one atomic Postgres txn:
+datarail run examples/rail.toml --source-file events.ndjson \
+    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
+# Re-run it (even after appending new lines) → nothing double-lands. Verified end-to-end against real Postgres 16:
+# run twice → 3 rows; append one line + re-run → 4 rows, not 7. (--at-least-once opts out.)
 ```
 
 **Drop-in for Kafka producers** — point an existing producer at datarail, unchanged; it seals every record:
