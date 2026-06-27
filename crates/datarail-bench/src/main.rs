@@ -100,7 +100,10 @@ fn main() {
     lat("x25519 seal_key (source)", 20_000, || {
         black_box(seal_key(black_box(&dest_pk), &[3u8; 32]));
     });
-    let (eph, _k) = seal_key(&dest_pk, &[3u8; 32]);
+    let Some((eph, _k)) = seal_key(&dest_pk, &[3u8; 32]) else {
+        eprintln!("bench: seal_key returned None for a valid key — skipping key-wrap bench");
+        return;
+    };
     lat("x25519 open_key (dest)", 20_000, || {
         black_box(open_key(black_box(&dest_secret), black_box(&eph)));
     });

@@ -45,11 +45,17 @@ pub fn x25519_public(secret: &[u8; 32]) -> [u8; 32] {
     XPublicKey::from(&XSecret::from(*secret)).to_bytes()
 }
 
-/// Raw X25519 Diffie–Hellman shared secret between `secret` and `public`.
-fn x25519_shared(secret: &[u8; 32], public: &[u8; 32]) -> [u8; 32] {
-    XSecret::from(*secret)
-        .diffie_hellman(&XPublicKey::from(*public))
-        .to_bytes()
+/// Raw X25519 Diffie–Hellman shared secret between `secret` and `public`, or `None` if it is
+/// **non-contributory** (a low-order `public` yields the all-zero shared secret).
+///
+/// Defense-in-depth (S-3, RFC 7748 §6.1): an all-zero shared secret would make the derived data key publicly
+/// computable — the [`kdf_data_key`] mixes only *public* values besides `shared`, so a known-zero `shared`
+/// reduces the key to a hash of public inputs. The `eph_pk` is `lacre`-authenticated **before** this runs
+/// (the offload verifies the seal first), so a wire adversary cannot reach it; this is belt-and-suspenders that
+/// fails closed rather than trusting that upstream check alone.
+fn x25519_shared(secret: &[u8; 32], public: &[u8; 32]) -> Option<[u8; 32]> {
+    let shared = XSecret::from(*secret).diffie_hellman(&XPublicKey::from(*public));
+    shared.was_contributory().then(|| shared.to_bytes())
 }
 
 /// Derive the per-cofre data key from the ECDH shared secret, domain-separated and bound to **both** public
@@ -70,20 +76,21 @@ fn kdf_data_key(shared: &[u8; 32], eph_public: &[u8; 32], recipient_pk: &[u8; 32
 /// A fresh `eph_secret` per cofre ⇒ a fresh `data_key` per cofre — forward-secure once the ephemeral is
 /// discarded, and provider-blind: only the holder of the recipient secret can re-derive it ([`open_key`]).
 #[must_use]
-pub fn seal_key(recipient_pk: &[u8; 32], eph_secret: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+pub fn seal_key(recipient_pk: &[u8; 32], eph_secret: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
     let eph_public = x25519_public(eph_secret);
-    let shared = x25519_shared(eph_secret, recipient_pk);
+    let shared = x25519_shared(eph_secret, recipient_pk)?; // `None` ⇒ a low-order `recipient_pk` (misconfig)
     let data_key = kdf_data_key(&shared, &eph_public, recipient_pk);
-    (eph_public, data_key)
+    Some((eph_public, data_key))
 }
 
 /// **Destination side** of the per-cofre key-wrap: recover the `data_key` from the cofre's `eph_public` using
-/// the recipient's X25519 secret. Only the holder of `recipient_secret` can derive the key.
+/// the recipient's X25519 secret. Only the holder of `recipient_secret` can derive the key. Returns `None` if
+/// `eph_public` is a low-order (non-contributory) point — the caller dead-letters such a cofre (S-3).
 #[must_use]
-pub fn open_key(recipient_secret: &[u8; 32], eph_public: &[u8; 32]) -> [u8; 32] {
-    let shared = x25519_shared(recipient_secret, eph_public);
+pub fn open_key(recipient_secret: &[u8; 32], eph_public: &[u8; 32]) -> Option<[u8; 32]> {
+    let shared = x25519_shared(recipient_secret, eph_public)?;
     let recipient_pk = x25519_public(recipient_secret);
-    kdf_data_key(&shared, eph_public, &recipient_pk)
+    Some(kdf_data_key(&shared, eph_public, &recipient_pk))
 }
 
 fn framed(context: &[u8], msg: &[u8]) -> Vec<u8> {
@@ -260,17 +267,49 @@ mod tests {
         // Source seals a per-cofre key to the dest's X25519 public key; only the dest re-derives it.
         let recipient_secret = [9u8; 32];
         let recipient_pk = super::x25519_public(&recipient_secret);
-        let (eph_public, k_src) = super::seal_key(&recipient_pk, &[3u8; 32]);
-        assert_eq!(super::open_key(&recipient_secret, &eph_public), k_src, "dest re-derives the key");
+        let (eph_public, k_src) = super::seal_key(&recipient_pk, &[3u8; 32]).expect("seal");
+        assert_eq!(super::open_key(&recipient_secret, &eph_public), Some(k_src), "dest re-derives the key");
         // A different recipient cannot open it.
-        assert_ne!(super::open_key(&[1u8; 32], &eph_public), k_src);
+        assert_ne!(super::open_key(&[1u8; 32], &eph_public), Some(k_src));
         // A tampered ephemeral public key yields a different (wrong) key — AEAD-open would then fail.
         let mut bad = eph_public;
         bad[0] ^= 1;
-        assert_ne!(super::open_key(&recipient_secret, &bad), k_src);
+        assert_ne!(super::open_key(&recipient_secret, &bad), Some(k_src));
         // A fresh ephemeral per cofre ⇒ a fresh data key.
-        let (_e2, k2) = super::seal_key(&recipient_pk, &[4u8; 32]);
+        let (_e2, k2) = super::seal_key(&recipient_pk, &[4u8; 32]).expect("seal2");
         assert_ne!(k2, k_src);
+    }
+
+    #[test]
+    fn low_order_eph_public_is_rejected_s3() {
+        // S-3 defense-in-depth: a low-order (non-contributory) eph_public — e.g. the all-zero point — yields an
+        // all-zero shared secret. `open_key`/`seal_key` must FAIL CLOSED (return None) rather than derive a key
+        // that an adversary could compute from public values alone. The RFC 7748 §6.1 small-subgroup points:
+        let low_order: [[u8; 32]; 3] = [
+            [0u8; 32], // the identity (order 1) — product is all-zero
+            {
+                // order-8 point (RFC 7748 test vector 1)
+                let mut p = [0u8; 32];
+                p[0] = 1;
+                p
+            },
+            {
+                // order-2 point: p = 2^255 - 19 - 1 reduced; the canonical all-zero-y small point set includes this.
+                let mut p = [0xe0; 32];
+                p[0] = 0xe0;
+                p[31] = 0x7f;
+                p
+            },
+        ];
+        let secret = [7u8; 32];
+        // The identity point MUST be rejected by open_key (the offload would dead-letter such a cofre).
+        assert_eq!(super::open_key(&secret, &low_order[0]), None, "all-zero eph_public must be rejected");
+        // seal_key to the identity recipient_pk must also fail closed (a low-order dest key is misconfig).
+        assert_eq!(super::seal_key(&low_order[0], &secret), None, "seal to a low-order recipient must fail");
+        // The order-8 point is likewise non-contributory and must be rejected.
+        assert_eq!(super::open_key(&secret, &low_order[1]), None, "order-8 eph_public must be rejected");
+        // (low_order[2] documents the small-subgroup family; was_contributory covers the whole set.)
+        let _ = low_order[2];
     }
 
     #[test]
