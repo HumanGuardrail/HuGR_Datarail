@@ -179,6 +179,28 @@ impl PostgresSink {
         query_simple(&mut self.stream, &upsert)?;
         Ok(())
     }
+
+    /// The transaction body for `commit_at_seq` (the Kafka-EOS sequence model): treat the batch as a WHOLE unit.
+    /// If the stored watermark is at or beyond `watermark`, the batch already landed (a retry / replay) → no-op;
+    /// otherwise land ALL `records` and set the watermark to `watermark`. No partial-suffix landing — the source
+    /// guarantees whole-batch, in-order presentation, so the stored watermark is always a clean batch boundary
+    /// (`KAFKA-EOS-DESIGN.md`).
+    fn txn_body_seq(&mut self, stream_hex: &str, lock_key: i64, watermark: i64, records: &[Vec<u8>]) -> io::Result<()> {
+        query_simple(&mut self.stream, &format!("SELECT pg_advisory_xact_lock({lock_key})"))?;
+        let current = read_watermark(&mut self.stream, stream_hex, true)?; // FOR UPDATE
+        if current.is_some_and(|c| c >= watermark) {
+            return Ok(()); // already processed (idempotent retry / replay) — clean no-op on COMMIT
+        }
+        if !records.is_empty() {
+            self.copy_in(records)?;
+        }
+        let upsert = format!(
+            "INSERT INTO datarail_watermark (stream, seq) VALUES ('\\x{stream_hex}', {watermark}) \
+             ON CONFLICT (stream) DO UPDATE SET seq = EXCLUDED.seq"
+        );
+        query_simple(&mut self.stream, &upsert)?;
+        Ok(())
+    }
 }
 
 /// Create the watermark table if absent (idempotent). The dedup watermark lives in the sink's own DB.
@@ -294,6 +316,27 @@ impl crate::TxnSink for PostgresSink {
             Ok(()) => query_simple(&mut self.stream, "COMMIT").map(|_| ()),
             Err(e) => {
                 let _ = query_simple(&mut self.stream, "ROLLBACK"); // best-effort; query_simple now drains to 'Z'
+                Err(e)
+            }
+        }
+    }
+
+    /// Kafka-EOS sequence model (see `KAFKA-EOS-DESIGN.md`): land `records` + advance the per-substream watermark
+    /// to `watermark` (the producer's `base_sequence + count`) in ONE transaction; a replayed/retried batch
+    /// (`watermark <= stored`) is a committed no-op. Whole-batch atomic — no partial-suffix landing.
+    fn commit_at_seq(&mut self, records: &[Vec<u8>], stream: &[u8], watermark: u64) -> io::Result<()> {
+        if records.iter().any(|r| r.contains(&0)) {
+            return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
+        }
+        let stream_hex = hex(stream);
+        let wm = i64::try_from(watermark).map_err(|_| invalid("watermark exceeds i64::MAX"))?;
+        let lock_key = lock_key_for(stream);
+        ensure_watermark_table(&mut self.stream)?;
+        query_simple(&mut self.stream, "BEGIN")?;
+        match self.txn_body_seq(&stream_hex, lock_key, wm, records) {
+            Ok(()) => query_simple(&mut self.stream, "COMMIT").map(|_| ()),
+            Err(e) => {
+                let _ = query_simple(&mut self.stream, "ROLLBACK"); // best-effort; query_simple drains to 'Z'
                 Err(e)
             }
         }

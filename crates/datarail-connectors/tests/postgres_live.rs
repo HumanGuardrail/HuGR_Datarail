@@ -60,6 +60,37 @@ fn exactly_once_a_replayed_batch_does_not_double_land() {
     // The harness asserts exactly 4 rows landed (a,b,c,d) despite the replays.
 }
 
+#[test]
+#[ignore = "needs a live Postgres (set DATARAIL_PG_* env); run in the docker verification harness"]
+fn commit_at_seq_is_idempotent_per_sequence_range_and_advances_past_dead_letters() {
+    // Kafka-EOS sequence model (KAFKA-EOS-DESIGN.md): commit_at_seq treats each batch as a whole unit keyed on
+    // the producer's sequence range. A retry/replay of the same range is a committed no-op; a processed range
+    // with zero landed records (all dead-lettered upstream) still advances the watermark so a replay no-ops.
+    let mut sink = PostgresSink::connect(live_cfg("datarail_seq")).expect("connect");
+    let stream = b"route-seq-p7";
+
+    // Batch [0,3): land a,b,c, watermark -> 3.
+    sink.commit_at_seq(&[b"s:a".to_vec(), b"s:b".to_vec(), b"s:c".to_vec()], stream, 3).expect("seq batch1");
+    // Idempotent-producer RETRY of the exact same range -> no-op (whole-batch).
+    sink.commit_at_seq(&[b"s:a".to_vec(), b"s:b".to_vec(), b"s:c".to_vec()], stream, 3).expect("seq retry");
+    assert_eq!(sink.resume_watermark(stream).expect("wm"), 3);
+
+    // A processed range [3,5) where BOTH records dead-lettered upstream: 0 records land, watermark advances to 5.
+    sink.commit_at_seq(&[], stream, 5).expect("seq dead-letter range");
+    // Replay of that empty range -> still no-op (5 <= 5).
+    sink.commit_at_seq(&[], stream, 5).expect("seq dead-letter replay");
+    assert_eq!(sink.resume_watermark(stream).expect("wm2"), 5);
+
+    // A genuinely new range [5,6): land f.
+    sink.commit_at_seq(&[b"s:f".to_vec()], stream, 6).expect("seq batch2");
+    sink.commit_at_seq(&[b"s:f".to_vec()], stream, 6).expect("seq batch2 retry"); // no-op
+    assert_eq!(sink.resume_watermark(stream).expect("wm3"), 6);
+
+    // Independent verification: exactly 4 rows (a,b,c,f) despite the retries + the dead-letter gap.
+    let n = psql_scalar("SELECT count(*) FROM datarail_seq");
+    assert_eq!(n, "4", "expected 4 rows (a,b,c,f), got {n}");
+}
+
 /// Run a SQL statement on the live DB via `psql` (the harness has it on PATH) — used to perturb the schema
 /// out from under the sink to test error recovery.
 fn run_psql(sql: &str) {

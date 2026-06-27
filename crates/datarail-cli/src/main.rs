@@ -586,6 +586,29 @@ impl AnySink {
         }
     }
 
+    /// Commit `fresh` for a Kafka-EOS **sequence** substream, setting the durable watermark to `watermark` (the
+    /// producer's `base_sequence + count`). Tier A → `commit_at_seq` (whole-batch idempotent exactly-once);
+    /// Tier C → plain `commit` (at-least-once). See `KAFKA-EOS-DESIGN.md`.
+    fn commit_seq(&mut self, fresh: &[Vec<u8>], stream: &[u8], watermark: u64) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.commit(fresh),
+            Self::Txn(pg) => {
+                use datarail_connectors::TxnSink as _;
+                pg.commit_at_seq(fresh, stream, watermark)
+            }
+        }
+    }
+
+    /// Plain at-least-once commit (no watermark), used for a Kafka batch with no stable idempotent identity even
+    /// when the sink is Tier-A-capable — a non-idempotent producer cannot be exactly-once, so we land + may dup,
+    /// never lose. For a `Txn` sink this is `PostgresSink`'s plain `COPY` path.
+    fn commit_plain(&mut self, fresh: &[Vec<u8>]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.commit(fresh),
+            Self::Txn(pg) => pg.commit(fresh),
+        }
+    }
+
     /// The end-to-end delivery guarantee this sink provides (for the run report — honest labelling).
     fn guarantee(&self) -> &'static str {
         match self {
@@ -650,6 +673,10 @@ fn select_sink(
     }
     Ok(AnySink::Plain(Box::new(VecSink::new())))
 }
+
+/// What [`Pipeline::deliver_batch`] returns: the offload disposition plus the records this batch freshly landed
+/// in the terminal sink (the slice the caller then commits to the external sink).
+type Delivered = (Disposition, Vec<Vec<u8>>);
 
 /// The outcome of shipping one batch through the [`Pipeline`]: the disposition the offload terminal returned
 /// and how many *fresh* records that batch committed to the external sink (0 for a `Duplicate`/`DeadLettered`).
@@ -716,6 +743,76 @@ impl Pipeline {
         record_key: &[u8],
         sink: &mut AnySink,
     ) -> Result<Option<BatchOutcome>, CliError> {
+        let Some((disposition, fresh)) = self.deliver_batch(batch, record_key)? else {
+            return Ok(None);
+        };
+        // Tier-A (file/replay) landed-count model: the watermark is `total` — the cumulative count of records
+        // landed for this stream through the end of this batch. On a replay the same prefix re-presents under the
+        // same cumulative watermark, so `commit_at` lands only what is genuinely new (end-to-end exactly-once).
+        let fresh_committed = fresh.len();
+        if !fresh.is_empty() {
+            let watermark = u64::try_from(self.committed_to_sink + fresh.len()).unwrap_or(u64::MAX);
+            sink.commit(&fresh, &self.stream, watermark).map_err(|e| CliError::Rail(e.to_string()))?;
+            self.committed_to_sink += fresh.len();
+        }
+        Ok(Some(BatchOutcome { disposition, fresh_committed }))
+    }
+
+    /// Like [`Pipeline::ship_batch`], but for a Kafka-EOS **sequence** substream: the dedup `stream` and the
+    /// `high` watermark (the idempotent producer's `base_sequence + count`) are supplied by the source per batch,
+    /// and the fresh records are committed via the whole-batch idempotent [`AnySink::commit_seq`]. The watermark
+    /// is a SOURCE position, so it advances even when a record dead-letters (the range is processed) — a replay
+    /// of the same range is a no-op (see `KAFKA-EOS-DESIGN.md`).
+    fn ship_batch_seq(
+        &mut self,
+        batch: &[Vec<u8>],
+        record_key: &[u8],
+        sink: &mut AnySink,
+        stream: &[u8],
+        high: u64,
+    ) -> Result<Option<BatchOutcome>, CliError> {
+        let Some((disposition, fresh)) = self.deliver_batch(batch, record_key)? else {
+            return Ok(None);
+        };
+        let fresh_committed = fresh.len();
+        // Always advance the watermark for a processed range, even with 0 fresh records (all dead-lettered) — a
+        // replay must then no-op. `commit_seq` itself no-ops when `high <= stored`, so a retry is safe.
+        sink.commit_seq(&fresh, stream, high).map_err(|e| CliError::Rail(e.to_string()))?;
+        self.committed_to_sink += fresh.len();
+        Ok(Some(BatchOutcome { disposition, fresh_committed }))
+    }
+
+    /// Like [`Pipeline::ship_batch_seq`] but plain at-least-once (no watermark) — for a Kafka batch with no
+    /// idempotent identity. Lands the fresh records via [`AnySink::commit_plain`]; a re-run may duplicate, never lose.
+    fn ship_batch_plain(
+        &mut self,
+        batch: &[Vec<u8>],
+        record_key: &[u8],
+        sink: &mut AnySink,
+    ) -> Result<Option<BatchOutcome>, CliError> {
+        let Some((disposition, fresh)) = self.deliver_batch(batch, record_key)? else {
+            return Ok(None);
+        };
+        let fresh_committed = fresh.len();
+        if !fresh.is_empty() {
+            sink.commit_plain(&fresh).map_err(|e| CliError::Rail(e.to_string()))?;
+            self.committed_to_sink += fresh.len();
+        }
+        Ok(Some(BatchOutcome { disposition, fresh_committed }))
+    }
+
+    /// Board `batch` under `record_key`, move it over the substrate, offload it, and return the offload
+    /// [`Disposition`] plus the records this batch freshly landed in the terminal sink (empty for a
+    /// `Duplicate`/`DeadLettered`). An empty input batch is a no-op (`None`). Shared by the landed-count and the
+    /// sequence ship paths — only the subsequent commit differs.
+    ///
+    /// `record_key` is the sole effectively-once identity (the dest hashes it into the dedup key): board the
+    /// *same* `record_key` again and the offload terminal returns [`Disposition::Duplicate`] with no fresh record.
+    fn deliver_batch(
+        &mut self,
+        batch: &[Vec<u8>],
+        record_key: &[u8],
+    ) -> Result<Option<Delivered>, CliError> {
         if batch.is_empty() {
             return Ok(None);
         }
@@ -739,22 +836,14 @@ impl Pipeline {
         let disposition = self.dst_term.offload(&received).map_err(CliError::Terminal)?;
         self.rail.ack(received.etiqueta.cofre_id)?;
 
-        // Only Delivered grows the terminal sink; commit those fresh records to the external sink. The watermark
-        // handed to a Tier-A sink is `total` — the cumulative count of records landed for this stream, through the
-        // end of this batch. On a replay (fresh process, once-gate empty) the same prefix re-presents under the
-        // same cumulative watermark, so `commit_at` lands only what is genuinely new: end-to-end exactly-once.
+        // Only Delivered grows the terminal sink; the fresh records are those past the commit cursor.
         let total = self.dst_term.sink().committed().len();
-        let fresh_committed = total - self.committed_to_sink;
-        if fresh_committed > 0 {
-            let fresh: Vec<Vec<u8>> = self.dst_term.sink().committed()[self.committed_to_sink..].to_vec();
-            let watermark = u64::try_from(total).unwrap_or(u64::MAX);
-            sink.commit(&fresh, &self.stream, watermark).map_err(|e| CliError::Rail(e.to_string()))?;
-            self.committed_to_sink = total;
-        }
-        Ok(Some(BatchOutcome {
-            disposition,
-            fresh_committed,
-        }))
+        let fresh: Vec<Vec<u8>> = if total > self.committed_to_sink {
+            self.dst_term.sink().committed()[self.committed_to_sink..].to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(Some((disposition, fresh)))
     }
 
     /// The human-readable end-of-run report (substrate, totals, last cofre).
@@ -767,27 +856,6 @@ impl Pipeline {
             self.dst_term.dead_letters().len(),
             self.last_cofre_hex,
         )
-    }
-}
-
-/// Drive the route: for each source batch, board → move over the spec's substrate → offload → commit the
-/// newly-landed records to the sink. The connectors **and** the real substrate are wired end-to-end.
-///
-/// With `watch`, a live one-line speedometer (elapsed ms, boarded, committed, dead-lettered, records/sec) is
-/// printed to stdout after every batch and as a final summary. The flag is purely observational — delivery
-/// semantics are byte-for-byte identical with and without it.
-/// A streaming [`Source`] over the Kafka ingest channel: each batch a real Kafka producer sends becomes one rail
-/// batch (its record values), boarded → sealed → offloaded → landed by [`run_pipe`]. Drains until the endpoint stops.
-struct KafkaChannelSource {
-    rx: std::sync::mpsc::Receiver<datarail_kafka::serve::ProducedBatch>,
-}
-
-impl Source for KafkaChannelSource {
-    fn next_batch(&mut self) -> std::io::Result<Option<Vec<Vec<u8>>>> {
-        match self.rx.recv() {
-            Ok((_topic, _partition, values)) => Ok(Some(values)),
-            Err(_) => Ok(None), // the ingest endpoint closed
-        }
     }
 }
 
@@ -840,16 +908,55 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
         let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx);
     });
 
-    // Kafka ingest is NOT eligible for Tier A as wired today: all (topic, partition)s funnel into one route_id
-    // stream whose cross-restart interleave is not a stable position, so a positional watermark is unsound
-    // (audit F2). Force at-least-once (no silent loss). Genuine per-partition-offset exactly-once is tracked
-    // future work (it needs the broker's per-partition offset threaded through + dead-letter-gap handling).
-    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once, /* source_ordered */ false)?;
-    eprintln!("datarail kafka-ingest on {listen} (advertised {advertised}:{port}) -> sealed rail -> sink (at-least-once)");
-    let mut source = KafkaChannelSource { rx };
-    run_pipe(&spec, &mut source, &mut sink, false)
+    // Kafka ingest delivers EXACTLY-ONCE for an idempotent producer (per (producer_id, partition) sequence —
+    // KAFKA-EOS-DESIGN.md) and AT-LEAST-ONCE for a non-idempotent one, decided PER BATCH below. Allow a
+    // Tier-A-capable (Txn) sink unless `--at-least-once` forces the plain path.
+    let mut sink = select_sink(sink_pg, sink_webhook, sink_file, at_least_once, /* source_ordered */ true)?;
+    eprintln!(
+        "datarail kafka-ingest on {listen} (advertised {advertised}:{port}) -> sealed rail -> sink \
+         (exactly-once for idempotent producers, else at-least-once)"
+    );
+    let mut pipe = Pipeline::from_spec(&spec)?;
+    let route_id = spec.route.route_id;
+    let mut batch_no = 0u64;
+    // Drain produced batches until the endpoint closes. Each carries its (topic, partition) and, for an
+    // idempotent producer, the EOS coordinate (producer_id, base_sequence, count).
+    for (topic, partition, values, eos) in rx {
+        if values.is_empty() {
+            continue;
+        }
+        if let Some(c) = eos {
+            // Exactly-once substream: stream = route_id ++ topic ++ partition ++ producer_id; the watermark is
+            // the producer sequence after this batch. The record_key is stable across retries (same coord).
+            let stream = eos_stream_id(&route_id, &topic, partition, c.producer_id);
+            let high = u64::try_from(i64::from(c.base_sequence) + i64::from(c.count)).unwrap_or(u64::MAX);
+            let key = format!("kafka-{topic}-{partition}-pid{}-seq{}", c.producer_id, c.base_sequence);
+            pipe.ship_batch_seq(&values, key.as_bytes(), &mut sink, &stream, high)?;
+        } else {
+            // No stable idempotent identity → honest at-least-once (plain commit, even on a Txn sink).
+            let key = format!("kafka-{topic}-{partition}-n{batch_no}");
+            pipe.ship_batch_plain(&values, key.as_bytes(), &mut sink)?;
+        }
+        batch_no += 1;
+    }
+    Ok(pipe.report())
 }
 
+/// The exactly-once dedup stream id for a Kafka `(topic, partition)` from an idempotent `producer_id`:
+/// `route_id ++ topic ++ partition ++ producer_id`. Distinct substreams never collide in the sink's watermark
+/// table; the same substream is stable across producer retries and broker/daemon restarts.
+fn eos_stream_id(route_id: &[u8], topic: &str, partition: i32, producer_id: i64) -> Vec<u8> {
+    let mut s = Vec::with_capacity(route_id.len() + topic.len() + 12);
+    s.extend_from_slice(route_id);
+    s.extend_from_slice(topic.as_bytes());
+    s.extend_from_slice(&partition.to_be_bytes());
+    s.extend_from_slice(&producer_id.to_be_bytes());
+    s
+}
+
+/// Drive the route: for each source batch, board → move over the spec's substrate → offload → commit the
+/// newly-landed records to the sink. With `watch`, a live one-line speedometer is printed after every batch
+/// (purely observational — delivery semantics are identical with and without it).
 fn run_pipe(
     spec: &RailSpec,
     source: &mut dyn Source,
@@ -1421,6 +1528,20 @@ mod tests {
         // --at-least-once always forces Tier C, even for an ordered source.
         assert!(!wants_tier_a(true, true), "--at-least-once opts out");
         assert!(!wants_tier_a(true, false));
+    }
+
+    #[test]
+    fn eos_stream_id_separates_distinct_substreams() {
+        use super::eos_stream_id;
+        let route = [1u8; 16];
+        let base = eos_stream_id(&route, "events", 0, 7);
+        // Different partition, producer, topic, or route ⇒ a different stream id (no watermark collision).
+        assert_ne!(base, eos_stream_id(&route, "events", 1, 7), "partition must matter");
+        assert_ne!(base, eos_stream_id(&route, "events", 0, 8), "producer_id must matter");
+        assert_ne!(base, eos_stream_id(&route, "orders", 0, 7), "topic must matter");
+        assert_ne!(base, eos_stream_id(&[2u8; 16], "events", 0, 7), "route_id must matter");
+        // Same coordinates ⇒ same id (stable across retries / restarts).
+        assert_eq!(base, eos_stream_id(&route, "events", 0, 7));
     }
 
     #[test]

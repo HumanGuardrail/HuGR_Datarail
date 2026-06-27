@@ -18,9 +18,10 @@ fn main() -> std::io::Result<()> {
     println!("datarail-kafka ingest on {listen} (advertised {advertised}:{port})");
     let (tx, rx) = mpsc::channel::<datarail_kafka::serve::ProducedBatch>();
     std::thread::spawn(move || {
-        for (topic, partition, values) in rx {
+        for (topic, partition, values, eos) in rx {
+            let seq = eos.map_or_else(|| "-".to_owned(), |e| format!("pid={} seq={}", e.producer_id, e.base_sequence));
             for v in &values {
-                println!("RECV topic={topic} partition={partition} value={}", String::from_utf8_lossy(v.as_slice()));
+                println!("RECV topic={topic} partition={partition} [{seq}] value={}", String::from_utf8_lossy(v.as_slice()));
             }
         }
     });
