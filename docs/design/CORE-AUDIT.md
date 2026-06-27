@@ -135,6 +135,8 @@ correct); multi-batch/legacy → no `eos`; `high = base_sequence + count` no ove
 `record_key` uniqueness; `commit_at_seq` idempotent retry + replay-after-restart + dead-letter advance; the
 per-batch snapshot under interleaved substreams + partial dead-letter (traced, correct).
 
-**Known limitation (honest, tracked):** the offload terminal's in-memory sink + once-gate retain all records for the
-daemon's lifetime (pre-existing; worsened by re-delivered retries) → long-running ingest grows in memory; a
-streaming/draining terminal sink is a separate arc.
+**Memory limitation — RESOLVED (2026-06-27, the streaming-terminal arc):** the offload terminal's sink retained
+every landed record for the daemon's lifetime (pre-existing). The pipeline now DRAINS the sink every batch
+(`take_committed` + a `landed_total` counter), and the dead-letter siding is BOUNDED (`MAX_DEAD_LETTERS_RETAINED`,
+evict-oldest + counted) so a contract-violation flood can't OOM the destination. Regression:
+`dead_letter_siding_is_bounded_under_a_flood`; live re-proof (file Tier A + Kafka EOS) unchanged.

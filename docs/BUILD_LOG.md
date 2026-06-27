@@ -782,6 +782,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   survives + recovers). Known honest limitation: the terminal sink/once-gate retain in memory for the daemon's
   life (tracked: a streaming terminal-sink arc). `CORE-AUDIT.md` §Kafka-EOS records all findings + dispositions.
 
+- 2026-06-27 — **STREAMING TERMINAL SINK — the EOS daemon is now long-running-safe (closed the memory wart I had
+  just documented).** Tech-lead call (owner: "esse call é seu, keep it SOTA, rigor máximo"): rather than leave the
+  EOS feature with a documented OOM limitation, fix it. The offload terminal's sink retained EVERY landed record
+  for the daemon's lifetime (pre-existing across all kafka-ingest/run). FIX: the pipeline now **drains the sink
+  every batch** (`sink_mut().take_committed()`), tracking the cumulative landed count in a `landed_total` counter
+  (the file Tier-A watermark) — memory is bounded to one batch. Also **bounded the dead-letter siding**
+  (`MAX_DEAD_LETTERS_RETAINED = 1024`, evict-oldest + a `dropped`/`total` count) so a producer flooding
+  contract-violations can't OOM the destination either. The once-gate stays bounded by its existing watermark+GC
+  (contiguous in-order seqs). Regression `dead_letter_siding_is_bounded_under_a_flood` (flood cap+100 → retained
+  1024, dropped 100, total preserved); live re-proof unchanged (file Tier A → 4 rows; Kafka EOS full chain → 3).
+  Full workspace clippy(deny all+pedantic)+test green; forbid(unsafe); no #[allow].
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**
