@@ -419,6 +419,9 @@ pub enum DeadLetterReason {
     ContractFingerprintMismatch,
     /// The AEAD-open failed (tamper / wrong key / nonce), so the payload could not be read.
     OpenFailed,
+    /// The cofre's `eph_pk` is a low-order / non-contributory X25519 point, so the per-cofre key-wrap could not
+    /// safely derive a key (S-3 defense-in-depth, RFC 7748 §6.1) — the cofre is rejected before AEAD-open.
+    KeyWrapInvalid,
     /// The decrypted `RECORD_BATCH` was malformed (truncated / trailing bytes).
     MalformedBatch,
     /// A decrypted record violated the offloading content contract (AC-9, offload side).
@@ -435,6 +438,7 @@ impl core::fmt::Display for DeadLetterReason {
             Self::RouteMismatch => f.write_str("cofre addressed to a different route/stream"),
             Self::ContractFingerprintMismatch => f.write_str("contract fingerprint mismatch (schema drift)"),
             Self::OpenFailed => f.write_str("AEAD open failed (tamper/wrong key)"),
+            Self::KeyWrapInvalid => f.write_str("key-wrap invalid (low-order/non-contributory eph_pk)"),
             Self::MalformedBatch => f.write_str("decrypted record batch is malformed"),
             Self::ContractViolation => f.write_str("decrypted record violates offloading contract"),
             Self::SenderCertInvalid => f.write_str("sealed-sender certificate failed validation"),
@@ -659,7 +663,10 @@ impl SourceTerminal {
         // (4) Per-cofre key-wrap (SPEC A5/03): a fresh ephemeral X25519 key seals a fresh data key to the
         // route's destination public key — only the dest can re-derive it (provider-blind, forward-secure).
         let mut eph_secret = random_32()?;
-        let (eph_pk, mut data_key) = seal_key(&self.config.dest_x25519_pk, &eph_secret);
+        let Some((eph_pk, mut data_key)) = seal_key(&self.config.dest_x25519_pk, &eph_secret) else {
+            eph_secret.zeroize();
+            return Err(TerminalError::Seal); // a low-order dest_x25519_pk is a route misconfiguration (S-3)
+        };
         eph_secret.zeroize(); // forward secrecy: wipe the ephemeral secret immediately (AUDIT-02 F4).
 
         // (5) Sealed-sender (SPEC-02 A4): if a credential is configured, prepend the issuer-signed SENDER_CERT
@@ -869,7 +876,12 @@ impl DestTerminal {
 
         // (3) Re-derive the per-cofre data key from the authenticated eph_pk, then AEAD-open with the header
         // bound as AAD (AUDIT-02 F5); a tamper / wrong-key failure dead-letters.
-        let mut data_key = open_key(&self.dest_x25519_secret, &cofre.etiqueta.eph_pk);
+        let Some(mut data_key) = open_key(&self.dest_x25519_secret, &cofre.etiqueta.eph_pk) else {
+            // S-3: the cofre's eph_pk is a low-order/non-contributory X25519 point — fail closed (the seal was
+            // already verified, so this is belt-and-suspenders, but a malformed key-wrap never derives a key).
+            self.dead_letters.push(cofre.clone(), DeadLetterReason::KeyWrapInvalid);
+            return Ok(Disposition::DeadLettered);
+        };
         let opened = aead_open(
             cofre.etiqueta.aead_alg,
             &data_key,

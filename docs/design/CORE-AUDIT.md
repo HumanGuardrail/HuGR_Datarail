@@ -28,7 +28,7 @@ panic-safety on hostile cofre bytes, constant-time (no secret-dependent compare)
 |---|---|---|---|
 | S-1 | **DRBG reseed keyed on PID → VM-snapshot/clone replays identical `(eph_secret, nonce)`** (catastrophic under opt-in `Gcm256`, plaintext-equality leak under GCM-SIV default). PROVEN. | HIGH | **FIXED** `675d70d`: every DRBG draw now mixes fresh OS entropy → clone-immune by construction, not by PID detection. Regression test: identical-state clones diverge every draw. |
 | S-2 | **Sealed-sender `epoch` never enforced** — a revoked sender's old cert is accepted forever (revocation is theater). PROVEN. | MED | **FIXED**: `DestTerminal::with_min_sender_epoch(n)` — a cert with `epoch < n` is dead-lettered (default 0 = backward-compatible; raise after a rotation). Regression test added. |
-| S-3 | No X25519 contributory/low-order-point check in key-wrap. | LOW | **ACCEPTED** (not reachable): `eph_pk` is always source-generated and authenticated (lacre verified) BEFORE ECDH, so no adversary can inject a low-order point. Defense-in-depth check is TRACKED. |
+| S-3 | No X25519 contributory/low-order-point check in key-wrap. | LOW | **FIXED** (2026-06-26, defense-in-depth): `x25519_shared` now rejects a non-contributory shared secret (`was_contributory()`, RFC 7748 §6.1); `seal_key`/`open_key` return `Option` and fail closed. Source-side a low-order `dest_x25519_pk` → `TerminalError::Seal`; dest-side a low-order `eph_pk` → `DeadLetterReason::KeyWrapInvalid` (rejected before AEAD-open). Still not wire-reachable (lacre verified first), but no longer trusts that alone. Regression test `low_order_eph_public_is_rejected_s3` (identity + order-8 points). |
 | S-4 | `idempotency_key = HMAC(tenant_secret, record_key)` rides cleartext → the rail can see which cofres share a record_key within a tenant (linkability). | LOW | **ACCEPTED** trade-off: inherent to a deterministic dedup key; `record_key` itself is NOT recoverable. Documented. |
 | S-5 | `sender_present` flag + a 200 B carga delta leak *whether* (not who) a cofre carries a sealed sender. | LOW | **ACCEPTED** trade-off: identity is correctly hidden (proven); presence-padding is optional future work. |
 
@@ -81,9 +81,13 @@ drop, no path traversal, INV-OPAQUE-CARGO holds).
 - **No-loss:** the broker is now **durability-before-ack** — acked records survive power loss. FIXED.
 - **Effectively-once:** holds **within a process run**; **NOT yet across crashes** (dedup not persisted/wired) —
   honestly TRACKED, not claimed. The broker is at-least-once across restarts.
-- Remaining TRACKED: **dedup persistence (D-3)** — the big one, effectively-once cross-crash; X25519 low-order
-  defense-in-depth (S-3, not reachable). (S-2 epoch, D-5 gap horizon, D-6 offsets dir-fsync are now FIXED.) None is a wire-adversary confidentiality/integrity break. D-3 is a correctness-critical durable
-  component scoped for its own careful arc + audit, not a tail-of-session rush.
+- **All audit findings now FIXED.** D-3 (dedup persistence / effectively-once cross-crash — the big one) was
+  solved at root: Tier A exactly-once into Postgres (`commit_at`, watermark in the sink's txn) + Tier C `FileOnce`
+  persistent dedup, and Tier A is now **wired into the product end-to-end** (`datarail run`/`kafka-ingest`, proven
+  live). S-3 (X25519 low-order defense-in-depth) is now FIXED too (was the last TRACKED item). (S-2 epoch, D-5 gap
+  horizon, D-6 offsets dir-fsync FIXED earlier.) No finding was ever a wire-adversary confidentiality/integrity
+  break; the remaining S-4/S-5 entries are documented ACCEPTED trade-offs (deterministic-dedup linkability /
+  sealed-sender presence), not defects.
 
 This pass is the methodology working: the auditors proved the scary lenses *safe* (signatures, verify-before-
 decrypt, panic-safety) and found the real defects (a crypto clone-reuse + the durability/dedup gaps), which were
