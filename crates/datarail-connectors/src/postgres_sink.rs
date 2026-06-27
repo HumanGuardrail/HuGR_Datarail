@@ -100,15 +100,27 @@ impl PostgresSink {
         let mut query = format!("COPY \"{}\" (\"{}\") FROM STDIN", self.table, self.column).into_bytes();
         query.push(0); // simple Query is a NUL-terminated C string
         send(&mut self.stream, b'Q', &query)?;
-        // Expect CopyInResponse ('G'); tolerate informational messages, fail on ErrorResponse.
+        // Wait for CopyInResponse ('G'). On an error, DRAIN to ReadyForQuery ('Z') before returning — the wire
+        // protocol guarantees a 'Z' follows every 'E', and leaving it unread desyncs every later query (audit C1).
+        let mut err: Option<io::Error> = None;
+        let mut ready_for_data = false;
         loop {
             let (tag, body) = read_msg(&mut self.stream)?;
             match tag {
-                b'G' => break,
-                b'E' => return Err(backend_error(&body)),
-                b'Z' => return Err(invalid("server was not ready to accept COPY-IN data")),
+                b'G' => {
+                    ready_for_data = true;
+                    break; // server is ready; the closing 'Z' arrives after CopyDone (drained below)
+                }
+                b'E' if err.is_none() => err = Some(backend_error(&body)),
+                b'Z' => break, // error path fully drained, or an unexpected ready
                 _ => {}
             }
+        }
+        if let Some(e) = err {
+            return Err(e); // 'E' then 'Z' consumed — the connection is realigned
+        }
+        if !ready_for_data {
+            return Err(invalid("server was not ready to accept COPY-IN data"));
         }
         for record in records {
             let mut frame = escape_copy(record);
@@ -116,23 +128,31 @@ impl PostgresSink {
             send(&mut self.stream, b'd', &frame)?;
         }
         send(&mut self.stream, b'c', &[])?; // CopyDone
-        // Expect CommandComplete ('C') then ReadyForQuery ('Z').
+        // Drain to ReadyForQuery ('Z'), capturing any ErrorResponse (do not early-return — see above).
+        let mut err: Option<io::Error> = None;
         loop {
             let (tag, body) = read_msg(&mut self.stream)?;
             match tag {
                 b'Z' => break,
-                b'E' => return Err(backend_error(&body)),
+                b'E' if err.is_none() => err = Some(backend_error(&body)),
                 _ => {} // CommandComplete ('C') and informational messages
             }
+        }
+        if let Some(e) = err {
+            return Err(e);
         }
         Ok(())
     }
 
     /// The transaction body for `commit_at` (between `BEGIN` and `COMMIT`/`ROLLBACK`): read the current watermark
     /// under a row lock; if this batch already landed, no-op; otherwise land the records + advance the watermark.
-    fn txn_body(&mut self, stream_hex: &str, watermark: i64, records: &[Vec<u8>]) -> io::Result<()> {
+    fn txn_body(&mut self, stream_hex: &str, lock_key: i64, watermark: i64, records: &[Vec<u8>]) -> io::Result<()> {
+        // Serialize concurrent commit_at on the same stream — `SELECT … FOR UPDATE` locks NO row when the
+        // watermark row does not exist yet, so two first-batches would both land (audit C2). A transaction-scoped
+        // advisory lock has no such gap; it is released on COMMIT/ROLLBACK.
+        query_simple(&mut self.stream, &format!("SELECT pg_advisory_xact_lock({lock_key})"))?;
         let current = read_watermark(&mut self.stream, stream_hex, true)?; // FOR UPDATE
-        if current >= watermark {
+        if current.is_some_and(|c| c >= watermark) {
             return Ok(()); // already landed (idempotent replay) — the COMMIT makes it a clean no-op
         }
         if !records.is_empty() {
@@ -153,16 +173,28 @@ fn ensure_watermark_table(stream: &mut (impl Read + Write)) -> io::Result<()> {
         .map(|_| ())
 }
 
-/// Read the current watermark seq for `stream_hex` (`0` if no row), optionally with `FOR UPDATE` to lock it
-/// inside a transaction. `stream_hex` is a hex string (no injection); the seq is an integer.
-fn read_watermark(stream: &mut (impl Read + Write), stream_hex: &str, for_update: bool) -> io::Result<i64> {
+/// Read the current watermark seq for `stream_hex`: `Some(seq)` if the row exists, `None` if absent — the two
+/// must NOT collapse (a `0` watermark is a real, distinct value; treating "absent" as `0` silently loses the
+/// first batch / re-lands, audit H3/M4). A present-but-unparsable value is a hard error. `stream_hex` is a hex
+/// string (no injection); the seq is an integer. `for_update` locks the row inside a transaction.
+fn read_watermark(stream: &mut (impl Read + Write), stream_hex: &str, for_update: bool) -> io::Result<Option<i64>> {
     let lock = if for_update { " FOR UPDATE" } else { "" };
     let sql = format!("SELECT seq FROM datarail_watermark WHERE stream = '\\x{stream_hex}'{lock}");
-    let row = query_simple(stream, &sql)?;
-    let seq = row
-        .and_then(|b| std::str::from_utf8(&b).ok().and_then(|s| s.trim().parse::<i64>().ok()))
-        .unwrap_or(0);
-    Ok(seq)
+    match query_simple(stream, &sql)? {
+        None => Ok(None),
+        Some(bytes) => {
+            let text = std::str::from_utf8(&bytes).map_err(|_| invalid("non-utf8 watermark value"))?;
+            let seq = text.trim().parse::<i64>().map_err(|_| invalid("unparsable watermark value"))?;
+            Ok(Some(seq))
+        }
+    }
+}
+
+/// A transaction-scoped advisory-lock key derived from the stream bytes — serializes concurrent `commit_at` on
+/// the same stream even when its watermark row does not exist yet (a `SELECT … FOR UPDATE` locks no missing row).
+fn lock_key_for(stream: &[u8]) -> i64 {
+    let h = md5(stream);
+    i64::from_le_bytes(h.get(0..8).and_then(|b| <[u8; 8]>::try_from(b).ok()).unwrap_or([0u8; 8]))
 }
 
 /// Run a simple `Query`, draining to `ReadyForQuery`. Returns the first field of the first `DataRow` (if any) —
@@ -173,29 +205,45 @@ fn query_simple(stream: &mut (impl Read + Write), sql: &str) -> io::Result<Optio
     q.push(0); // NUL-terminated C string
     send(stream, b'Q', &q)?;
     let mut first: Option<Vec<u8>> = None;
+    let mut saw_row = false;
+    let mut err: Option<io::Error> = None;
+    // ALWAYS drain to ReadyForQuery ('Z') — the protocol guarantees one terminates every query, and leaving it
+    // unread (e.g. early-returning on 'E') desyncs every later query/COPY on this connection (audit C1).
     loop {
         let (tag, body) = read_msg(stream)?;
         match tag {
-            b'D' if first.is_none() => {
-                // DataRow: int16 field count, then per field [int32 len][bytes] (len -1 = NULL).
-                let nfields = body.get(0..2).and_then(|b| <[u8; 2]>::try_from(b).ok()).map(i16::from_be_bytes);
-                if nfields.is_some_and(|n| n >= 1) {
-                    let len = body.get(2..6).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(i32::from_be_bytes);
-                    first = match len {
-                        Some(l) if l >= 0 => {
-                            let n = usize::try_from(l).unwrap_or(0);
-                            body.get(6..6 + n).map(<[u8]>::to_vec)
-                        }
-                        _ => Some(Vec::new()), // NULL field
-                    };
+            b'D' if !saw_row => {
+                saw_row = true;
+                first = parse_first_field(&body);
+                if first.is_none() && err.is_none() {
+                    // A DataRow was present but unparsable — fail loud, never silently look like "no row" (audit M4).
+                    err = Some(invalid("malformed DataRow from backend"));
                 }
             }
-            b'E' => return Err(backend_error(&body)),
-            b'Z' => break, // ReadyForQuery
-            _ => {} // RowDescription 'T', CommandComplete 'C', NoticeResponse, etc.
+            b'E' if err.is_none() => err = Some(backend_error(&body)),
+            b'Z' => break, // ReadyForQuery — connection realigned
+            _ => {} // RowDescription 'T', CommandComplete 'C', NoticeResponse, extra DataRows, etc.
         }
     }
-    Ok(first)
+    match err {
+        Some(e) => Err(e),
+        None => Ok(first),
+    }
+}
+
+/// Parse the first field of a `DataRow` body: `int16 field-count`, then per field `[int32 len][bytes]` (`len -1`
+/// = NULL → empty). Returns `None` if the body is too short to hold the declared first field (a malformed row).
+fn parse_first_field(body: &[u8]) -> Option<Vec<u8>> {
+    let nfields = body.get(0..2).and_then(|b| <[u8; 2]>::try_from(b).ok()).map(i16::from_be_bytes)?;
+    if nfields < 1 {
+        return Some(Vec::new()); // a row with zero fields → treat as empty
+    }
+    let len = body.get(2..6).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(i32::from_be_bytes)?;
+    if len < 0 {
+        return Some(Vec::new()); // NULL field
+    }
+    let n = usize::try_from(len).ok()?;
+    body.get(6..6 + n).map(<[u8]>::to_vec)
 }
 
 impl crate::Sink for PostgresSink {
@@ -223,14 +271,15 @@ impl crate::TxnSink for PostgresSink {
             return Err(invalid("record contains a NUL byte, which the Postgres text COPY format cannot carry"));
         }
         let stream_hex = hex(stream);
-        let wm = i64::try_from(watermark).unwrap_or(i64::MAX);
+        let wm = i64::try_from(watermark).map_err(|_| invalid("watermark exceeds i64::MAX"))?;
+        let lock_key = lock_key_for(stream);
         ensure_watermark_table(&mut self.stream)?;
         query_simple(&mut self.stream, "BEGIN")?;
         // Run the transaction body; on ANY error roll back so the connection is reusable (not stuck in a failed txn).
-        match self.txn_body(&stream_hex, wm, records) {
+        match self.txn_body(&stream_hex, lock_key, wm, records) {
             Ok(()) => query_simple(&mut self.stream, "COMMIT").map(|_| ()),
             Err(e) => {
-                let _ = query_simple(&mut self.stream, "ROLLBACK");
+                let _ = query_simple(&mut self.stream, "ROLLBACK"); // best-effort; query_simple now drains to 'Z'
                 Err(e)
             }
         }
@@ -239,7 +288,7 @@ impl crate::TxnSink for PostgresSink {
     fn resume_watermark(&mut self, stream: &[u8]) -> io::Result<u64> {
         ensure_watermark_table(&mut self.stream)?;
         let cur = read_watermark(&mut self.stream, &hex(stream), false)?;
-        Ok(u64::try_from(cur).unwrap_or(0))
+        Ok(cur.and_then(|c| u64::try_from(c).ok()).unwrap_or(0))
     }
 }
 

@@ -46,6 +46,23 @@ interaction, offsets recovery parse-safety (CRC + torn-tail truncation, no panic
 | D-6 | `FileOffsets` doesn't fsync the parent dir on create / re-fsync after compaction (rename durability). | MED | **FIXED**: `fsync_dir` helper — fsync the dir on `open` (first-create durable) and (propagated, not swallowed) after the compaction rename. |
 | D-7 | `Commit` accepted an arbitrary offset (past tail → wedge). | LOW | **FIXED** `741b803`: reject a commit past the durable topic tail. |
 
+## Txn-path audit (the new exactly-once `commit_at`) — 2 PROVEN CRITICALs, all fixed
+A third brutal auditor hit the new transactional path (it claimed "exactly-once PROVEN" — durability components
+always get audited). It CONFIRMED safe: no SQL injection (`hex` is hex-only; identifiers validated; bytea literal
+correct), single-connection crash atomicity (COPY participates in the txn rollback), panic-safety. It PROVED two
+real breaks (both fixed + regression-tested):
+
+| # | Finding | Sev | Disposition |
+|---|---|---|---|
+| T-1 | **Backend `ErrorResponse` desynced the wire** — `query_simple`/`copy_in` early-returned on `'E'` without draining the mandatory trailing `ReadyForQuery`; every later query then misread → `resume_watermark` returned 0 → the WHOLE stream re-landed. PROVEN (durable wm 1, read back 0). | CRIT | **FIXED**: every query/COPY now DRAINS to `'Z'`, capturing the error, before returning. Live regression `a_backend_error_does_not_desync_the_connection`. |
+| T-2 | **`SELECT … FOR UPDATE` locks no missing row** → two concurrent first-batches both land (double-land). PROVEN (2 rows for 1 batch). | CRIT | **FIXED**: a transaction-scoped `pg_advisory_xact_lock` keyed by the stream serializes concurrent `commit_at` even with no watermark row yet. |
+| T-3 | Watermark `0` ambiguous (no-row vs seq 0) → first batch silently lost / re-landed. | HIGH | **FIXED**: `read_watermark` returns `Option<i64>` (None = no row, distinct from 0); a present-but-unparsable value is a hard error. |
+| T-4 | A short/malformed `DataRow` silently returned 0. | MED | **FIXED**: a present-but-unparsable `DataRow` is now an error, never a silent 0. |
+| T-5 | `watermark > i64::MAX` clamped silently. | LOW | **FIXED**: errors instead of clamping. |
+
+The "exactly-once PROVEN" claim was real for the happy path but FALSE under error/concurrency — exactly what the
+audit is for. It is now actually true (live C1 regression + the concurrency lock), and re-gated in CI.
+
 ## Honest status after this pass
 - **Sealing / provider-blind:** HOLDS against the wire adversary (pipe/storage/MITM) in the GCM-SIV default; the
   one real weakness (snapshot/clone key reuse) is FIXED. `Gcm256` (opt-in `vaes`) is now also clone-safe.
