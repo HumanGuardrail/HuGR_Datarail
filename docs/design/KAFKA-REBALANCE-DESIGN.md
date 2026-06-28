@@ -1,6 +1,16 @@
 # KAFKA-REBALANCE-DESIGN — automatic consumer-group rebalance (increment 4b)
 
-> **STATUS: DESIGN — FROZEN (2026-06-27), not yet implemented.** The last piece for a `subscribe()`-based Kafka
+> **STATUS: BUILT + PROVEN (2026-06-27); brutal concurrency audit PENDING (part of the 4-way audit).** The
+> coordinator (`coordinator.rs`: the `Empty→PreparingRebalance→CompletingRebalance→Stable` state machine, one
+> `Mutex`+`Condvar`, lazy session expiry, bounded `wait_timeout` parks) + the wire codec (`groups.rs`:
+> `JoinGroup` v1–4 / `SyncGroup` v0–2 / `Heartbeat` v0–2 / `LeaveGroup` v0–2) + `serve_broker` dispatch + an
+> `ApiVersions` advertisement are built. PROVEN: coordinator unit tests with REAL concurrent joiner threads
+> (single-member leader+sync+HB; two joiners → one generation, leader assigns both, follower parks for its
+> assignment; leave → survivor rejoins) + the FULL-BINARY `kafka_rebalance_wire.rs` (two concurrent consumer
+> connections JoinGroup→SyncGroup→Heartbeat → one generation, leader's assignments routed, both stable). A
+> dedicated concurrency-focused adversarial audit (step 7) runs as part of the whole-repo 4-way Opus audit.
+>
+> **(original DESIGN below.)** The last piece for a `subscribe()`-based Kafka
 > consumer: the single-node group **coordinator** that ASSIGNS partitions to group members automatically via
 > `JoinGroup` (11) / `SyncGroup` (14) / `Heartbeat` (12) / `LeaveGroup` (13). Builds on the already-shipped
 > `FindCoordinator` (self), durable `OffsetCommit`/`OffsetFetch` (increment 3), and multi-partition (increment 4a).

@@ -47,10 +47,12 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
   (increment 3: `OffsetCommit`/`OffsetFetch`/`FindCoordinator`, fsync-before-ack via `FileOffsets`) — a consumer's
   committed offset survives its own restart AND a broker restart. **Multi-partition** (increment 4a): `--partitions
   N` → Metadata advertises N partitions, each an INDEPENDENT durable log + offset space (proven by
-  `kafka_multipartition_wire.rs`). **Honest limits:** **no automatic group rebalance**
-  (`JoinGroup`/`SyncGroup`/`Heartbeat` — increment 4b): this serves explicit-commit / manual-assignment consumers
-  (`KAFKA-GROUPS-DESIGN.md`); offset-stable across a clean crash + failed batch, with silent mid-history disk-rot
-  renumbering a known retained-log limit (CRC-detected; hardening tracked).
+  `kafka_multipartition_wire.rs`). **Automatic group rebalance** (increment 4b): a single-node coordinator serves
+  `JoinGroup`/`SyncGroup`/`Heartbeat`/`LeaveGroup`, so a `subscribe()` consumer group auto-assigns partitions
+  (proven by `kafka_rebalance_wire.rs`; concurrency audit pending). **Honest limits:** group membership is runtime
+  state (not persisted across a broker restart — committed OFFSETS are); server-side assignment / KIP-848,
+  static membership, cooperative-incremental rebalance are out of scope; offset-stable across a clean crash +
+  failed batch, with silent mid-history disk-rot renumbering a known retained-log limit (CRC-detected; tracked).
 - **No compression** (gzip/snappy/lz4/zstd). A compressed batch is rejected with a clear error. Producers must
   send uncompressed (`compression.type=none`) for now.
 - **No TRANSACTIONAL producer** (the `AddPartitionsToTxn` / `EndTxn` / transaction-coordinator APIs, a stable
