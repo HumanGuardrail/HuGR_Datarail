@@ -16,10 +16,14 @@ use crate::consume::{
     fetch_response, list_offsets_response, parse_fetch, parse_list_offsets, FetchPartitionResult,
     FetchTopicResult, ListOffsetResult, ListOffsetTopicResult, API_FETCH, API_LIST_OFFSETS,
 };
+use crate::coordinator::GroupCoordinator;
 use crate::groups::{
-    find_coordinator_response, offset_commit_response, offset_fetch_response, parse_find_coordinator,
-    parse_offset_commit, parse_offset_fetch, OffsetCommitPartitionResult, OffsetCommitTopicResult,
-    OffsetFetchPartitionResult, OffsetFetchTopicResult, API_FIND_COORDINATOR, API_OFFSET_COMMIT, API_OFFSET_FETCH,
+    find_coordinator_response, heartbeat_response, join_group_response, leave_group_response,
+    offset_commit_response, offset_fetch_response, parse_find_coordinator, parse_heartbeat, parse_join_group,
+    parse_leave_group, parse_offset_commit, parse_offset_fetch, parse_sync_group, sync_group_response,
+    JoinGroupResponse, OffsetCommitPartitionResult, OffsetCommitTopicResult, OffsetFetchPartitionResult,
+    OffsetFetchTopicResult, API_FIND_COORDINATOR, API_HEARTBEAT, API_JOIN_GROUP, API_LEAVE_GROUP,
+    API_OFFSET_COMMIT, API_OFFSET_FETCH, API_SYNC_GROUP,
 };
 use crate::handlers::{
     api_versions_response, init_producer_id_response, metadata_response, parse_metadata_topics,
@@ -148,7 +152,8 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             API_VERSIONS => api_versions_response(api_version, correlation_id),
             API_METADATA => {
                 let topics = parse_metadata_topics(&mut reader)?;
-                metadata_response(api_version, correlation_id, &shared.host, shared.port, &topics)
+                // Ingest merges all partitions into one sink, so a single partition is advertised here.
+                metadata_response(api_version, correlation_id, &shared.host, shared.port, &topics, 1)
             }
             API_PRODUCE => {
                 let topics = parse_produce(&mut reader, api_version)?;
@@ -188,9 +193,12 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                     let key = (name.to_owned(), part);
                     let base = *offsets.get(&key).unwrap_or(&0);
                     let code = codes.get(&key).copied().unwrap_or(0); // read before the insert moves `key`
-                    // Bound the map: past the cap, don't retain new keys (they restart at 0) — no unbounded
-                    // growth from attacker-chosen (topic, partition) identities (audit K1). saturating add (K6).
-                    if offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS {
+                    // Advance the reported base offset ONLY on a durable land (code 0). A failed batch (code 56)
+                    // must NOT consume offsets — else a producer retry sees a non-contiguous gap (audit 4b LOW;
+                    // the sink watermark, not this counter, is the EOS authority, so this is producer-visible
+                    // contiguity, not correctness). Bound the map: past the cap, don't retain new keys (no
+                    // unbounded growth from attacker-chosen identities, audit K1); saturating add (K6).
+                    if code == 0 && (offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS) {
                         offsets.insert(key, base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)));
                     }
                     (base, code)
@@ -260,10 +268,12 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
     listener: &TcpListener,
     advertised_host: &str,
     advertised_port: i32,
+    partitions: i32,
     broker: &Arc<B>,
 ) -> io::Result<()> {
     let host = advertised_host.to_owned();
     let next_producer_id = Arc::new(AtomicI64::new(1));
+    let coordinator = Arc::new(GroupCoordinator::with_defaults());
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let stream = stream?;
@@ -277,9 +287,11 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
         let broker = Arc::clone(broker);
         let host = host.clone();
         let pid = Arc::clone(&next_producer_id);
+        let coord = Arc::clone(&coordinator);
         let active = Arc::clone(&active);
         std::thread::spawn(move || {
-            let _ = handle_broker_connection(stream, broker.as_ref(), &host, advertised_port, &pid);
+            let _ =
+                handle_broker_connection(stream, broker.as_ref(), &host, advertised_port, partitions, &pid, &coord);
             active.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -291,7 +303,9 @@ fn handle_broker_connection<B: KafkaBroker>(
     broker: &B,
     host: &str,
     port: i32,
+    partitions: i32,
     next_producer_id: &AtomicI64,
+    coordinator: &GroupCoordinator,
 ) -> io::Result<()> {
     while let Some(frame) = read_frame(&mut stream)? {
         let mut reader = Reader::new(&frame);
@@ -306,7 +320,7 @@ fn handle_broker_connection<B: KafkaBroker>(
             API_VERSIONS => api_versions_response(api_version, correlation_id),
             API_METADATA => {
                 let topics = parse_metadata_topics(&mut reader)?;
-                metadata_response(api_version, correlation_id, host, port, &topics)
+                metadata_response(api_version, correlation_id, host, port, &topics, partitions)
             }
             API_INIT_PRODUCER_ID => {
                 let pid = next_producer_id.fetch_add(1, Ordering::Relaxed);
@@ -363,12 +377,69 @@ fn handle_broker_connection<B: KafkaBroker>(
                 let out = offset_fetch_results(broker, &req);
                 offset_fetch_response(api_version, correlation_id, &out)
             }
-            other => return Err(io::Error::other(format!("unsupported Kafka api_key {other}"))),
+            other => match dispatch_group_api(other, api_version, correlation_id, &mut reader, coordinator)? {
+                Some(resp) => resp,
+                None => return Err(io::Error::other(format!("unsupported Kafka api_key {other}"))),
+            },
         };
         stream.write_all(&Writer::frame(&response))?;
         stream.flush()?;
     }
     Ok(())
+}
+
+/// Handle the consumer-group REBALANCE APIs (JoinGroup/SyncGroup/Heartbeat/LeaveGroup) against the coordinator.
+/// Returns `None` if `api_key` is not one of them (so the caller can fall through to the unsupported-key error).
+fn dispatch_group_api(
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    reader: &mut Reader,
+    coordinator: &GroupCoordinator,
+) -> io::Result<Option<Vec<u8>>> {
+    let resp = match api_key {
+        API_JOIN_GROUP => {
+            let req = parse_join_group(reader, api_version)?;
+            let protocols: Vec<(String, Vec<u8>)> =
+                req.protocols.into_iter().map(|p| (p.name, p.metadata)).collect();
+            let o = coordinator.join(
+                &req.group_id,
+                &req.member_id,
+                req.session_timeout_ms,
+                req.rebalance_timeout_ms,
+                &req.protocol_type,
+                &protocols,
+            );
+            let resp = JoinGroupResponse {
+                error_code: o.error_code,
+                generation: o.generation,
+                protocol: o.protocol,
+                leader: o.leader,
+                member_id: o.member_id,
+                members: o.members,
+            };
+            join_group_response(api_version, correlation_id, &resp)
+        }
+        API_SYNC_GROUP => {
+            let req = parse_sync_group(reader, api_version)?;
+            let assignments: Vec<(String, Vec<u8>)> =
+                req.assignments.into_iter().map(|a| (a.member_id, a.assignment)).collect();
+            let o = coordinator.sync(&req.group_id, &req.member_id, req.generation_id, &assignments);
+            sync_group_response(api_version, correlation_id, o.error_code, &o.assignment)
+        }
+        API_HEARTBEAT => {
+            let req = parse_heartbeat(reader, api_version)?;
+            let code = coordinator.heartbeat(&req.group_id, &req.member_id, req.generation_id);
+            heartbeat_response(api_version, correlation_id, code)
+        }
+        API_LEAVE_GROUP => {
+            let (group_id, member_id) = parse_leave_group(reader, api_version)?;
+            let code = coordinator.leave(&group_id, &member_id);
+            leave_group_response(api_version, correlation_id, code)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(resp))
 }
 
 /// Resolve a parsed `Fetch` request against the broker: un-seal each partition's records at the edge into a v2

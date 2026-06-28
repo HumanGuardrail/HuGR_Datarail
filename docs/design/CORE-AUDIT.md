@@ -1,5 +1,52 @@
 # CORE-AUDIT — brutal adversarial audit of the two pillars (seal-core + exactly-once/durability)
 
+## 4-way Opus audit (2026-06-27) — owner-requested; concurrency findings fixed, others stale/honesty
+
+Four independent Opus auditors ran in parallel (worktree-isolated) over the whole repo: (1) Kafka concurrency +
+wire, (2) crypto + provider-blind, (3) durability + exactly-once, (4) parse-safety + charter + honesty. **Meta-issue:
+auditors 2/3/4's worktrees branched from a STALE base (`d094023`, pre-increment-2/3/4b + pre-fixes), so their
+CRITICAL/HIGH findings were against OLD code.** Auditor 1 noticed the staleness and re-audited current `main`
+(`3dbdab9`) directly. The lead cold-verified EVERY finding against current `main` (AP-5):
+
+- **FIXED (auditor 1, valid — current main):** (MEDIUM) `SyncGroup` accepted assignments from any member → a
+  follower could drive the group Stable + inject assignment bytes; now leader-only (regression test). (LOW)
+  `generation` `wrapping_add` could wrap to the `-1` sentinel → `checked_add(1).unwrap_or(1)`. (LOW) a follower's
+  `SyncGroup` parked on a fixed coordinator timeout → now honors the member's own `rebalance_timeout`.
+- **REJECTED as STALE (cold-verified already-fixed/wired on `3dbdab9`):** WAL delivered-but-unacked loss (ack-floor
+  resume present, `wal/src/lib.rs:151,169`); Kafka ingest acks-before-durable (ack-AFTER-durable via the `done`
+  channel, `serve.rs:158-186`); Tier-A `commit_at` not wired (`select_sink`→`AnySink::Txn`→`commit_at`, proven by
+  `connectors-live.yml`); Kafka EOS dedup = per-process counter (the Kafka path uses `eos_stream_id`; the
+  `datarail-run-N` key is the `run` path where the Postgres watermark is the EOS authority); Kafka offsets in-RAM /
+  "no kafka_store" (the durable `kafka_store::SealedPartitionLog` exists); X25519 `was_contributory` "missing" (it's
+  at `crypto/src/lib.rs:58`); cofre `expect()` (already saturating casts); CI gate "absent" (`ci.yml` exists).
+- **FIXED (auditor 4 honesty, valid on main):** the OMB `~72×` and throughput `~1.4 GB/s` "n=3, σ1.6/tight" labels
+  are 3 MANUAL dispatches transcribed (the harness runs n=1 per dispatch) — labels refined in `LASTRO-MATRIX.md`
+  (Standing rule + rows), an automated n=3 loop TRACKED; `COMPETITIVE-SCORECARD` ~40× clarified as an earlier
+  non-durable comparison vs the authoritative fsync-vs-fsync ~72×. (DOD-01 GATE-WARP per-core staleness auditor 4
+  flagged was already reconciled in a prior commit — re-verified.) Crypto seal-core + parse-safety: CLEAN (even on
+  the stale base, and unchanged/strengthened since).
+
+**Re-run of the 3 stale lanes against current `main` (`76632bc`, with an anti-staleness self-sync):**
+- **Durability — CLEAN.** The auditor synced to `76632bc`, re-verified the WAL ack-floor fix with TWO fresh
+  adversarial crash tests (ack the second-half / ack-every-even-with-gaps → zero loss), and confirmed
+  kafka_store / offsets / postgres_sink / the ack-after-durable wiring sound. **1 LOW (FIXED):** the ingest
+  produce-response advanced the reported base offset even on a FAILED (code-56) batch → a producer retry saw a
+  non-contiguous gap (no loss/dup — the sink watermark is the EOS authority; producer-visible contiguity only).
+  Fixed: advance the reported base ONLY on code 0 (`serve.rs`).
+- **Parse-safety + charter — CLEAN.** Synced to `76632bc`; ran `cargo clippy --workspace --all-targets -- -D
+  warnings` → zero warnings; verified `bounded_count` in EVERY kafka array parse, all non-kafka decoders bounded,
+  only the sanctioned shmem `unsafe`, the CI grep gates correct, no honesty regression.
+- **Crypto — CLEAN (its lone finding REJECTED as stale).** This auditor FAILED to self-sync (wrongly concluded
+  its `d094023` worktree was current) and reported "X25519 `was_contributory` missing" + "no kafka_store" — both
+  FALSE on real `main` (cold-verified: `was_contributory` is at `crypto/src/lib.rs:58`; `kafka_store.rs` exists).
+  Its seal-core verifications (provider-blind holds, AAD binding, domain separation, sealed-sender, CSPRNG
+  clone-resistance, `Once` gate) are valid (that code is unchanged) → seal core CLEAN.
+
+**Net of the whole 4-way audit + re-run:** all real findings fixed (3 concurrency + 1 durability-cosmetic); every
+CRITICAL/HIGH was a stale-worktree artifact already fixed on `main` (cold-verified). The codebase is concurrency-,
+durability-, crypto-, and parse-sound on `76632bc`+.
+
+
 > Two hostile background auditors attacked the code the whole product rests on: the **sealing core** (crypto +
 > cofre + terminal — the provider-blind guarantee) and the **exactly-once / no-loss core** (once + broker + topic
 > + offsets). Both were disciplined and cold-verified with PoCs. This is the honest record: every finding, its

@@ -28,7 +28,7 @@ struct ApiRange {
 /// `InitProducerId` is advertised at v0/v1 only (non-flexible) — enough for an idempotent (non-transactional)
 /// producer. `Fetch`/`ListOffsets` are the CONSUME side (only the `kafka-broker` mode serves them; advertising
 /// them is harmless for ingest-only producers). All are non-flexible versions (no KIP-482 tagged fields).
-const SUPPORTED: [ApiRange; 9] = [
+const SUPPORTED: [ApiRange; 13] = [
     ApiRange { key: API_PRODUCE, min: 0, max: 7 },
     ApiRange { key: crate::consume::API_FETCH, min: 0, max: 4 },
     ApiRange { key: crate::consume::API_LIST_OFFSETS, min: 0, max: 2 },
@@ -39,6 +39,12 @@ const SUPPORTED: [ApiRange; 9] = [
     ApiRange { key: crate::groups::API_OFFSET_COMMIT, min: 0, max: 2 },
     ApiRange { key: crate::groups::API_OFFSET_FETCH, min: 0, max: 2 },
     ApiRange { key: crate::groups::API_FIND_COORDINATOR, min: 0, max: 2 },
+    // Consumer-group REBALANCE (kafka-broker mode): automatic assignment (`KAFKA-REBALANCE-DESIGN.md`).
+    // Non-flexible version caps (group-instance-id / KIP-482 tagged fields are out of scope).
+    ApiRange { key: crate::groups::API_JOIN_GROUP, min: 1, max: 4 },
+    ApiRange { key: crate::groups::API_HEARTBEAT, min: 0, max: 2 },
+    ApiRange { key: crate::groups::API_LEAVE_GROUP, min: 0, max: 2 },
+    ApiRange { key: crate::groups::API_SYNC_GROUP, min: 0, max: 2 },
 ];
 
 /// Build the full `InitProducerId` response (response header v0 + body v0) granting `producer_id` with epoch 0.
@@ -111,7 +117,8 @@ pub fn parse_metadata_topics(reader: &mut Reader) -> io::Result<Vec<String>> {
 }
 
 /// Build the full `Metadata` response (response header v0 + body) for `req_version` (0 or 1). Advertises this
-/// process as the single broker `node 0` at `host:port`, and each requested topic as a single partition led by us.
+/// process as the single broker `node 0` at `host:port`, and each requested topic as `partitions` partitions
+/// (indices `0..partitions`), all led by us. `partitions` is clamped to `>= 1`.
 #[must_use]
 pub fn metadata_response(
     req_version: i16,
@@ -119,6 +126,7 @@ pub fn metadata_response(
     host: &str,
     port: i32,
     topics: &[String],
+    partitions: i32,
 ) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
@@ -147,14 +155,17 @@ pub fn metadata_response(
             w.int8(0); // is_internal = false
         }
         // partitions: ARRAY of { error_code INT16, partition INT32, leader INT32, replicas ARRAY<INT32>, isr ARRAY<INT32> }
-        w.int32(1);
-        w.int16(0); // error_code
-        w.int32(0); // partition_index 0
-        w.int32(0); // leader = node 0
-        w.int32(1);
-        w.int32(0); // replicas = [0]
-        w.int32(1);
-        w.int32(0); // isr = [0]
+        let n = partitions.max(1);
+        w.int32(n);
+        for p in 0..n {
+            w.int16(0); // error_code
+            w.int32(p); // partition_index
+            w.int32(0); // leader = node 0
+            w.int32(1);
+            w.int32(0); // replicas = [0]
+            w.int32(1);
+            w.int32(0); // isr = [0]
+        }
     }
     w.into_bytes()
 }

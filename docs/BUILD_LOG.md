@@ -854,6 +854,27 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   len-last / put-before-evict ordering sound); X25519 `was_contributory` (already implemented); the fork-safety
   comment (accurate). **Tracked (defense-in-depth / non-product tier):** secret zeroize-on-drop, replicated-topic
   dedup, WAL cursor CRC, a few bounded caps + fuzz gaps. forbid(unsafe); no #[allow]; touched crates green.
+- 2026-06-27 — **✅ Kafka MULTI-PARTITION increment 4a (`af38d8c`).** `metadata_response` advertises N partitions
+  (was hardcoded 1); `serve_broker` threads a count; CLI `--partitions N` (default 1). The durable store already
+  keys lazily per `(topic, partition)`, so each partition is an INDEPENDENT log + offset space — no store change.
+  Proven full-binary (`kafka_multipartition_wire.rs`): `--partitions 3` → Metadata advertises 3; produce to
+  partition 2 → fetch partition 2 gets them, partition 0 independent+empty, partition 0 its own offset space.
+  Self-audited (proportionate: small mechanical change over already-audited machinery — no new exploitable
+  surface). Docs: KAFKA-COMPAT, LASTRO-MATRIX. **Next: increment 4b (automatic group rebalance) — DESIGN FROZEN**
+  in `KAFKA-REBALANCE-DESIGN.md` (JoinGroup/SyncGroup/Heartbeat/LeaveGroup coordinator state machine; the
+  highest-concurrency-risk arc → frozen as design-first, to implement + adversarially audit as its own increment).
+- 2026-06-27 — **✅ Kafka automatic group REBALANCE increment 4b (`ed6b1eb`/`ca8bc34`/`98362a4`).** Built the
+  single-node consumer-group coordinator (`coordinator.rs`: Empty→PreparingRebalance→CompletingRebalance→Stable,
+  one Mutex+Condvar, lazy session expiry, bounded `wait_timeout` parks — no deadlock) + the wire codec
+  (`groups.rs`: JoinGroup v1–4 / SyncGroup v0–2 / Heartbeat v0–2 / LeaveGroup v0–2) + `serve_broker` dispatch
+  (Arc<GroupCoordinator> shared across connection threads) + ApiVersions. A join during CompletingRebalance/Stable
+  RESTARTS the rebalance (caught while writing the tests — a late member must not join a finalized generation).
+  PROVEN: coordinator unit tests with REAL concurrent joiner threads + the FULL-BINARY `kafka_rebalance_wire.rs`
+  (two consumers JoinGroup→SyncGroup→Heartbeat → one generation, leader's assignments routed, both stable).
+  forbid(unsafe); clippy -D warnings, NO #[allow] (removed a too_many_arguments allow that would breach the CI
+  gate; bundled the JoinGroup response into a struct instead). Docs: KAFKA-REBALANCE-DESIGN (BUILT+PROVEN),
+  KAFKA-COMPAT, LASTRO-MATRIX. **PENDING: the concurrency-focused adversarial audit (part of the owner-requested
+  4-way Opus brutal audit, next).**
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 
