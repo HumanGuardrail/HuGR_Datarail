@@ -11,10 +11,11 @@ workspace = true
 [features]
 # Accept COMPRESSED producer batches (KAFKA-COMPRESSION-DESIGN.md). Off by default → the crate stays
 # dependency-free and rejects compressed batches (as before). Each codec is a pure-Rust, decompress-only sub-feature.
-compression = ["compression-gzip", "compression-lz4", "compression-zstd"]
+compression = ["compression-gzip", "compression-lz4", "compression-zstd", "compression-snappy"]
 compression-gzip = ["dep:flate2"]
 compression-lz4 = ["dep:lz4_flex"]
 compression-zstd = ["dep:ruzstd"]
+compression-snappy = ["dep:snap"]
 
 [dependencies]
 # gzip decompression (Kafka codec 1). Pure-Rust miniz_oxide backend (no C), decompress-only. Feature-gated. WAIVER.
@@ -23,3 +24,6 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"],
 lz4_flex = { version = "0.11", default-features = false, features = ["frame"], optional = true }
 # zstd decompression (Kafka codec 4). Pure-Rust DECODER (no C, unlike the `zstd` crate). Feature-gated. WAIVER.
 ruzstd = { version = "0.8", optional = true }
+# snappy raw-block decompression (Kafka codec 2 — wrapped in xerial/snappy-java framing we parse ourselves).
+# Pure-Rust. Feature-gated. WAIVER.
+snap = { version = "1", optional = true }

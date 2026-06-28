@@ -590,7 +590,7 @@ mod tests {
 
     /// Re-frame a plain (uncompressed) v2 batch as a compressed one: set the attributes codec + swap in the
     /// compressed records blob + fix batchLength. Header is 61 bytes; attributes at [21..23]; batchLength at [8..12].
-    #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
+    #[cfg(any(feature = "compression-lz4", feature = "compression-zstd", feature = "compression-snappy"))]
     fn reframe_compressed(plain: &[u8], codec: i16, compressed: &[u8]) -> Vec<u8> {
         let mut out = plain[..61].to_vec();
         out[21..23].copy_from_slice(&codec.to_be_bytes());
@@ -630,5 +630,21 @@ mod tests {
         zstd.extend_from_slice(records);
         let out = reframe_compressed(&plain, 4, &zstd);
         assert_eq!(parse_record_batch(&out).expect("zstd batch parses").values, values);
+    }
+
+    #[test]
+    #[cfg(feature = "compression-snappy")]
+    fn parse_snappy_xerial_compressed_v2_batch() {
+        // Kafka snappy = xerial/snappy-java framing: magic + version + compat-version + [block_len][raw-snappy block].
+        let values = vec![b"evt:sn-a".to_vec(), b"evt:sn-b".to_vec()];
+        let plain = super::build_record_batch(0, &values);
+        let block = snap::raw::Encoder::new().compress_vec(&plain[61..]).expect("snappy compress");
+        let mut xerial = vec![0x82u8, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00];
+        xerial.extend_from_slice(&1i32.to_be_bytes()); // version
+        xerial.extend_from_slice(&1i32.to_be_bytes()); // compatible version
+        xerial.extend_from_slice(&i32::try_from(block.len()).expect("len").to_be_bytes());
+        xerial.extend_from_slice(&block);
+        let out = reframe_compressed(&plain, 2, &xerial);
+        assert_eq!(parse_record_batch(&out).expect("snappy batch parses").values, values);
     }
 }
