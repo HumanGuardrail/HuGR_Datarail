@@ -28,11 +28,13 @@ fn build_conn(
     enable_tls: bool,
     cert: Option<String>,
     key: Option<String>,
+    client_ca: Option<String>,
 ) -> Result<std::sync::Arc<dyn datarail_kafka::serve::ConnWrap>, CliError> {
     if enable_tls {
         let cert = cert.ok_or_else(|| CliError::Arg("--tls requires --tls-cert <pem>".into()))?;
         let key = key.ok_or_else(|| CliError::Arg("--tls requires --tls-key <pem>".into()))?;
-        let conn = tls::TlsConn::from_pem(&cert, &key).map_err(|e| CliError::Io(e.to_string()))?;
+        // client_ca = Some → mutual TLS (require + verify a client cert chaining to that CA).
+        let conn = tls::TlsConn::from_pem(&cert, &key, client_ca).map_err(|e| CliError::Io(e.to_string()))?;
         Ok(std::sync::Arc::new(conn))
     } else {
         Ok(std::sync::Arc::new(datarail_kafka::serve::PlainConn))
@@ -45,6 +47,7 @@ fn build_conn(
     enable_tls: bool,
     _cert: Option<String>,
     _key: Option<String>,
+    _client_ca: Option<String>,
 ) -> Result<std::sync::Arc<dyn datarail_kafka::serve::ConnWrap>, CliError> {
     if enable_tls {
         return Err(CliError::Arg("--tls requires building the binary with `--features tls`".into()));
@@ -967,7 +970,7 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
     let (tx, rx) = std::sync::mpsc::channel::<datarail_kafka::serve::ProducedBatch>();
     let adv = advertised.clone();
-    let conn_wrap = build_conn(tls, tls_cert, tls_key)?;
+    let conn_wrap = build_conn(tls, tls_cert, tls_key, None)?; // kafka-ingest: one-way TLS only (no mTLS)
     std::thread::spawn(move || {
         let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx, &conn_wrap);
     });
@@ -1238,6 +1241,7 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
     let mut tls = false;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut tls_client_ca: Option<String> = None;
     let mut sasl_user: Option<String> = None;
     let mut sasl_pass: Option<String> = None;
     let mut i = 1;
@@ -1275,6 +1279,10 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
                 tls_key = Some(require(rest, i + 1, "pem")?.to_string());
                 i += 2;
             }
+            "--tls-client-ca" => {
+                tls_client_ca = Some(require(rest, i + 1, "pem")?.to_string());
+                i += 2;
+            }
             "--sasl-user" => {
                 sasl_user = Some(require(rest, i + 1, "user")?.to_string());
                 i += 2;
@@ -1309,7 +1317,10 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
         if tls { " [TLS]" } else { "" },
         if sasl_creds.is_some() { " [SASL/PLAIN]" } else { "" }
     );
-    let conn_wrap = build_conn(tls, tls_cert, tls_key)?;
+    if tls_client_ca.is_some() && !tls {
+        return Err(CliError::Arg("kafka-broker: --tls-client-ca (mutual TLS) requires --tls".into()));
+    }
+    let conn_wrap = build_conn(tls, tls_cert, tls_key, tls_client_ca)?;
     datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store, &conn_wrap, sasl_creds)
         .map_err(|e| CliError::Io(e.to_string()))?;
     Ok(String::new())
