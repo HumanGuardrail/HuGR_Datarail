@@ -38,10 +38,10 @@
 | **exactly-once into Postgres across crashes (Tier A)** | TxnSink | `PostgresSink::commit_at` + `tests/postgres_live.rs` (incl. grown-source partial-overlap) | live PG: batch + 3 replays → 4 rows; grown batch → suffix-only | **BACKED** — watermark stored transactionally in the DB; idempotent at RECORD granularity (`base = watermark - records.len()`), not just batch |
 | **exactly-once END-TO-END through the product CLI (append-ordered source)** | Tier A wiring | `datarail run --source-file --sink-postgres` (default Tier A for ordered sources) + `connectors-live.yml` replay+grow assertion | live PG: file source ×2 (identical replay) → **3 rows**; append +1 & re-run → **4, not 7**; `--at-least-once` → doubles (as labelled) | **BACKED/MEASURED** (2026-06-27) — the Postgres-resident watermark enforces once-ness across invocations. **Scope (audit F1):** the count-watermark is *positional* → sound only for an append-ordered/replayable source (file/replay/inline). **HTTP & Kafka-ingest are at-least-once** (a GET / merged-partition stream is not a stable position) — no false exactly-once, no silent loss |
 | **persistent dedup survives restart (Tier C)** | FileOnce | `datarail-once/src/persist.rs` | crash-tested: dedup + above-watermark keys + torn-tail | **BACKED** — restart no longer floods dups; bounded ≤1 (file/webhook) |
-| **~72× less RAM @ equal fsync durability, ~92× idle** | OMB Run 12 | `bench/omb/run-omb.sh` + `omb-benchmark.yml` (`kafka_fsync`) | **n=3, σ1.6** | **BACKED** (the headline) |
+| **~72× less RAM @ equal fsync durability, ~92× idle** | OMB Run 12 | `bench/omb/run-omb.sh` + `omb-benchmark.yml` (`kafka_fsync`) | **n=3, σ1.6** — but across **3 MANUAL dispatches** (the harness runs n=1 per dispatch; an automated n=3 loop is TRACKED, 2026-06-27 audit) | **BACKED** (the headline) — the regime (tens vs hundreds of MB) is robust; the n=3 is honestly 3 transcribed runs, not one automated triplet |
 | FASP holds flat / TCP collapses past 15% loss (real netem) | WAN-RESULTS | `bench/wan/netem-fasp-vs-tcp.sh` + `wan-bench.yml` | n=2, labelled DIRECTIONAL, no headline × | **BACKED** (honest n=2) |
 | FASP "16.3/29.6/42.1×" *specific* multipliers | DOD-01, scorecard | `fasp_vs_lossbased.rs` asserts only **>1.5× + widening** | one seed | **SINGLE-SAMPLE** → flagged |
-| throughput: sealed engine **~1.4 GB/s @1KB (TIE, ~0.87× Kafka)** | THROUGHPUT-RESULTS | `loadgen.yml` ×3 | **n=3, tight** | **BACKED** — n=3 corrected the n=1 "1900/WINS" down to a TIE |
+| throughput: sealed engine **~1.4 GB/s @1KB (TIE, ~0.87× Kafka)** | THROUGHPUT-RESULTS | `loadgen.yml` ×3 | **n=3, tight** (3 dispatches transcribed) | **BACKED** (direction = TIE is robust) — n=3 corrected the n=1 "1900/WINS" down to a TIE; like the RAM headline, the n=3 is 3 manual runs, not one automated triplet |
 | **cold-start: datarail p50 2 ms vs Kafka p50 5.1 s** | COLD-START-RESULTS | `bench/cold-start/cold-start.sh` + `cold-start.yml` | **n=30/5 controlled CI, datarail spread=0** | **BACKED** (gap closed 2026-06-26) |
 | GATE-WARP (re-scoped to intent, owner-ratified) | DECISION-GATE-WARP | `loadgen.yml` (VAES, committed) | aggregate ~2.3 GB/s ÷ 51 MB/s ≈ 45× (≥10× bar) | **BACKED/PASS** — per-core ~134 MB/s recorded as known characteristic (per-record-bound); original per-core metric retired (disproven premise) |
 | Run 11 "~67×, 13 MB vs 877 MB" | OMB Run 11 | OMB harness | n=1 (self-stated) | **STALE** → superseded by Run 12 (n=3) |
@@ -59,7 +59,11 @@
 
 ## Standing rule
 Before any number is written as PROVEN/MEASURED in a doc or the HTML, it must trace to a committed `cargo test`
-gate or a committed `bench/` + workflow, run at n>1 (or exhaustively). The one durable benchmark headline that
-meets this fully now are **~72× RAM (Run 12, n=3)** and **cold-start (2 ms vs 5.1 s, n=30/5 controlled CI)**;
+gate or a committed `bench/` + workflow, run at n>1 (or exhaustively). **Honesty refinement (2026-06-27 audit):**
+only **cold-start (2 ms vs 5.1 s, n=30/5)** is reproduced by a SINGLE committed harness invocation (the
+`cold-start.yml` loop runs n=30 in one dispatch). The **~72× RAM** and **~1.4 GB/s throughput** n=3 figures are
+3 *manual dispatches* transcribed into the results docs — real and consistent, but the harness runs n=1 per
+dispatch; automating the n=3 loop (so one dispatch emits the triplet + σ) is TRACKED. The benchmark headlines that
+meet the rule most fully are **~72× RAM (Run 12, n=3 manual)** and **cold-start (2 ms vs 5.1 s, n=30/5 automated)**;
 FASP-WAN (n=2) and the directional throughput / GATE-WARP figures are honestly labelled below PROVEN until their
 n≥3 / real-WAN / VAES-artifact work lands.
