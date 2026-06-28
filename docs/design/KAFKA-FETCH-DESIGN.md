@@ -1,18 +1,25 @@
 # KAFKA-FETCH-DESIGN — provider-blind Kafka CONSUME (the bidirectional drop-in)
 
-> **STATUS: increment 1 BUILT + PROVEN (2026-06-27).** `datarail kafka-broker` serves Produce (seal+store) +
-> Fetch (un-seal at the edge) + ListOffsets over the real Kafka wire. Built: a hand-rolled `CRC-32C` +
+> **STATUS: increment 2 BUILT + PROVEN + AUDITED (2026-06-27).** `datarail kafka-broker` serves Produce
+> (seal+store) + Fetch (un-seal at the edge) + ListOffsets over the real Kafka wire, backed by a **durable,
+> provider-blind on-disk store that survives a restart**. Built (incr 1): a hand-rolled `CRC-32C` +
 > `build_record_batch` (a real consumer accepts the batch), the `consume` codec (Fetch v0–4 / ListOffsets v0–2),
 > `serve_broker` + the `KafkaBroker` trait, `DestTerminal::open` (read-only verify+decrypt, no dedup so re-fetch
-> is idempotent), and the CLI sealed in-memory store. PROVEN: the store unit test (storage holds sealed
-> ciphertext — provider-blind — and un-seals on fetch; idempotent re-fetch; bounds) + the FULL wire test
-> (`kafka_broker_wire.rs`: the real binary, produce 3 → fetch back the plaintext, suffix fetch, ListOffsets → 3).
-> **Honest scope:** the store is **in-memory** (provider-blind but not durable across restart) — durable
-> `datarail-topic` backing is increment 2; single partition; no consumer groups; produce hop plaintext (seal-on-
-> ingest). **AUDITED CLEAN (2026-06-27, `CORE-AUDIT.md` §Kafka-CONSUME):** a brutal adversarial pass found NO
-> exploitable bug — cross-route read, forged-cofre injection, malformed-request panic/over-alloc, bad-CRC, and
-> plaintext-leak all DEFEATED; the `offload`→`open_records` refactor is behavior-preserving (every check, same
-> order). Next: increment 2 (durability).
+> is idempotent). Built (incr 2, this update): `kafka_store::SealedPartitionLog` — wraps the proven flat-RAM
+> `datarail-replaylog` (fsync-durable, torn-tail-safe) and maps Kafka's **contiguous logical offset** onto the
+> log's byte offsets, with `fsync`-before-ack and a `--data-dir`; topic names hex-encoded into the path (no
+> traversal). PROVEN: store unit tests (contiguous offsets, **restart recovery**, failed-batch offset stability,
+> `max_bytes`) + the rewritten store test (on-DISK provider-blind check + restart) + the FULL wire test
+> (`kafka_broker_wire.rs`: the real binary, produce 3 → **KILL the broker** → assert on-disk bytes are sealed →
+> **RESTART on the same `--data-dir`** → fetch back the original plaintext). **AUDITED (2026-06-27,
+> `CORE-AUDIT.md` §Kafka-CONSUME + §Kafka-CONSUME-DURABILITY):** incr-1 consume path CLEAN; incr-2 durable store
+> — a failed-batch offset-shift (HIGH) **fixed at root** (reconcile to disk on any append/fsync failure); silent
+> mid-history disk bit-rot offset-renumbering (HIGH) **scoped honestly** (CRC detects it — wrong bytes never
+> returned — but the substrate resyncs past the corrupt segment; outside the clean-crash model, hardening
+> tracked); path/int/concurrency/provider-blind lenses CLEAN.
+> **Honest scope:** durable single-node store, **single partition**, **no consumer groups**
+> (`OffsetCommit`/`OffsetFetch`/group join), produce hop plaintext (seal-on-ingest), no compression. Multi-
+> partition + consumer groups + transactional cross-session EOS + TLS on the Kafka hop are later increments.
 
 
 > Today `kafka-ingest` is one-way: a Kafka producer → datarail seals → an external sink. This adds the **consume**
@@ -70,8 +77,11 @@ and un-seals on `fetch` (decode → `DestTerminal::open` → plaintext). The exi
 untouched — this is an additive second mode (`datarail kafka-broker`).
 
 ## Honest scope / non-goals (stated, not faked)
-- **Increment 1 store is in-memory** (provider-blind but not durable across restart) — durable `datarail-topic`
-  backing is increment 2. We say so.
+- **Increment 2 store is durable on disk** (`kafka_store::SealedPartitionLog` over `datarail-replaylog`,
+  `fsync`-before-ack) and **survives a restart** — proven by a real broker-kill+restart wire test. Offset stability
+  holds across a clean crash and a failed/partial batch; silent mid-history **disk bit-rot** is detected by CRC
+  (wrong bytes never returned) but resyncs past the corrupt segment (renumbers survivors) — a known retained-log
+  limit, outside the crash-consistency model, hardening tracked. (Increment 1 was in-memory.)
 - **No consumer groups / offset-commit coordination** (`OffsetCommit`/`OffsetFetch`/group join) — the consumer
   tracks its own offset (auto.offset.reset / explicit seek). Group coordination is a later increment.
 - **Single partition per topic**, uncompressed, Fetch v0–v4.
@@ -80,11 +90,23 @@ untouched — this is an additive second mode (`datarail kafka-broker`).
 ## Build plan (each step tested; new path audited like the rest)
 1. **This doc.** ✅
 2. `KafkaBroker` trait + `serve_broker` loop + Fetch/ListOffsets parse+build in `datarail-kafka` (wire only,
-   unit-tested with a stub broker).
-3. ApiVersions advertises Fetch+ListOffsets.
-4. CLI `kafka-broker`: the sealed in-memory store + seal-on-produce / un-seal-on-fetch impl.
+   unit-tested with a stub broker). ✅
+3. ApiVersions advertises Fetch+ListOffsets. ✅
+4. CLI `kafka-broker`: the sealed store + seal-on-produce / un-seal-on-fetch impl. ✅ (incr 1 in-memory)
 5. **Faithful wire test:** produce 3 records, then Fetch from 0 → get the 3 plaintext back; assert the STORED
-   bytes are sealed (not the plaintext) — the provider-blind property. ListOffsets returns (0, 3).
-6. (CI) a real Kafka **consumer** (kcat -C / librdkafka) round-trips against `datarail kafka-broker`.
+   bytes are sealed (not the plaintext) — the provider-blind property. ListOffsets returns (0, 3). ✅
+6. (CI) a real Kafka **consumer** (kcat -C / librdkafka) round-trips against `datarail kafka-broker`. *(tracked)*
 7. **Adversarial audit** of the new consume path (un-seal-on-fetch is security-critical — a forged/cross-route
-   cofre must never open; bounds/`max_bytes`/offset must never panic or over-read).
+   cofre must never open; bounds/`max_bytes`/offset must never panic or over-read). ✅ CLEAN (`CORE-AUDIT.md`)
+
+### Increment 2 — durable store ✅ BUILT + PROVEN + AUDITED (2026-06-27)
+8. `kafka_store::SealedPartitionLog` over `datarail-replaylog`: contiguous logical offset ↦ byte offset,
+   `fsync`-before-ack, restart recovery by rescanning the durable log. ✅
+9. `KafkaBrokerStore` uses per-`(topic,partition)` durable logs from a `--data-dir`; topic hex-encoded into the
+   path (no traversal). Board key derived from `(topic, partition, logical offset)` (unique + restart-stable). ✅
+10. **Restart wire test:** produce 3 → KILL the broker → assert on-disk bytes are sealed → RESTART on the same
+    `--data-dir` → fetch back the original plaintext. ✅ (`kafka_broker_wire.rs`)
+11. **Adversarial audit** of the durable path. ✅ (`CORE-AUDIT.md` §Kafka-CONSUME-DURABILITY): failed-batch
+    offset-shift fixed at root; mid-history disk-rot offset-renumber scoped honestly + tracked.
+12. *(tracked, later increments)* durable consumer-group offsets (`datarail-offsets`), multi-partition,
+    transactional cross-session EOS, compression, TLS on the Kafka hop.

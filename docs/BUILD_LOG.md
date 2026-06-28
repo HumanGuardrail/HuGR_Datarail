@@ -810,6 +810,23 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   single partition, no consumer groups, produce hop plaintext (seal-on-ingest). Docs: KAFKA-FETCH-DESIGN,
   KAFKA-COMPAT, README, LASTRO-MATRIX. forbid(unsafe); no #[allow]. (Next: increment 2 durability + adversarial
   audit of the un-seal-on-fetch path — security-critical.)
+- 2026-06-27 — **✅ Kafka CONSUME increment 2 — DURABLE store (`7cbe37f`) + audit fixes (`ae20be9`).** The
+  kafka-broker consume store was in-memory (incr 1: lost on restart). Built `kafka_store::SealedPartitionLog`,
+  wrapping the proven flat-RAM `datarail-replaylog` (fsync-durable, torn-tail-safe): maps Kafka's **contiguous
+  logical offset** onto the log's byte offsets, **fsync-before-ack**, restart recovery by rescanning the durable
+  log; `KafkaBrokerStore` now keeps per-`(topic,partition)` durable logs under a `--data-dir`, topic **hex-encoded**
+  into the path (no traversal), board key from `(topic,partition,logical offset)` (unique + restart-stable).
+  PROVEN: unit tests (contiguous offsets, restart recovery, failed-batch offset stability, max_bytes) + rewritten
+  store test (on-DISK provider-blind + restart) + the FULL wire test (`kafka_broker_wire.rs`: produce 3 → **KILL**
+  the broker → assert on-disk sealed → **RESTART** same `--data-dir` → fetch back the plaintext). **AUDITED**
+  (`CORE-AUDIT.md` §Kafka-CONSUME-DURABILITY): a 7th brutal auditor (isolated worktree) found 2 HIGH + 1 LOW;
+  path/int/concurrency/provider-blind CLEAN. HIGH#2 (failed-batch offset shift) **fixed at root** (reconcile the
+  index to disk on any append/fsync failure; regression test). HIGH#1 (silent mid-history disk-rot renumbers
+  offsets — a `datarail-replaylog` resync property, OUTSIDE the clean-crash model, CRC-detected so wrong bytes are
+  never returned) **scoped honestly + tracked** (not silently shipped; the proven claim is the clean-crash one).
+  LOW (doc overclaim "a crash" → "a clean crash") fixed. Docs: KAFKA-FETCH-DESIGN, CORE-AUDIT, LASTRO-MATRIX,
+  README. forbid(unsafe); no #[allow]; CLI suite green. (Next tracked: consumer-group offsets via
+  `datarail-offsets`, multi-partition, transactional cross-session EOS, compression, TLS on the Kafka hop.)
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

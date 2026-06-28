@@ -168,3 +168,36 @@ Findings: 3, all INFO/LOW, none a defect — a v0 `ListOffsets` path reachable o
 `ApiVersions` (format correct); unknown-`api_key` drops the connection (fail-safe, no desync); the Fetch `Err`
 arm is effectively dead with the in-memory store (correct defensive code for a future fallible backend). No fix
 required. The security-critical un-seal-on-fetch path holds up to violent probing.
+
+## Kafka-CONSUME-DURABILITY audit (2026-06-27) — brutal adversarial pass on the increment-2 durable store
+
+A seventh auditor (isolated worktree, branched from the committed increment-2 store `7cbe37f`) attacked
+`kafka_store::SealedPartitionLog` + the `KafkaBrokerStore` durable rewrite. **3 findings (2 HIGH, 1 LOW);
+path/int/concurrency/provider-blind lenses CLEAN.** Each finding was lead-cold-verified against source before
+acting (one would-be path-traversal/int-overflow/plaintext-leak set was correctly self-rejected by the auditor).
+
+- **HIGH #2 — failed-batch offset shift → FIXED AT ROOT.** A valid frame appended *before* a later record in the
+  SAME batch failed (oversize record, or disk-full mid-batch) was durable on disk but the live broker never
+  published its offset; on restart `open()` counted it, shifting every subsequently-acked record's logical offset
+  (an acked offset would point at the wrong record). PoC: batch `["good", >MAX_RECORD]` then `["real-0"]` → live
+  `real-0`@0 but restart `real-0`@1. **Fix:** `append_durable` reconciles the in-memory index to what is actually
+  on disk (shared `scan_starts`) on ANY append/`fsync` failure, so the next produce's base AND a post-restart
+  `open()` agree — a failed batch never silently shifts later offsets. Regression:
+  `a_failed_batch_keeps_logical_offsets_stable_across_restart`.
+- **HIGH #1 — silent mid-history disk-rot renumbers offsets → SCOPED HONESTLY + TRACKED.** A CRC mismatch in a
+  *non-final* segment makes `datarail-replaylog` RESYNC past the corrupt segment (cold-verified at
+  `replaylog/src/lib.rs:346` `resync_or_stop`); the index rebuild then drops that segment's tail and renumbers
+  survivors. This is a storage-integrity failure *outside the crash-consistency model* — corruption is detected
+  (wrong bytes are NEVER returned), and it does **not** affect the clean-crash durability claim (a torn tail is in
+  the final segment → clean stop → contiguous index intact). Documented in the module + design non-goals; hardening
+  (per-record durable logical ids / a fail-loud integrity checkpoint instead of silent renumber) is tracked, not
+  claimed. *(Not a silently-shipped gap: the proven claim is precisely the clean-crash one.)*
+- **LOW — doc overclaim → FIXED.** The module doc said "a crash … never loses an acked record"; softened to "a
+  *clean* crash", matching what is proven.
+
+**CLEAN lenses (cold-verified):** `partition_dir` hex-encodes the topic (charset `0-9a-f`, then `-{partition}`) →
+no `/`/`..`/NUL reaches a path component, injective even for negative partitions; wire-controlled `fetch` offset
+(`usize::try_from(..).unwrap_or(MAX)` → empty) and `max_bytes` (≤0 → exactly one record, the progress guarantee)
+never panic/over-read; single `Mutex`, poisoning via `into_inner`, no nested locks → no deadlock; the board key
+`kbroker-{topic}-…` is HMAC'd into `idempotency_key` and the carga is ciphertext → no plaintext (nor the topic)
+reaches disk. Provider-blind-on-disk additionally proven by the rewritten store test + the restart wire test.

@@ -38,10 +38,12 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
 
 ## What is NOT implemented (honest limits — do not claim these)
 - **Consumer side EXISTS now** (`kafka-broker` mode: `Fetch`, `ListOffsets`) — an unmodified consumer reads back,
-  un-sealed at the edge, from a provider-blind (sealed) store. **Honest limits of increment 1:** the store is
-  **in-memory** (not durable across restart — durable `datarail-topic` backing is the next increment); **single
-  partition** per topic; **no consumer-group coordination** (`OffsetCommit`/`OffsetFetch`/group join) — the
-  consumer tracks its own offset (`auto.offset.reset`/seek).
+  un-sealed at the edge, from a provider-blind (sealed) store. The store is **durable on disk** (increment 2:
+  `kafka_store::SealedPartitionLog` over `datarail-replaylog`, `fsync`-before-ack, contiguous logical offset) and
+  **survives a restart** (proven by a broker-kill+restart wire test). **Honest limits:** **single partition** per
+  topic; **no consumer-group coordination** (`OffsetCommit`/`OffsetFetch`/group join) — the consumer tracks its own
+  offset (`auto.offset.reset`/seek); offset-stable across a clean crash + failed batch, with silent mid-history
+  disk-rot renumbering a known retained-log limit (CRC-detected; hardening tracked — `CORE-AUDIT.md`).
 - **No compression** (gzip/snappy/lz4/zstd). A compressed batch is rejected with a clear error. Producers must
   send uncompressed (`compression.type=none`) for now.
 - **No TRANSACTIONAL producer** (the `AddPartitionsToTxn` / `EndTxn` / transaction-coordinator APIs, a stable

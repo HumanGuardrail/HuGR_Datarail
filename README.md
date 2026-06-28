@@ -81,9 +81,11 @@ storage holding only **sealed** records (un-sealed only at the fetch edge — a 
 provider-blind):
 
 ```sh
-datarail kafka-broker examples/rail.toml --advertised <reachable-host>
-# Produce (seal+store) + Fetch (un-seal at the edge) + ListOffsets. Verified e2e: produce 3 → fetch back the
-# original plaintext, while the stored cofres are ciphertext. (v1: in-memory store, single partition.)
+datarail kafka-broker examples/rail.toml --advertised <reachable-host> --data-dir ./datarail-kafka-data
+# Produce (seal+store) + Fetch (un-seal at the edge) + ListOffsets. Storage is DURABLE (fsync-before-ack) and
+# provider-blind: verified e2e produce 3 → KILL the broker → restart → fetch back the original plaintext, while
+# the on-disk cofres are ciphertext. (Durable single-node store, single partition; consumer groups + multi-
+# partition tracked.)
 ```
 
 Lower-level rehearsals (files, two-process TCP, identity pairing):
