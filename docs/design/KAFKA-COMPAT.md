@@ -82,8 +82,11 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
   per-partition exactly-once. The faithful marker/LSO model (concurrent same-partition txns + a true
   `read_uncommitted`) is tracked future work.
 - **TLS on the Kafka hop EXISTS now** (server-side termination, `--features tls`: `--tls --tls-cert --tls-key`,
-  `KAFKA-TLS-DESIGN.md`) — encrypts hop (1). **No SASL yet**, and **no mTLS / client-cert** yet (one-way auth). See
-  the security posture below.
+  `KAFKA-TLS-DESIGN.md`) — encrypts hop (1). **SASL/PLAIN auth EXISTS now** (`--sasl-user`/`--sasl-pass`,
+  `KAFKA-SASL-DESIGN.md`): a client must authenticate (`SaslHandshake` → `SaslAuthenticate`, mechanism `PLAIN`)
+  before any other API; proven against real librdkafka (`kafka-broker-sasl.yml`). Pair `--sasl-*` with `--tls` for
+  `SASL_SSL` (PLAIN sends the password in the clear). **No SCRAM/GSSAPI yet** (single credential, PLAIN only); **no
+  mTLS / client-cert** yet. See the security posture below.
 - **Single partition per topic, single broker.** No real partitioning/replication on the Kafka-facing side — the
   durability/replication is datarail's own (the rail + substrate), not Kafka-style partition replicas.
 
