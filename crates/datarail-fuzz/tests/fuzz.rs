@@ -248,3 +248,69 @@ fn kafka_produce_parsers_never_panic_on_garbage() {
         let _ = parse_record_batch(&buf); // v2/legacy dispatch on arbitrary bytes
     }
 }
+
+#[test]
+fn kafka_consume_parsers_never_panic_on_garbage() {
+    use datarail_kafka::codec::Reader;
+    use datarail_kafka::consume::{parse_fetch, parse_list_offsets};
+    let mut rng = Rng::new(0x00C0_FFEE_1234);
+    for _ in 0..100_000 {
+        let buf = rng.bytes(192);
+        for version in [0i16, 1, 2, 3, 4, 9] {
+            let mut r = Reader::new(&buf);
+            let _ = parse_fetch(&mut r, version);
+            let mut r2 = Reader::new(&buf);
+            let _ = parse_list_offsets(&mut r2, version);
+        }
+    }
+}
+
+#[test]
+fn kafka_group_parsers_never_panic_on_garbage() {
+    use datarail_kafka::codec::Reader;
+    use datarail_kafka::groups::{
+        parse_find_coordinator, parse_heartbeat, parse_join_group, parse_leave_group, parse_offset_commit,
+        parse_offset_fetch, parse_sync_group,
+    };
+    let mut rng = Rng::new(0x5EA1_ED00_4B1D);
+    for _ in 0..100_000 {
+        let buf = rng.bytes(192);
+        for version in [0i16, 1, 2, 4] {
+            let mut r = Reader::new(&buf);
+            let _ = parse_join_group(&mut r, version); // bounded protocol array on hostile counts
+            let mut r = Reader::new(&buf);
+            let _ = parse_sync_group(&mut r, version); // bounded assignment array
+            let mut r = Reader::new(&buf);
+            let _ = parse_heartbeat(&mut r, version);
+            let mut r = Reader::new(&buf);
+            let _ = parse_leave_group(&mut r, version);
+            let mut r = Reader::new(&buf);
+            let _ = parse_offset_commit(&mut r, version);
+            let mut r = Reader::new(&buf);
+            let _ = parse_offset_fetch(&mut r, version);
+            let mut r = Reader::new(&buf);
+            let _ = parse_find_coordinator(&mut r, version);
+        }
+    }
+}
+
+#[test]
+fn kafka_metadata_parser_never_panics_on_garbage() {
+    use datarail_kafka::codec::Reader;
+    use datarail_kafka::handlers::parse_metadata_topics;
+    let mut rng = Rng::new(0xD15E_A5ED_0042);
+    for _ in 0..100_000 {
+        let buf = rng.bytes(160);
+        let mut r = Reader::new(&buf);
+        let _ = parse_metadata_topics(&mut r); // a huge topic count must bound, never over-allocate
+    }
+}
+
+#[test]
+fn cofre_decode_never_panics_on_garbage() {
+    let mut rng = Rng::new(0xC0FF_EE5E_A100_0042);
+    for _ in 0..100_000 {
+        let buf = rng.bytes(256);
+        let _ = datarail_cofre::decode(&buf); // arbitrary bytes → Err, never panic / OOM (parse-before-verify)
+    }
+}
