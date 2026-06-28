@@ -80,6 +80,14 @@ pub struct Once {
     gc_lag: u64,
 }
 
+/// Wipe the Ed25519 watermark-signing `seed` from memory when the gate is dropped (defense-in-depth: a
+/// long-lived secret should not linger in freed heap / a core dump / swap — complements the redacting `Debug`).
+impl Drop for Once {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.seed);
+    }
+}
+
 /// Redacting `Debug` (AUDIT-02): never print the Ed25519 watermark-signing `seed`.
 impl core::fmt::Debug for Once {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

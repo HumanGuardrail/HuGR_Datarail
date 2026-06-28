@@ -11,3 +11,4 @@ workspace = true
 [dependencies]
 datarail-core = { path = "../datarail-core" }
 datarail-crypto = { path = "../datarail-crypto" }
+zeroize = "1"
