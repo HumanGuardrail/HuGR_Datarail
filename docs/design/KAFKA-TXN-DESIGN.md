@@ -69,6 +69,26 @@ txn state is runtime (a crash aborts in-flight txns) UNLESS we persist it — se
 - v1 of this tier: abort-on-broker-restart (Q3); `read_committed` filtering per the Q2 ruling.
 - NOT: cross-broker txn coordination, exactly-once across a multi-node cluster.
 
+## Steps 5–6 design decision (the delicate isolation core) — DECIDED 2026-06-28
+Two models were weighed for `read_committed` isolation; the decision has real EOS-correctness scope:
+- **Buffer-until-commit (rejected as the primary model).** Hold a txn's records in memory; flush to the durable log
+  only on `EndTxn(commit)`, discard on abort. Then the durable log holds ONLY committed records → no filtering, no
+  markers, no restart-recovery problem. **But** it breaks with **concurrent transactions on the same partition**
+  (two producers each compute a provisional base offset from the log end → overlap) and it makes `read_uncommitted`
+  stricter than Kafka. Acceptable only for the strictly-one-txn-per-partition-at-a-time case.
+- **Full marker / LSO model (CHOSEN).** Transactional records are stored durably and interleaved as produced
+  (real offsets immediately); a durable **un-sealed control marker** (Q1=a) records each `EndTxn` (COMMIT/ABORT) at
+  its offset. The store tracks, per partition, the txn ranges `(producer_id, [start,end), state)`; the **LSO** = the
+  first offset of any still-ongoing txn (everything below it is resolved). `read_committed` Fetch **edge-filters**
+  (Q2=a): return records below the LSO that are not in an aborted range, with an empty aborted-list. On restart
+  (Q3): replay the log + markers to rebuild the ranges; any txn with no terminal marker is treated as **aborted**
+  (its records skipped). This is the Kafka-correct model and the only one sound under concurrent txns + restart.
+- **Implementation shape:** the produce path passes `(producer_id, transactional)` (from the batch attributes bit
+  4 / the `EosCoord`) to the store so it records the range as ongoing; `KafkaBroker` gains `produce_txn` +
+  `end_txn_marker(producer_id, committed, partitions)`; `fetch` gains an isolation flag; the durable marker is a
+  distinct control record in `SealedPartitionLog`. This is the next focused increment (carefully designed +
+  unit-tested + the brutal audit before ANY exactly-once-abort claim).
+
 ## Build plan (once ratified — each step tested + audited, like every prior increment)
 1. **This doc + owner ratification of Q1–Q4.**
 2. `txn.rs`: the `TxnCoordinator` state machine + epoch fencing (unit-tested, no wire).

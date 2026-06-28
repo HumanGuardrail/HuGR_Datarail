@@ -886,6 +886,17 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   every long-lived-secret holder (dest X25519 key, source/sender/once seeds, tenant_secret). Roadmap now
   exhausted of buildable, non-blocked, in-scope items; remaining = owner-decision (TLS/compression deps waiver,
   shmem #24) / external (librdkafka CI, OMB n=3 HW) / large-future (transactional EOS). forbid(unsafe); no #[allow].
+- 2026-06-28 — **🔨 Kafka TRANSACTIONAL EOS — scaffold built (steps 1–4), delicate isolation core (5–6) designed.**
+  Owner re-armed the loop instead of answering the design's open questions → per the autonomy directive I ratified
+  Q1–Q4 myself (`KAFKA-TXN-DESIGN.md`) and built incrementally: (1) `txn.rs` TxnCoordinator + **epoch fencing**
+  (a zombie at a stale epoch is rejected — unit-tested); (3) the non-flexible wire codec (InitProducerId-with-
+  transactional_id / AddPartitionsToTxn / AddOffsetsToTxn / TxnOffsetCommit / EndTxn); (4) serve_broker wiring
+  (Arc<TxnCoordinator>, producer-ids in a distinct 1<<40 range; EndTxn(commit) durably commits staged offsets) +
+  ApiVersions. **HONEST SCOPE:** the protocol drives end-to-end but COMMIT/ABORT markers + `read_committed`
+  isolation are NOT yet built — a transactional ABORT does not yet hide its records → **no exactly-once-abort
+  claim** until steps 5–6 + the audit. **Steps 5–6 DECIDED:** the full marker/LSO model (durable un-sealed markers,
+  per-partition txn-range tracking, edge-filtered `read_committed`, abort-on-restart) over buffer-until-commit
+  (which breaks on concurrent same-partition txns). Commits `5514378`/`03b8e4e`/`80293a1`. kafka 48 green.
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 
