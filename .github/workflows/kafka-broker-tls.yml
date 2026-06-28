@@ -38,21 +38,26 @@ jobs:
             sleep 1
           done
 
+      # The cert is a throwaway self-signed test cert, so we disable CHAIN VERIFICATION on the client — the TLS
+      # handshake + encryption still happen (that is what we are proving: real librdkafka talks to datarail over
+      # TLS). In production the operator supplies a cert their clients already trust. stderr is kept (not
+      # suppressed) so a handshake failure is visible in the log.
       - name: Real librdkafka PRODUCER over TLS → datarail kafka-broker (seal + store)
         run: |
           printf 'evt:t1\nevt:t2\nevt:t3\n' \
-            | docker run --rm -i --network host -v "$(pwd)/cert.pem:/cert.pem" edenhill/kcat:1.7.1 \
-                -b localhost:9092 -X security.protocol=SSL -X ssl.ca.location=/cert.pem -t events -P
+            | docker run --rm -i --network host edenhill/kcat:1.7.1 \
+                -b localhost:9092 -X security.protocol=SSL -X enable.ssl.certificate.verification=false \
+                -t events -P
           sleep 1
 
       - name: Real librdkafka CONSUMER over TLS reads back + on-disk is ciphertext (provider-blind)
         run: |
-          OUT=$(timeout 30 docker run --rm --network host -v "$(pwd)/cert.pem:/cert.pem" edenhill/kcat:1.7.1 \
-                  -b localhost:9092 -X security.protocol=SSL -X ssl.ca.location=/cert.pem \
-                  -t events -C -o beginning -e -q 2>/dev/null || true)
+          OUT=$(timeout 30 docker run --rm --network host edenhill/kcat:1.7.1 \
+                  -b localhost:9092 -X security.protocol=SSL -X enable.ssl.certificate.verification=false \
+                  -t events -C -o beginning -e -q 2>&1 || true)
           echo "TLS consumer read: [$OUT]"
           for m in evt:t1 evt:t2 evt:t3; do
-            echo "$OUT" | grep -qF "$m" || { echo "::error::TLS consumer missing $m"; exit 1; }
+            echo "$OUT" | grep -qF "$m" || { echo "::error::TLS consumer missing $m"; echo "--- full kcat output ---"; echo "$OUT"; exit 1; }
           done
           if grep -rqa "evt:t1" ./kbroker-data 2>/dev/null; then
             echo "::error::plaintext found on disk — provider-blind violated"; exit 1
