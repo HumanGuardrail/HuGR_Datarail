@@ -948,6 +948,24 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   > `Cargo.lock` via the `quic` substrate (no new audit surface), and `rustls-pemfile` is a tiny ring-ecosystem PEM
   > parser. The default binary is unaffected (feature off). remediation: n/a (feature-gated, like `quic`). tracking:
   > `KAFKA-TLS-DESIGN.md`. forbid-unsafe holds (our crates stay unsafe-free; the deps' internal `unsafe` is theirs).
+- 2026-06-28 — **✅ COMPRESSION — accept compressed producer batches (PROVEN vs real librdkafka).** The biggest
+  drop-in wall (real producers default to compression). Behind `--features compression` (default binary stays
+  zero-dep + rejects compressed, as before), the broker decompresses the producer's batch and seals each record;
+  Fetch stays uncompressed (consumers accept it). All four Kafka codecs, pure-Rust **decompress-only**: gzip
+  (flate2/miniz_oxide), lz4 (lz4_flex **frame** format), zstd (ruzstd, no C), snappy (snap). Each bounded by a 16 MiB
+  zip-bomb cap. Decompression is intrinsic to batch parsing so it lives in `datarail-kafka` behind the feature
+  (the cli `compression` feature forwards it). The real-librdkafka CI (`kafka-broker-compression.yml`) is the proof:
+  kcat produces with each `compression.codec` → broker decompresses+seals → consume back, on-disk ciphertext —
+  **all 4 green** (run 28335560570). CI caught that real librdkafka snappy is NOT the xerial framing my unit test
+  assumed → made `unsnappy` liberal (xerial magic → framed; 0xFF → snappy-frame; else → raw block). Commits
+  b591570→c81400a on `kafka-compression` (PR #11). Honest scope: decompress-on-produce; re-compress-on-fetch tracked.
+
+  > **WAIVER (owner-delegated — "siga autônomo", 2026-06-28)** — the zero-dep charter gets four pure-Rust,
+  > decompress-only codec crates behind the optional `compression` feature: `flate2` (rust_backend/miniz_oxide),
+  > `lz4_flex` (frame), `ruzstd` (pure-Rust zstd decoder), `snap`. reason: accepting compressed batches needs codec
+  > support; all are pure-Rust (no C, unlike the `zstd` crate) and decompress-only. The default binary is unaffected
+  > (feature off, like `quic`/`tls`). remediation: n/a (feature-gated). forbid-unsafe holds (our code stays
+  > unsafe-free; the codecs' internal `unsafe` is theirs). tracking: `KAFKA-COMPRESSION-DESIGN.md`.
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 
