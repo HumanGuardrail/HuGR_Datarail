@@ -1,10 +1,15 @@
 //! The `Produce` (API 0) request: parse the request envelope + the v2 `RecordBatch` blob, extract each record's
-//! value bytes (the payload a datarail terminal will seal), and build the response. Uncompressed batches only
-//! (a producer with compression disabled — the default for the common path); a compressed batch is a clear error.
+//! value bytes (the payload a datarail terminal will seal), and build the response. Compressed batches are
+//! decompressed when the `compression` feature is on (`KAFKA-COMPRESSION-DESIGN.md`); otherwise a clear error.
 
 use std::io;
 
 use crate::codec::{write_response_header, Reader, Writer};
+
+/// Cap on a single batch's DECOMPRESSED records size (a zip-bomb guard: a small compressed batch from an untrusted
+/// producer cannot expand to exhaust memory). Matches the serve-layer max frame.
+#[cfg(feature = "compression")]
+const MAX_DECOMPRESSED: usize = 16 * 1024 * 1024;
 
 /// The idempotent-producer identity of a single v2 `RecordBatch` — the stable, retry-invariant coordinate
 /// datarail keys exactly-once on (see `KAFKA-EOS-DESIGN.md`). Present only for a SINGLE idempotent v2 batch
@@ -144,12 +149,14 @@ pub fn parse_record_batch(blob: &[u8]) -> io::Result<ParsedRecords> {
     let mut first_coord: Option<EosCoord> = None;
     while !reader.is_empty() {
         let _offset = reader.int64()?; // baseOffset (v2) / offset (legacy)
-        let _length = reader.int32()?; // batchLength (v2) / messageSize (legacy)
+        let length = reader.int32()?; // batchLength (v2) / messageSize (legacy)
+        // batchLength counts from HERE (partitionLeaderEpoch) to the end of the batch's records.
+        let batch_end = reader.position().saturating_add(usize::try_from(length).unwrap_or(0));
         let _crc_or_epoch = reader.uint32()?; // partitionLeaderEpoch (v2) / crc (legacy)
         let magic = reader.int8()?;
         match magic {
             2 => {
-                let coord = parse_v2_records(&mut reader, &mut values)?;
+                let coord = parse_v2_records(&mut reader, batch_end, &mut values)?;
                 if batches == 0 {
                     first_coord = coord;
                 }
@@ -169,12 +176,10 @@ pub fn parse_record_batch(blob: &[u8]) -> io::Result<ParsedRecords> {
 
 /// Parse the v2 `RecordBatch` fields after the magic byte, pushing each record's value. Returns the
 /// idempotent-producer [`EosCoord`] when the batch carries one (`producer_id >= 0` and `base_sequence >= 0`).
-fn parse_v2_records(reader: &mut Reader, values: &mut Vec<Vec<u8>>) -> io::Result<Option<EosCoord>> {
+fn parse_v2_records(reader: &mut Reader, batch_end: usize, values: &mut Vec<Vec<u8>>) -> io::Result<Option<EosCoord>> {
     let _crc = reader.uint32()?;
     let attributes = reader.int16()?;
-    if attributes & 0x07 != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed batches not supported"));
-    }
+    let codec = u8::try_from(attributes & 0x07).unwrap_or(0); // bits 0-2: 0=none, 1=gzip, 2=snappy, 3=lz4, 4=zstd
     let transactional = attributes & 0x10 != 0; // v2 attributes bit 4 = transactional batch
     let _last_offset_delta = reader.int32()?;
     let _base_timestamp = reader.int64()?;
@@ -185,6 +190,40 @@ fn parse_v2_records(reader: &mut Reader, values: &mut Vec<Vec<u8>>) -> io::Resul
     let record_count = reader.int32()?;
     let n = usize::try_from(record_count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad record count"))?;
+    if codec == 0 {
+        // Uncompressed: the records follow inline; the varint-framed loop self-terminates after `n` records.
+        parse_records_into(reader, n, values)?;
+    } else {
+        // Compressed: the records section (from here to batch_end) is one compressed blob. Decompress it
+        // (feature-gated, bounded) and parse the records from the decompressed bytes.
+        #[cfg(feature = "compression")]
+        {
+            let blob_len = batch_end.saturating_sub(reader.position());
+            let blob = reader.take(blob_len)?;
+            let decompressed = crate::compress::decompress(codec, blob, MAX_DECOMPRESSED)?;
+            let mut inner = Reader::new(&decompressed);
+            parse_records_into(&mut inner, n, values)?;
+        }
+        #[cfg(not(feature = "compression"))]
+        {
+            let _ = batch_end;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed batches not supported"));
+        }
+    }
+    // An idempotent producer stamps producer_id >= 0 + a real base_sequence; a non-idempotent one sends -1.
+    let eos = (producer_id >= 0 && base_sequence >= 0).then_some(EosCoord {
+        producer_id,
+        producer_epoch,
+        base_sequence,
+        count: record_count,
+        transactional,
+    });
+    Ok(eos)
+}
+
+/// Parse `n` v2 records (varint-framed) from `reader`, pushing each non-null value. Shared by the uncompressed
+/// path (reads inline) and the compressed path (reads from the decompressed blob).
+fn parse_records_into(reader: &mut Reader, n: usize, values: &mut Vec<Vec<u8>>) -> io::Result<()> {
     for _ in 0..n {
         let _length = reader.varint()?;
         let _attributes = reader.int8()?;
@@ -201,15 +240,7 @@ fn parse_v2_records(reader: &mut Reader, values: &mut Vec<Vec<u8>>) -> io::Resul
             let _hv = take_varint_bytes(reader)?;
         }
     }
-    // An idempotent producer stamps producer_id >= 0 + a real base_sequence; a non-idempotent one sends -1.
-    let eos = (producer_id >= 0 && base_sequence >= 0).then_some(EosCoord {
-        producer_id,
-        producer_epoch,
-        base_sequence,
-        count: record_count,
-        transactional,
-    });
-    Ok(eos)
+    Ok(())
 }
 
 /// Parse one legacy `MessageSet` message (magic 0/1) after the magic byte, pushing its value. The crc and the
@@ -519,5 +550,41 @@ mod tests {
         b.int32(-1);
         b.int32(1);
         assert!(parse_record_batch(&b.into_bytes()).is_err());
+    }
+
+    /// gzip a byte slice (test helper — the `compression-gzip` feature pulls flate2).
+    #[cfg(feature = "compression-gzip")]
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(data).expect("gz write");
+        enc.finish().expect("gz finish")
+    }
+
+    #[test]
+    #[cfg(feature = "compression-gzip")]
+    fn parse_gzip_compressed_v2_batch_decompresses_and_yields_values() {
+        // Reuse the proven uncompressed builder, then GZIP its records section (header is 61 bytes; attributes at
+        // [21..23]; batchLength at [8..12] counts from offset 12) and re-frame as a gzip (codec 1) batch.
+        let values = vec![b"evt:gz-a".to_vec(), b"evt:gz-b".to_vec(), b"evt:gz-c".to_vec()];
+        let plain = super::build_record_batch(0, &values);
+        let compressed = gzip(&plain[61..]);
+        let mut out = plain[..61].to_vec();
+        out[21..23].copy_from_slice(&1i16.to_be_bytes()); // attributes: gzip codec
+        out.extend_from_slice(&compressed);
+        let batch_len = i32::try_from(out.len() - 12).expect("len");
+        out[8..12].copy_from_slice(&batch_len.to_be_bytes());
+
+        let parsed = parse_record_batch(&out).expect("gzip batch parses");
+        assert_eq!(parsed.values, values, "gzip records were decompressed + parsed in order");
+    }
+
+    #[test]
+    #[cfg(feature = "compression-gzip")]
+    fn gzip_decompress_rejects_a_zip_bomb_past_the_cap() {
+        let big = vec![0u8; 1 << 20]; // 1 MiB of zeros → tiny gzip, expands past a small cap
+        let compressed = gzip(&big);
+        let err = crate::compress::decompress(1, &compressed, 1024).expect_err("must reject over-cap");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

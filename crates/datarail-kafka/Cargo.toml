@@ -8,4 +8,12 @@ description = "datarail-kafka — Kafka wire-protocol ingest: an unmodified Kafk
 [lints]
 workspace = true
 
+[features]
+# Accept COMPRESSED producer batches (KAFKA-COMPRESSION-DESIGN.md). Off by default → the crate stays
+# dependency-free and rejects compressed batches (as before). Each codec is a pure-Rust, decompress-only sub-feature.
+compression = ["compression-gzip"]
+compression-gzip = ["dep:flate2"]
+
 [dependencies]
+# gzip decompression (Kafka codec 1). Pure-Rust miniz_oxide backend (no C), decompress-only. Feature-gated. WAIVER.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"], optional = true }
