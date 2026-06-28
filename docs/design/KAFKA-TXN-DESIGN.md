@@ -1,6 +1,23 @@
 # KAFKA-TXN-DESIGN — transactional producer EOS (the last Kafka exactly-once tier)
 
-> **STATUS: BUILDING (2026-06-27) — Q1–Q4 RATIFIED BY THE TECHLEAD (autonomy directive: design/scope are my call).**
+> **STATUS: BUILT + PROVEN + AUDITED (2026-06-28).** `datarail kafka-broker` serves the transactional producer
+> APIs (`InitProducerId(transactional_id)` with epoch fencing, `AddPartitionsToTxn`, `AddOffsetsToTxn`,
+> `TxnOffsetCommit`, `EndTxn`) on the **buffer-until-commit** model: a transactional batch is FENCED against the
+> coordinator (`produce_check`: epoch + partition-claim) then BUFFERED (keyed by `(producer_id, epoch, topic,
+> partition)`), invisible until `EndTxn(commit)` flushes it to the durable sealed log atomically (offsets too) /
+> `EndTxn(abort)` discards it. PROVEN: `txn.rs` unit tests (epoch fencing, one-txn-per-partition, produce_check,
+> commit/abort) + `kafka_txn_wire.rs` (full binary: buffered→invisible; commit→visible across 2 partitions;
+> abort→hidden; **a stale-epoch zombie is NEVER committed**) + the store epoch-scoped-commit regression.
+> **AUDITED (`CORE-AUDIT.md` §Kafka-TXN): a brutal 4-Opus pass found 3 EOS breaks (unfenced produce / re-init
+> orphan / non-atomic-swallowed commit) — ALL FIXED at root; a confirming re-audit verified them + found 1
+> TOCTOU (the `produce_check`/`buffer_txn` two-lock seam) — FIXED (epoch in the buffer key).** The codec is
+> parse-safe + charter-clean; provider-blind holds (buffered plaintext is sealed before it ever hits disk).
+> **HONEST SCOPE:** correct for **one producer per partition during a txn** (concurrent same-partition → retriable
+> `CONCURRENT_TRANSACTIONS`); `read_uncommitted` behaves like `read_committed`; **abort-on-restart** (in-flight
+> txns abort on a broker restart). The faithful marker/LSO model (concurrent same-partition txns + a true
+> `read_uncommitted`) is tracked future work.
+>
+> **(build history below — Q1–Q4 RATIFIED BY THE TECHLEAD.)**
 > The owner re-armed the autonomous loop rather than answer Q1–Q4, so per the standing "decide+execute, don't ask
 > which-option" directive I ratify them with the recommendations below and build incrementally (each step green +
 > the whole tier audited before any exactly-once claim is made — the delicate semantics are managed by the audit,

@@ -897,6 +897,20 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   claim** until steps 5–6 + the audit. **Steps 5–6 DECIDED:** the full marker/LSO model (durable un-sealed markers,
   per-partition txn-range tracking, edge-filtered `read_committed`, abort-on-restart) over buffer-until-commit
   (which breaks on concurrent same-partition txns). Commits `5514378`/`03b8e4e`/`80293a1`. kafka 48 green.
+- 2026-06-28 — **✅ Kafka TRANSACTIONAL EOS — COMPLETE + AUDITED (steps 5–8).** Implemented the isolation core via
+  **buffer-until-commit** (REVISED from the marker/LSO model: correct-by-construction beats a large delicate
+  surface for an unattended build — rigor compact): a txn batch is buffered (invisible) until `EndTxn(commit)`
+  flushes it to the durable sealed log atomically / abort discards it; `Fetch` unchanged (the log holds only
+  committed records). Added one-txn-per-partition enforcement (`CONCURRENT_TRANSACTIONS`). Proven full-binary
+  (`kafka_txn_wire.rs`: commit-visible-atomic / abort-hidden / zombie-fenced). **AUDITED by a brutal 4-Opus pass
+  (`CORE-AUDIT.md` §Kafka-TXN)** — held the exactly-once-abort claim until the audit, which found **3 EOS breaks**
+  (unfenced produce → zombie/unclaimed commit; re-init orphan; non-atomic-swallowed commit) — **all FIXED at root**
+  (`produce_check` fence, `abort_txn`-on-reinit, `end_txn`/`finish_txn` split + retriable flush, flush-before-remove);
+  a confirming re-audit found **1 TOCTOU** (the produce_check/buffer_txn two-lock seam) — **FIXED** (epoch in the
+  buffer key; commit flushes only the matching epoch). Codec parse-safe + charter-clean; coordinator race-free;
+  provider-blind holds (buffered plaintext sealed before disk). Commits `398098e`→`f1295f3`. **HONEST SCOPE:** one
+  producer per partition/txn; `read_uncommitted`==`read_committed`; abort-on-restart; faithful marker/LSO model
+  tracked. Docs: KAFKA-TXN-DESIGN (AUDITED), CORE-AUDIT, KAFKA-COMPAT, LASTRO-MATRIX, README. kafka 50 + cli green.
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 
