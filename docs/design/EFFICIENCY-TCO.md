@@ -16,7 +16,7 @@
 | RSS under load | ~22 MB *(corrected; draft 7 MB)* | 870 MB | 1,757 MB |
 | CPU under load | 1.24 cores | 1.49 cores | 0.83 cores |
 
-**RAM: this draft said 124× — CORRECTED by the audit to ~40× loaded / ~90× idle (Run 10 re-measure), and ~67× for the durable same-work comparison (Run 11). CPU: ~parity.**
+**RAM: this draft said 124× — CORRECTED. The AUTHORITATIVE figure is the n=3 fsync-vs-fsync same-ruler Run 12: ~72× less RAM (range 69–73×, σ1.6), ~92× idle (`OMB-RESULTS.md`, committed `omb-benchmark.yml`). The earlier 124× (Run 10 n=1) and 67× (Run 11 n=1) are superseded; ~40× loaded / ~90× idle was an intermediate Run-10 re-measure. CPU: ~parity.**
 
 ## Why footprint → dollars: instance sizing is RAM-bound for brokers
 
@@ -114,5 +114,6 @@ And when both endpoints are online, datarail uses **no store at all** — direct
 > **Honest correction:** this Kafka config (stock flush settings) does NOT fsync on the produce path — it acks on
 > the leader's page cache — so datarail-WAL does the *more* durable work AND uses ~67× less RAM (not "the same"
 > work). Caveats kept: single CI run (n=1, no variance bars); ruler not byte-identical (`/proc` VmRSS vs
-> `docker stats`); end-to-end the shim is acks=1; single-node (RF=1, no replication either side). PENDING: a
-> true fsync-vs-fsync Kafka (`log.flush.interval.messages=1`) + same-ruler (both via cgroup) + n≥3 re-run.
+> `docker stats`); end-to-end the shim is acks=1; single-node (RF=1, no replication either side). ~~PENDING: a
+> true fsync-vs-fsync Kafka (`log.flush.interval.messages=1`) + same-ruler + n≥3 re-run.~~ **RESOLVED by Run 12
+> (n=3, σ1.6, fsync-vs-fsync ⇒ ~72×, above)** — this n=1 Run 11 paragraph is retained only for history.

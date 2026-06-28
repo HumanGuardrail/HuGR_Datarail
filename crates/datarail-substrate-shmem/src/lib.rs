@@ -173,17 +173,31 @@ impl Substrate for ShmemRing {
         if total > self.capacity {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame larger than the ring"));
         }
-        let read = self.cell(READ_OFF).load(Ordering::Acquire); // consumer progress
+        let read = self.cell(READ_OFF).load(Ordering::Acquire); // consumer progress — PEER-CONTROLLABLE
         let write = self.cell(WRITE_OFF).load(Ordering::Relaxed); // our own
-        if total > self.capacity - (write - read) {
+        // The consumer's `read` cursor lives in the shared segment and is untrusted (a hostile/corrupt same-host
+        // consumer): `write - read` must not underflow (`read > write` → usize wraparound → a bogus "free" that
+        // bypasses back-pressure and publishes a corrupt cursor), mirroring the guard in `recv`. Both subtractions
+        // are checked.
+        let Some(used) = write.checked_sub(read) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursors (read > write)"));
+        };
+        let Some(free) = self.capacity.checked_sub(used) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursors (used > capacity)"));
+        };
+        if total > free {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "shmem ring full (back-pressure)"));
         }
+        // `write` also lives in the shared segment; guard the advance against a corrupted cursor (checked_add).
+        let Some(next_write) = write.checked_add(total) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "corrupt shmem ring cursor (write overflow)"));
+        };
         let mut frame = Vec::with_capacity(total);
         frame.extend_from_slice(&len.to_le_bytes());
         frame.extend_from_slice(&bytes);
         self.write_ring(write, &frame);
         // Publish: the Release pairs with the consumer's Acquire load of WRITE, so the bytes happen-before.
-        self.cell(WRITE_OFF).store(write + total, Ordering::Release);
+        self.cell(WRITE_OFF).store(next_write, Ordering::Release);
         Ok(())
     }
 

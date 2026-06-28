@@ -1,0 +1,50 @@
+name: CI — gates (clippy · tests · forbid-unsafe)
+
+# The enforcement gate the constitution requires ("gates in CI, not prose"): clippy deny(all+pedantic), the full
+# test suite, and the forbid(unsafe) charter run on EVERY push and PR — not just the manually-dispatched benchmark
+# jobs. The lint levels live in each crate's Cargo.toml; this workflow is what actually runs them continuously.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: forbid-unsafe charter — only the sanctioned shmem waiver may allow unsafe
+        run: |
+          # The workspace is #![forbid(unsafe_code)] (enforced at compile time); the ONE sanctioned waiver is the
+          # shmem substrate. Fail if any #[allow(unsafe_code)] appears in tracked src/ outside that crate.
+          stray=$(grep -rn "allow(unsafe_code)" crates --include='*.rs' \
+            | grep -v 'crates/datarail-substrate-shmem/' || true)
+          if [ -n "$stray" ]; then
+            echo "::error::unsanctioned allow(unsafe_code) outside the shmem waiver:"; echo "$stray"; exit 1
+          fi
+          # Also fail on any #[allow(clippy::...)] — the charter forbids silencing lints.
+          stray_clippy=$(grep -rn "allow(clippy::" crates --include='*.rs' || true)
+          if [ -n "$stray_clippy" ]; then
+            echo "::error::allow(clippy::...) is forbidden by the charter:"; echo "$stray_clippy"; exit 1
+          fi
+
+      - name: clippy (deny all + pedantic, no allow)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test (workspace; #[ignore] live/bench tests excluded)
+        run: cargo test --workspace

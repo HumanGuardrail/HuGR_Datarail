@@ -841,6 +841,19 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   `groups` AND the pre-existing `consume`/`produce` parsers; per-partition OffsetCommit error-code LOW fixed. Docs:
   KAFKA-GROUPS-DESIGN, CORE-AUDIT, KAFKA-COMPAT, LASTRO-MATRIX. forbid(unsafe); no #[allow]; workspace green.
   Honest scope: explicit-commit / manual-assignment consumers; automatic rebalance + multi-partition = increment 4.
+- 2026-06-27 — **✅ WHOLE-REPO background audit triaged (all 34 crates) + remediated.** A background auditor swept
+  the repo; every finding cold-verified by the lead before acting (`CORE-AUDIT.md` §Whole-repo). **Fixed:**
+  (CRITICAL) WAL lost delivered-but-un-acked records on crash — `open_with` resumed at the advanced read cursor and
+  discarded the persisted ACK FLOOR → reproduced + fixed (`5b7093c`, regression test); (HIGH) shmem `send`
+  unchecked peer-controllable cursor subtraction → `checked_sub`/`checked_add` (`e24128d`); (HIGH) no continuous CI
+  gate → `ci.yml` runs clippy + tests + forbid-unsafe on push/PR (`3868391`); (INFO) cofre `expect()` in non-test
+  code → saturating casts; (honesty) `DOD-01` stale GATE-WARP `PROVEN PASS @ 1.43/10.5 GB/s/core` reconciled to the
+  owner-ratified re-scope, `EFFICIENCY-TCO` Run-11 `PENDING n≥3` marked resolved by Run 12. **Rejected as
+  stale/incorrect (cold-verified):** "Tier-A `commit_at` not wired" (it is — `AnySink::Txn`→`commit_at`, proven by
+  `connectors-live.yml`); replication + tieredlog "ack/evict before durable" (`FsBlob::put` fsyncs every blob,
+  len-last / put-before-evict ordering sound); X25519 `was_contributory` (already implemented); the fork-safety
+  comment (accurate). **Tracked (defense-in-depth / non-product tier):** secret zeroize-on-drop, replicated-topic
+  dedup, WAL cursor CRC, a few bounded caps + fuzz gaps. forbid(unsafe); no #[allow]; touched crates green.
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

@@ -162,38 +162,41 @@ fn ram_flat_across_full_send_recv_ack_cycle() {
 /// asserts the cost is BOUNDED by the in-flight window and RECLAIMED on ack (so it's not a leak).
 #[test]
 fn unacked_backlog_ram_is_bounded_by_inflight_and_reclaimed_on_ack() {
-    const N: u64 = 80_000;
-    let Some(rss0) = rss_kb() else {
-        eprintln!("skip: /proc not available (non-Linux)");
-        return;
-    };
+    // A clear un-acked backlog. Kept modest because each distinct cofre is a real seal (crypto); the O(in-flight)
+    // -and-reclaimed invariant holds at any N — we assert the map count, not RSS, so a huge N buys nothing.
+    const N: u64 = 500;
+    let rss0 = rss_kb(); // informational only (Some on Linux, None elsewhere) — the invariant below is RSS-free
     let dir = temp_dir("backlog");
     let cfg = WalConfig { flush_bytes: 1 << 20, flush_micros: 200_000, segment_bytes: 4 << 20 };
     let mut log = DurableLog::open_with(&dir, cfg).expect("open");
-    let cofre = cofre_seq(0);
-    for _ in 0..N {
-        log.send(&cofre).expect("send");
+    // DISTINCT cofres → the in-flight map (keyed by cofre_id) genuinely holds one entry per delivered-un-acked
+    // cofre. (A single repeated cofre would collapse to one map entry and prove nothing about the backlog cost.)
+    for seq in 0..N {
+        log.send(&cofre_seq(seq)).expect("send");
     }
     log.flush().expect("flush");
-    // Deliver everything WITHOUT acking → inflight maps hold N entries.
+    // Deliver everything WITHOUT acking → the in-flight map holds N entries.
     let mut ids = Vec::new();
     while let Some(c) = log.recv().expect("recv") {
         ids.push(c.etiqueta.cofre_id);
     }
     assert_eq!(ids.len(), usize::try_from(N).unwrap(), "all delivered");
-    let backlog_rss = rss_kb().unwrap();
-    // Now ack everything → the maps must be released.
+    // The un-acked backlog holds O(in-flight) bookkeeping (one entry per delivered-un-acked cofre).
+    assert_eq!(log.inflight_len(), usize::try_from(N).unwrap(), "the backlog is tracked, O(in-flight)");
+    let backlog_rss = rss_kb();
+    // Now ack everything → the bookkeeping must be RECLAIMED.
     for id in &ids {
         log.ack(*id).expect("ack");
     }
-    let after_ack = rss_kb().unwrap();
-    eprintln!("backlog: rss0 {rss0} → un-acked {backlog_rss} → acked {after_ack} KB");
-    // The point: it is O(in-flight) (grows with the un-acked backlog) and RECLAIMED on ack — not a leak. We do
-    // NOT assert it stays flat under backlog (it doesn't; that's the honest correction).
-    assert!(
-        after_ack < backlog_rss.saturating_sub((backlog_rss - rss0) / 2).max(rss0),
-        "acking a full backlog must reclaim most of the in-flight bookkeeping (un-acked {backlog_rss}, acked {after_ack})"
-    );
+    let after_ack = rss_kb();
+    // Assert the REAL invariant at the data-structure level (allocator-independent, runs on every platform): the
+    // in-flight map is released. RSS reclaim is NOT asserted — glibc malloc keeps freed pages in its arenas, so RSS
+    // need not drop on Linux even though the bookkeeping is gone (that exact false failure showed up on CI). RSS is
+    // an informational print: the honest claim is O(in-flight)-and-reclaimed, proven by the count returning to 0.
+    assert_eq!(log.inflight_len(), 0, "acking the full backlog reclaims ALL in-flight bookkeeping — not a leak");
+    if let (Some(r0), Some(rb), Some(ra)) = (rss0, backlog_rss, after_ack) {
+        eprintln!("backlog RSS: rss0 {r0} → un-acked {rb} → acked {ra} KB (reclaim allocator-dependent; invariant proven by inflight_len)");
+    }
 }
 
 /// REGRESSION GATE for the audit's total-loss bug: a lost cursor checkpoint combined with GC of early segments
@@ -275,6 +278,46 @@ fn corrupt_interior_frame_in_sealed_segment_errors() {
         }
     }
     assert!(errored, "corruption inside a sealed segment must surface as an error, not be silently swallowed");
+}
+
+/// Audit CRITICAL regression: `recv` advances the read cursor on DELIVERY, so a crash after delivering-but-not-
+/// acking some cofres — and acking/checkpointing a LATER one — must RE-DELIVER the un-acked ones on restart, never
+/// skip them. Resuming from the persisted ACK FLOOR (not the advanced read cursor) is what guarantees at-least-once.
+#[test]
+fn delivered_but_unacked_records_are_redelivered_after_a_crash() {
+    const N: u64 = 10;
+    let dir = temp_dir("unacked-redeliver");
+    let acked_seq;
+    {
+        let mut log = DurableLog::open(&dir).expect("open");
+        for seq in 0..N {
+            log.send(&cofre_seq(seq)).expect("send");
+        }
+        log.flush().expect("flush");
+        // Deliver 6, then ack ONLY the 6th (a partial / out-of-order ack) → the first 5 are delivered-but-un-acked.
+        let mut delivered = Vec::new();
+        for _ in 0..6 {
+            delivered.push(log.recv().expect("recv").expect("a cofre"));
+        }
+        let last = delivered.last().expect("6 delivered");
+        acked_seq = last.etiqueta.seq;
+        log.ack(last.etiqueta.cofre_id).expect("ack the 6th only");
+        // DROP here = crash. The 5 delivered-but-un-acked cofres MUST remain re-deliverable.
+    }
+    let mut reopened = DurableLog::open(&dir).expect("reopen");
+    let mut got = std::collections::BTreeSet::new();
+    while let Some(c) = reopened.recv().expect("recv") {
+        got.insert(c.etiqueta.seq);
+        reopened.ack(c.etiqueta.cofre_id).expect("ack");
+    }
+    // At-least-once: every record NOT durably acked before the crash is re-delivered (none lost). The single acked
+    // record may or may not reappear (a harmless duplicate either way) — only loss of an UN-acked record is a bug.
+    for seq in 0..N {
+        if seq == acked_seq {
+            continue;
+        }
+        assert!(got.contains(&seq), "un-acked record {seq} was LOST across the crash (recovered {got:?})");
+    }
 }
 
 fn rss_kb() -> Option<u64> {
