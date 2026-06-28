@@ -10,8 +10,25 @@
 //! `INVALID_PRODUCER_EPOCH`, so a zombie producer from a previous session can never commit into a new one's txn.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, PoisonError};
+
+use crate::codec::{write_response_header, Reader, Writer};
+
+/// `AddPartitionsToTxn` API key.
+pub const API_ADD_PARTITIONS_TO_TXN: i16 = 24;
+/// `AddOffsetsToTxn` API key.
+pub const API_ADD_OFFSETS_TO_TXN: i16 = 25;
+/// `EndTxn` API key.
+pub const API_END_TXN: i16 = 26;
+/// `TxnOffsetCommit` API key.
+pub const API_TXN_OFFSET_COMMIT: i16 = 28;
+
+/// Smallest possible wire size of a topic array entry: a `string` length (2) + a partition-count `int32` (4).
+const MIN_TOPIC_BYTES: usize = 6;
+/// Smallest possible wire size of a partition array entry: at least an `int32`.
+const MIN_PARTITION_BYTES: usize = 4;
 
 /// NONE.
 pub const NONE: i16 = 0;
@@ -219,9 +236,183 @@ impl TxnCoordinator {
     }
 }
 
+// ---- wire codec (non-flexible versions; flexible/tagged-field versions out of scope) ----
+
+fn bounded(count: i32, reader: &Reader, min_entry: usize) -> usize {
+    reader.bounded_count(count, min_entry)
+}
+
+/// Parse an `InitProducerId` request body (v0–v1): returns the `transactional_id` (`None` ⇒ a bare idempotent
+/// producer, not transactional). The `transaction_timeout_ms` is consumed but unused.
+///
+/// # Errors
+/// [`io::Error`] if malformed.
+pub fn parse_init_producer_id(reader: &mut Reader) -> io::Result<Option<String>> {
+    let transactional_id = reader.nullable_string()?;
+    let _transaction_timeout_ms = reader.int32()?;
+    Ok(transactional_id)
+}
+
+/// Build an `InitProducerId` response (v0–v1) — same shape as the idempotent grant, with the assigned epoch.
+#[must_use]
+pub fn init_producer_id_response(correlation_id: i32, producer_id: i64, epoch: i16) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false);
+    w.int32(0); // throttle_time_ms
+    w.int16(NONE); // error_code
+    w.int64(producer_id);
+    w.int16(epoch);
+    w.into_bytes()
+}
+
+/// A parsed `(transactional_id, producer_id, epoch)` prefix shared by the txn APIs.
+struct TxnHeader {
+    transactional_id: String,
+    producer_id: i64,
+    epoch: i16,
+}
+
+fn parse_txn_header(reader: &mut Reader) -> io::Result<TxnHeader> {
+    let transactional_id = reader.string()?;
+    let producer_id = reader.int64()?;
+    let epoch = reader.int16()?;
+    Ok(TxnHeader { transactional_id, producer_id, epoch })
+}
+
+/// A parsed `AddPartitionsToTxn` request.
+#[derive(Debug, Clone)]
+pub struct AddPartitionsRequest {
+    /// Transactional id.
+    pub transactional_id: String,
+    /// Producer id.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub epoch: i16,
+    /// `(topic, partitions)` to enroll.
+    pub topics: Vec<(String, Vec<i32>)>,
+}
+
+/// Parse `AddPartitionsToTxn` (v0–v1).
+///
+/// # Errors
+/// [`io::Error`] if malformed.
+pub fn parse_add_partitions(reader: &mut Reader, _version: i16) -> io::Result<AddPartitionsRequest> {
+    let h = parse_txn_header(reader)?;
+    let tc = bounded(reader.int32()?, reader, MIN_TOPIC_BYTES);
+    let mut topics = Vec::new();
+    for _ in 0..tc {
+        let name = reader.string()?;
+        let pc = bounded(reader.int32()?, reader, MIN_PARTITION_BYTES);
+        let mut parts = Vec::new();
+        for _ in 0..pc {
+            parts.push(reader.int32()?);
+        }
+        topics.push((name, parts));
+    }
+    Ok(AddPartitionsRequest { transactional_id: h.transactional_id, producer_id: h.producer_id, epoch: h.epoch, topics })
+}
+
+/// Build an `AddPartitionsToTxn` response mirroring the topics/partitions, each with `error_code`.
+#[must_use]
+pub fn add_partitions_response(correlation_id: i32, topics: &[(String, Vec<i32>)], error_code: i16) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false);
+    w.int32(0); // throttle_time_ms
+    w.int32(i32::try_from(topics.len()).unwrap_or(0));
+    for (name, parts) in topics {
+        w.string(name);
+        w.int32(i32::try_from(parts.len()).unwrap_or(0));
+        for &p in parts {
+            w.int32(p);
+            w.int16(error_code);
+        }
+    }
+    w.into_bytes()
+}
+
+/// Parse `AddOffsetsToTxn` (v0–v1) → `(transactional_id, producer_id, epoch, group_id)`.
+///
+/// # Errors
+/// [`io::Error`] if malformed.
+pub fn parse_add_offsets(reader: &mut Reader, _version: i16) -> io::Result<(String, i64, i16, String)> {
+    let h = parse_txn_header(reader)?;
+    let group_id = reader.string()?;
+    Ok((h.transactional_id, h.producer_id, h.epoch, group_id))
+}
+
+/// Build a simple throttle+error txn response (`AddOffsetsToTxn` / `EndTxn`).
+#[must_use]
+pub fn throttle_error_response(correlation_id: i32, error_code: i16) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false);
+    w.int32(0); // throttle_time_ms
+    w.int16(error_code);
+    w.into_bytes()
+}
+
+/// A parsed `TxnOffsetCommit` request.
+#[derive(Debug, Clone)]
+pub struct TxnOffsetCommitRequest {
+    /// Transactional id.
+    pub transactional_id: String,
+    /// Consumer group whose offsets the txn commits.
+    pub group_id: String,
+    /// Producer id.
+    pub producer_id: i64,
+    /// Producer epoch.
+    pub epoch: i16,
+    /// `(topic, partition, committed_offset)` to stage.
+    pub offsets: Vec<(String, i32, i64)>,
+    /// Echo of the topic/partition structure (for the response).
+    pub topics: Vec<(String, Vec<i32>)>,
+}
+
+/// Parse `TxnOffsetCommit` (v0–v1).
+///
+/// # Errors
+/// [`io::Error`] if malformed.
+pub fn parse_txn_offset_commit(reader: &mut Reader, _version: i16) -> io::Result<TxnOffsetCommitRequest> {
+    let transactional_id = reader.string()?;
+    let group_id = reader.string()?;
+    let producer_id = reader.int64()?;
+    let epoch = reader.int16()?;
+    let tc = bounded(reader.int32()?, reader, MIN_TOPIC_BYTES);
+    let mut offsets = Vec::new();
+    let mut topics = Vec::new();
+    for _ in 0..tc {
+        let name = reader.string()?;
+        let pc = bounded(reader.int32()?, reader, MIN_PARTITION_BYTES);
+        let mut parts = Vec::new();
+        for _ in 0..pc {
+            let partition = reader.int32()?;
+            let committed_offset = reader.int64()?;
+            let _metadata = reader.nullable_string()?;
+            offsets.push((name.clone(), partition, committed_offset));
+            parts.push(partition);
+        }
+        topics.push((name, parts));
+    }
+    Ok(TxnOffsetCommitRequest { transactional_id, group_id, producer_id, epoch, offsets, topics })
+}
+
+/// Parse `EndTxn` (v0–v1) → `(transactional_id, producer_id, epoch, committed)`.
+///
+/// # Errors
+/// [`io::Error`] if malformed.
+pub fn parse_end_txn(reader: &mut Reader, _version: i16) -> io::Result<(String, i64, i16, bool)> {
+    let h = parse_txn_header(reader)?;
+    let committed = reader.int8()? != 0;
+    Ok((h.transactional_id, h.producer_id, h.epoch, committed))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TxnCoordinator, INVALID_PRODUCER_EPOCH, INVALID_TXN_STATE, NONE};
+    use super::{
+        add_partitions_response, init_producer_id_response, parse_add_offsets, parse_add_partitions,
+        parse_end_txn, parse_init_producer_id, parse_txn_offset_commit, throttle_error_response, TxnCoordinator,
+        INVALID_PRODUCER_EPOCH, INVALID_TXN_STATE, NONE,
+    };
+    use crate::codec::{Reader, Writer};
 
     #[test]
     fn init_bumps_epoch_and_fences_the_prior_incarnation() {
@@ -265,6 +456,90 @@ mod tests {
         assert_eq!(out.offsets, vec![("src".to_owned(), 0, 42)], "staged offsets committed atomically");
         // After EndTxn the txn is reset — a second EndTxn with no open txn is INVALID_TXN_STATE.
         assert_eq!(c.end_txn("tx-A", pid, ep, true).error_code, INVALID_TXN_STATE);
+    }
+
+    #[test]
+    fn txn_codec_round_trips_and_bounds_garbage() {
+        // InitProducerId with a transactional_id.
+        let mut w = Writer::new();
+        w.nullable_string(Some("tx-A"));
+        w.int32(60_000);
+        let body = w.into_bytes();
+        let mut r = Reader::new(&body);
+        assert_eq!(parse_init_producer_id(&mut r).unwrap().as_deref(), Some("tx-A"));
+        let resp = init_producer_id_response(7, 1000, 3);
+        let mut rr = Reader::new(&resp);
+        assert_eq!(rr.int32().unwrap(), 7); // corr
+        assert_eq!(rr.int32().unwrap(), 0); // throttle
+        assert_eq!(rr.int16().unwrap(), 0); // error
+        assert_eq!(rr.int64().unwrap(), 1000); // producer_id
+        assert_eq!(rr.int16().unwrap(), 3); // epoch
+
+        // AddPartitionsToTxn round-trip.
+        let mut w = Writer::new();
+        w.string("tx-A");
+        w.int64(1000);
+        w.int16(3);
+        w.int32(1); // 1 topic
+        w.string("events");
+        w.int32(2); // 2 partitions
+        w.int32(0);
+        w.int32(1);
+        let body = w.into_bytes();
+        let mut r = Reader::new(&body);
+        let req = parse_add_partitions(&mut r, 1).unwrap();
+        assert_eq!(req.transactional_id, "tx-A");
+        assert_eq!(req.producer_id, 1000);
+        assert_eq!(req.topics, vec![("events".to_owned(), vec![0, 1])]);
+        let _ = add_partitions_response(7, &req.topics, NONE);
+
+        // AddOffsetsToTxn + EndTxn.
+        let mut w = Writer::new();
+        w.string("tx-A");
+        w.int64(1000);
+        w.int16(3);
+        w.string("grp");
+        let body = w.into_bytes();
+        let mut r = Reader::new(&body);
+        assert_eq!(parse_add_offsets(&mut r, 1).unwrap(), ("tx-A".to_owned(), 1000, 3, "grp".to_owned()));
+        let _ = throttle_error_response(7, NONE);
+
+        let mut w = Writer::new();
+        w.string("tx-A");
+        w.int64(1000);
+        w.int16(3);
+        w.int8(1); // committed
+        let body = w.into_bytes();
+        let mut r = Reader::new(&body);
+        assert_eq!(parse_end_txn(&mut r, 1).unwrap(), ("tx-A".to_owned(), 1000, 3, true));
+
+        // TxnOffsetCommit round-trip.
+        let mut w = Writer::new();
+        w.string("tx-A");
+        w.string("grp");
+        w.int64(1000);
+        w.int16(3);
+        w.int32(1);
+        w.string("src");
+        w.int32(1);
+        w.int32(0);
+        w.int64(42);
+        w.nullable_string(None);
+        let body = w.into_bytes();
+        let mut r = Reader::new(&body);
+        let toc = parse_txn_offset_commit(&mut r, 1).unwrap();
+        assert_eq!(toc.offsets, vec![("src".to_owned(), 0, 42)]);
+
+        // A lying topic count + filler must not panic / over-allocate.
+        let mut w = Writer::new();
+        w.string("tx");
+        w.int64(1);
+        w.int16(0);
+        w.int32(i32::MAX);
+        w.raw(&vec![0u8; 4096]);
+        let body = w.into_bytes();
+        let mut r = Reader::new(&body);
+        let _ = parse_add_partitions(&mut r, 1);
     }
 
     #[test]
