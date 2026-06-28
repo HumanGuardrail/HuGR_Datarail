@@ -1,0 +1,64 @@
+name: Kafka broker over TLS — real librdkafka (security.protocol=SSL)
+
+# Proves hop-(1) TLS termination (KAFKA-TLS-DESIGN.md) against a REAL Kafka client: a self-signed cert, a
+# `datarail kafka-broker --tls`, and kcat (= librdkafka) with security.protocol=SSL producing + consuming over
+# TLSv1.3 — with the on-disk store still asserted ciphertext-only (provider-blind). No PROVEN claim without this.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/datarail-kafka/**"
+      - "crates/datarail-cli/**"
+      - ".github/workflows/kafka-broker-tls.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  tls-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the TLS broker + a self-signed cert (SAN localhost/127.0.0.1) + start it
+        run: |
+          cargo build -p datarail-cli --release --features tls
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout key.pem -out cert.pem \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          ./target/release/datarail kafka-broker examples/rail.toml \
+            --listen 0.0.0.0:9092 --advertised localhost \
+            --data-dir ./kbroker-data --partitions 1 \
+            --tls --tls-cert cert.pem --tls-key key.pem &
+          echo $! > broker.pid
+          for i in $(seq 1 20); do
+            if openssl s_client -connect localhost:9092 -CAfile cert.pem </dev/null 2>/dev/null \
+                 | grep -q "Verify return code: 0"; then echo "TLS broker up (handshake ok)"; break; fi
+            sleep 1
+          done
+
+      - name: Real librdkafka PRODUCER over TLS → datarail kafka-broker (seal + store)
+        run: |
+          printf 'evt:t1\nevt:t2\nevt:t3\n' \
+            | docker run --rm -i --network host -v "$(pwd)/cert.pem:/cert.pem" edenhill/kcat:1.7.1 \
+                -b localhost:9092 -X security.protocol=SSL -X ssl.ca.location=/cert.pem -t events -P
+          sleep 1
+
+      - name: Real librdkafka CONSUMER over TLS reads back + on-disk is ciphertext (provider-blind)
+        run: |
+          OUT=$(timeout 30 docker run --rm --network host -v "$(pwd)/cert.pem:/cert.pem" edenhill/kcat:1.7.1 \
+                  -b localhost:9092 -X security.protocol=SSL -X ssl.ca.location=/cert.pem \
+                  -t events -C -o beginning -e -q 2>/dev/null || true)
+          echo "TLS consumer read: [$OUT]"
+          for m in evt:t1 evt:t2 evt:t3; do
+            echo "$OUT" | grep -qF "$m" || { echo "::error::TLS consumer missing $m"; exit 1; }
+          done
+          if grep -rqa "evt:t1" ./kbroker-data 2>/dev/null; then
+            echo "::error::plaintext found on disk — provider-blind violated"; exit 1
+          fi
+          echo "## Kafka over TLS ✅ — real librdkafka produced + consumed over TLS (security.protocol=SSL); the on-disk store is sealed (provider-blind)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the broker
+        if: always()
+        run: '[ -f broker.pid ] && kill "$(cat broker.pid)" 2>/dev/null || true'
