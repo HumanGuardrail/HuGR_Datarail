@@ -1100,13 +1100,16 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     fn commit_txn(&self, producer_id: i64, _partitions: &[(String, i32)]) -> std::io::Result<()> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let inner = &mut *g;
-        // Flush EVERY buffer this producer holds (durably) — they become visible together (atomic commit). Collect
-        // the matching keys first to avoid borrowing `txn_buffers` while mutating the logs.
+        // Flush EVERY buffer this producer holds to the durable log. Flush BEFORE removing (the records are cloned
+        // out, which releases the `txn_buffers` borrow for `produce_into`): if an append fails, the buffer stays
+        // intact so an EndTxn RETRY re-flushes it — a partition's committed records are never lost on a mid-flush
+        // error (audit). (Cross-partition visibility may be split across the retry — no loss, eventually all visible.)
         let keys: Vec<(i64, String, i32)> =
             inner.txn_buffers.keys().filter(|(pid, _, _)| *pid == producer_id).cloned().collect();
         for key in keys {
-            if let Some(records) = inner.txn_buffers.remove(&key) {
-                inner.produce_into(&key.1, key.2, &records)?;
+            if let Some(records) = inner.txn_buffers.get(&key).cloned() {
+                inner.produce_into(&key.1, key.2, &records)?; // on error: buffer kept, retry recovers it
+                inner.txn_buffers.remove(&key);
             }
         }
         Ok(())

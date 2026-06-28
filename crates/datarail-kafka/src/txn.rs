@@ -89,12 +89,15 @@ pub struct EndTxnOutcome {
     pub offsets: Vec<(String, i32, i64)>,
 }
 
-/// The mutable shared state, behind one `Mutex`: per-id txn state + the global partition-claim table.
+/// The mutable shared state, behind one `Mutex`: per-id txn state + the global partition-claim table + the
+/// `producer_id → transactional_id` reverse index (the Produce path carries only the `producer_id`).
 #[derive(Default)]
 struct TxnInner {
     txns: HashMap<String, TxnState>,
     /// Which `transactional_id` currently holds each `(topic, partition)` (one open txn per partition).
     claimed: HashMap<(String, i32), String>,
+    /// `producer_id → transactional_id` — lets the Produce path fence a batch against the coordinator.
+    by_producer: HashMap<i64, String>,
 }
 
 impl TxnInner {
@@ -139,14 +142,39 @@ impl TxnCoordinator {
             st.reset_txn(); // any in-flight txn of the old epoch is implicitly aborted
             let out = (st.producer_id, st.epoch);
             g.release_claims(transactional_id); // its old txn aborts → free its partitions
+            g.by_producer.insert(out.0, transactional_id.to_owned()); // pid is reused; keep the index current
             out
         } else {
             let pid = self.next_producer_id.fetch_add(1, Ordering::Relaxed);
             let st = TxnState::new(pid);
             let out = (st.producer_id, st.epoch);
             g.txns.insert(transactional_id.to_owned(), st);
+            g.by_producer.insert(pid, transactional_id.to_owned());
             out
         }
+    }
+
+    /// FENCE a transactional Produce batch (the Produce path carries only `(producer_id, epoch)` + the partition):
+    /// returns `NONE` only if `(producer_id, epoch)` is the CURRENT incarnation AND the partition is in its OPEN
+    /// txn — else `INVALID_PRODUCER_EPOCH` (a zombie / unknown producer) or `INVALID_TXN_STATE` (no open txn, or the
+    /// partition was never `AddPartitionsToTxn`'d). This is what stops a stale-epoch zombie or an unclaimed-partition
+    /// write from ever being buffered (audit: the Produce path was unfenced).
+    #[must_use]
+    pub fn produce_check(&self, producer_id: i64, epoch: i16, topic: &str, partition: i32) -> i16 {
+        let g = self.lock();
+        let Some(tid) = g.by_producer.get(&producer_id) else {
+            return INVALID_PRODUCER_EPOCH;
+        };
+        let Some(st) = g.txns.get(tid) else {
+            return INVALID_PRODUCER_EPOCH;
+        };
+        if st.producer_id != producer_id || st.epoch != epoch {
+            return INVALID_PRODUCER_EPOCH; // fenced by a newer incarnation
+        }
+        if !st.ongoing || !st.partitions.contains(&(topic.to_owned(), partition)) {
+            return INVALID_TXN_STATE; // no open txn, or this partition was not AddPartitionsToTxn'd
+        }
+        NONE
     }
 
     /// Verify `(producer_id, epoch)` against the current incarnation; `Ok(())` or an error code.
@@ -167,7 +195,7 @@ impl TxnCoordinator {
         partitions: &[(String, i32)],
     ) -> i16 {
         let mut g = self.lock();
-        let TxnInner { txns, claimed } = &mut *g;
+        let TxnInner { txns, claimed, .. } = &mut *g;
         let Some(st) = txns.get_mut(transactional_id) else {
             return INVALID_PRODUCER_EPOCH;
         };
@@ -223,8 +251,10 @@ impl TxnCoordinator {
         NONE
     }
 
-    /// `EndTxn`: commit or abort. Returns the partitions needing a marker and (on commit) the staged offsets to
-    /// durably apply, then resets the txn to ready-for-next.
+    /// `EndTxn` PREPARE: validate `(producer_id, epoch)` against an OPEN txn and return the partitions to flush +
+    /// (on commit) the staged offsets — WITHOUT resetting. The caller flushes/discards the buffers durably and, only
+    /// on success, calls [`finish_txn`](Self::finish_txn). Keeping the txn open until the durable flush succeeds is
+    /// what lets a failed commit be RETRIED (audit: a swallowed mid-flush error must not be acked as success).
     pub fn end_txn(&self, transactional_id: &str, producer_id: i64, epoch: i16, commit: bool) -> EndTxnOutcome {
         let mut g = self.lock();
         let Some(st) = g.txns.get_mut(transactional_id) else {
@@ -258,10 +288,17 @@ impl TxnCoordinator {
         let partitions: Vec<(String, i32)> = st.partitions.iter().cloned().collect();
         let (group, offsets) =
             if commit { (st.group.clone(), st.staged_offsets.clone()) } else { (None, Vec::new()) };
-        st.reset_txn();
-        // The txn is resolved → free its partition claims so another producer can transact on them.
-        g.release_claims(transactional_id);
         EndTxnOutcome { error_code: NONE, committed: commit, partitions, group, offsets }
+    }
+
+    /// Finalize a resolved txn — reset its state (ready for the next) and free its partition claims. Called by the
+    /// serve layer ONLY after the durable flush (commit) / discard (abort) succeeded. Idempotent if the txn is gone.
+    pub fn finish_txn(&self, transactional_id: &str) {
+        let mut g = self.lock();
+        if let Some(st) = g.txns.get_mut(transactional_id) {
+            st.reset_txn();
+        }
+        g.release_claims(transactional_id);
     }
 }
 
@@ -458,12 +495,13 @@ mod tests {
         );
         // B CAN claim a different partition.
         assert_eq!(c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 1)]), NONE);
-        // After A ends, B can claim events:0.
+        // After A finishes, B can claim events:0 (claims free on finish_txn, not the prepare).
         assert_eq!(c.end_txn("tx-A", pa, ea, true).error_code, NONE);
+        c.finish_txn("tx-A");
         assert_eq!(
             c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 0)]),
             NONE,
-            "the partition frees on EndTxn"
+            "the partition frees on finish_txn"
         );
     }
 
@@ -507,8 +545,35 @@ mod tests {
         assert_eq!(out.partitions.len(), 2, "both enrolled partitions get a COMMIT marker");
         assert_eq!(out.group.as_deref(), Some("grp"));
         assert_eq!(out.offsets, vec![("src".to_owned(), 0, 42)], "staged offsets committed atomically");
-        // After EndTxn the txn is reset — a second EndTxn with no open txn is INVALID_TXN_STATE.
+        // EndTxn (prepare) does NOT reset — the txn stays open so a failed durable flush can be retried; a re-prepare
+        // still validates.
+        assert_eq!(c.end_txn("tx-A", pid, ep, true).error_code, NONE, "re-prepare is valid until finish");
+        // finish_txn resets it — a subsequent EndTxn has no open txn → INVALID_TXN_STATE.
+        c.finish_txn("tx-A");
         assert_eq!(c.end_txn("tx-A", pid, ep, true).error_code, INVALID_TXN_STATE);
+    }
+
+    #[test]
+    fn produce_check_fences_zombies_and_unclaimed_partitions() {
+        let c = TxnCoordinator::new(1000);
+        let (pid, ep) = c.init_producer_id("tx-A");
+        c.add_partitions("tx-A", pid, ep, &[("events".to_owned(), 0)]);
+        // A claimed partition at the current epoch → allowed.
+        assert_eq!(c.produce_check(pid, ep, "events", 0), NONE);
+        // An UNCLAIMED partition → rejected (it was never AddPartitionsToTxn'd).
+        assert_eq!(c.produce_check(pid, ep, "events", 1), INVALID_TXN_STATE);
+        // A STALE epoch (zombie) → fenced.
+        assert_eq!(c.produce_check(pid, ep - 1, "events", 0), INVALID_PRODUCER_EPOCH);
+        // After a re-init bumps the epoch, the old epoch is fenced on the produce path too.
+        let (pid2, ep2) = c.init_producer_id("tx-A");
+        assert_eq!(pid2, pid);
+        assert_eq!(c.produce_check(pid, ep, "events", 0), INVALID_PRODUCER_EPOCH, "old epoch fenced after re-init");
+        // The new incarnation must re-claim before producing.
+        assert_eq!(c.produce_check(pid2, ep2, "events", 0), INVALID_TXN_STATE, "must AddPartitions again");
+        c.add_partitions("tx-A", pid2, ep2, &[("events".to_owned(), 0)]);
+        assert_eq!(c.produce_check(pid2, ep2, "events", 0), NONE);
+        // An unknown producer id → fenced.
+        assert_eq!(c.produce_check(999, 0, "events", 0), INVALID_PRODUCER_EPOCH);
     }
 
     #[test]

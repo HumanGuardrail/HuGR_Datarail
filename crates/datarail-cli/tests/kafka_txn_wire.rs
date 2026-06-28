@@ -261,6 +261,24 @@ fn transactional_commit_is_visible_atomically_and_abort_is_hidden() {
         "aborted record is never visible"
     );
 
+    // --- ZOMBIE FENCE (audit CRITICAL): a stale-epoch Produce must NOT be committed ---
+    stream.write_all(&init_producer_id_req(15, "tx-1")).unwrap();
+    let (pid3, epoch3) = init_producer_id(&read_frame(&mut stream)); // epoch bumped again; pid2/epoch2 now fenced
+    stream.write_all(&add_partitions_req(16, "tx-1", pid3, epoch3, "events", &[0])).unwrap();
+    let _ = read_frame(&mut stream);
+    // A legit record at the CURRENT epoch.
+    stream.write_all(&produce_txn_req(17, "events", 0, pid3, epoch3, &[b"evt:legit"])).unwrap();
+    let _ = read_frame(&mut stream);
+    // A ZOMBIE record at the OLD (fenced) epoch — must be rejected, never buffered.
+    stream.write_all(&produce_txn_req(18, "events", 0, pid2, epoch2, &[b"evt:zombie"])).unwrap();
+    let _ = read_frame(&mut stream);
+    stream.write_all(&end_txn_req(19, "tx-1", pid3, epoch3, true)).unwrap();
+    let _ = read_frame(&mut stream);
+    stream.write_all(&fetch_req(20, "events", 0, 0)).unwrap();
+    let got = fetch_values(&read_frame(&mut stream));
+    assert!(got.contains(&b"evt:legit".to_vec()), "the current-epoch record committed");
+    assert!(!got.contains(&b"evt:zombie".to_vec()), "the fenced stale-epoch record was NEVER committed");
+
     let _ = std::fs::remove_file(&rail);
     let _ = std::fs::remove_dir_all(&data_dir);
 }

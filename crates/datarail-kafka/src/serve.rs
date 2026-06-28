@@ -364,6 +364,10 @@ fn handle_broker_connection<B: KafkaBroker>(
                 // A transactional_id in the body → the txn coordinator (epoch-fenced); else a bare idempotent id.
                 if let Some(tid) = parse_init_producer_id(&mut reader)? {
                     let (pid, epoch) = txn.init_producer_id(&tid);
+                    // The epoch bump aborted any in-flight txn at the coordinator; the producer_id is REUSED, so
+                    // also drop any buffers left from the prior incarnation (audit: re-init orphaned the store
+                    // buffers → an old-epoch record could be committed by the new txn).
+                    broker.abort_txn(pid, &[]);
                     txn_init_producer_id_response(correlation_id, pid, epoch)
                 } else {
                     let pid = ctx.next_producer_id.fetch_add(1, Ordering::Relaxed);
@@ -372,24 +376,7 @@ fn handle_broker_connection<B: KafkaBroker>(
             }
             API_PRODUCE => {
                 let topics = parse_produce(&mut reader, api_version)?;
-                // Seal + store each partition batch BEFORE acking; the response carries the base offset + code.
-                let mut results: HashMap<(String, i32), (i64, i16)> = HashMap::new();
-                for t in &topics {
-                    for p in &t.partitions {
-                        // A TRANSACTIONAL batch is BUFFERED (held until EndTxn — not visible until commit); a plain
-                        // / idempotent batch lands durably immediately.
-                        let landed = if let Some(eos) = p.eos.filter(|e| e.transactional) {
-                            broker.buffer_txn(eos.producer_id, &t.name, p.partition, &p.values)
-                        } else {
-                            broker.produce(&t.name, p.partition, &p.values)
-                        };
-                        let outcome = match landed {
-                            Ok(base) => (base, 0i16),
-                            Err(_) => (-1, 56), // KAFKA_STORAGE_ERROR (retriable) — never a false ack
-                        };
-                        results.insert((t.name.clone(), p.partition), outcome);
-                    }
-                }
+                let results = produce_results(broker, txn, &topics);
                 produce_response(api_version, correlation_id, &topics, &mut |name, part, _count| {
                     results.get(&(name.to_owned(), part)).copied().unwrap_or((0, 0))
                 })
@@ -532,23 +519,40 @@ fn dispatch_txn_api<B: KafkaBroker>(
         }
         API_END_TXN => {
             let (tid, pid, epoch, committed) = parse_end_txn(reader, api_version)?;
+            // PREPARE: validate against the OPEN txn (no reset yet — so a failed flush can be retried).
             let out = txn.end_txn(&tid, pid, epoch, committed);
-            if out.error_code == 0 {
-                if out.committed {
-                    // COMMIT: flush the buffered records to the durable log (now visible) FIRST, then apply the
-                    // staged consumer offsets — atomic, all-or-nothing, from the client's view.
-                    let _ = broker.commit_txn(pid, &out.partitions);
+            let code = if out.error_code != 0 {
+                out.error_code
+            } else if out.committed {
+                // COMMIT: flush the buffered records to the durable log, then the staged offsets. On ANY failure,
+                // return a RETRIABLE code and do NOT finish the txn — the producer retries EndTxn; the flush
+                // re-runs (already-flushed buffers are gone → harmless) until it fully succeeds (audit: a swallowed
+                // mid-flush error was acked as a successful atomic commit, silently losing committed records).
+                if broker.commit_txn(pid, &out.partitions).is_err() {
+                    56
+                } else {
+                    let mut offsets_ok = true;
                     if let Some(group) = &out.group {
                         for (topic, partition, offset) in &out.offsets {
-                            let _ = broker.commit_offset(group, topic, *partition, *offset);
+                            if broker.commit_offset(group, topic, *partition, *offset).is_err() {
+                                offsets_ok = false;
+                            }
                         }
                     }
-                } else {
-                    // ABORT: discard the buffered records — they never become durable/visible.
-                    broker.abort_txn(pid, &out.partitions);
+                    if offsets_ok {
+                        txn.finish_txn(&tid);
+                        0
+                    } else {
+                        56 // retriable: re-EndTxn re-commits the (idempotent) offsets; records already durable
+                    }
                 }
-            }
-            throttle_error_response(correlation_id, out.error_code)
+            } else {
+                // ABORT: discard the buffered records — they never become durable/visible.
+                broker.abort_txn(pid, &out.partitions);
+                txn.finish_txn(&tid);
+                0
+            };
+            throttle_error_response(correlation_id, code)
         }
         _ => return Ok(None),
     };
@@ -559,6 +563,39 @@ fn dispatch_txn_api<B: KafkaBroker>(
 fn txn_offset_commit_response(correlation_id: i32, topics: &[(String, Vec<i32>)], error_code: i16) -> Vec<u8> {
     // Same wire shape as AddPartitionsToTxn's response body (throttle + topics[name, partitions[idx, error]]).
     add_partitions_response(correlation_id, topics, error_code)
+}
+
+/// Seal + store each produced partition batch BEFORE acking, returning `(base_offset, error_code)` per
+/// `(topic, partition)`. A TRANSACTIONAL batch is FENCED against the coordinator (stale epoch / un-claimed
+/// partition → rejected, never buffered) then BUFFERED until `EndTxn`; a plain/idempotent batch lands durably now.
+fn produce_results<B: KafkaBroker>(
+    broker: &B,
+    txn: &TxnCoordinator,
+    topics: &[crate::produce::ProducedTopic],
+) -> HashMap<(String, i32), (i64, i16)> {
+    let mut results: HashMap<(String, i32), (i64, i16)> = HashMap::new();
+    for t in topics {
+        for p in &t.partitions {
+            let outcome = if let Some(eos) = p.eos.filter(|e| e.transactional) {
+                let code = txn.produce_check(eos.producer_id, eos.producer_epoch, &t.name, p.partition);
+                if code == 0 {
+                    match broker.buffer_txn(eos.producer_id, &t.name, p.partition, &p.values) {
+                        Ok(base) => (base, 0i16),
+                        Err(_) => (-1, 56),
+                    }
+                } else {
+                    (-1, code)
+                }
+            } else {
+                match broker.produce(&t.name, p.partition, &p.values) {
+                    Ok(base) => (base, 0i16),
+                    Err(_) => (-1, 56), // KAFKA_STORAGE_ERROR (retriable) — never a false ack
+                }
+            };
+            results.insert((t.name.clone(), p.partition), outcome);
+        }
+    }
+    results
 }
 
 /// Resolve a parsed `Fetch` request against the broker: un-seal each partition's records at the edge into a v2
