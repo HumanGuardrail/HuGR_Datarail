@@ -926,6 +926,28 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   was assigned cleanly). All green: gate + `kafka-broker-librdkafka` (run 28327143722). Commits a2cafc3→1a65a20
   on pr8. Docs: README, KAFKA-COMPAT, LASTRO-MATRIX. **The drop-in is now proven against the actual Kafka client,
   not only our wire protocol tests.**
+- 2026-06-28 — **🔨 TLS on the Kafka hop (branch `tls-kafka-hop`, incr 1–2 of 3).** Owner delegated the roadmap
+  ("essas decisões são suas"); I picked KAFKA-COMPAT roadmap item #2 (close the plaintext producer→datarail hop)
+  and built design-first (`KAFKA-TLS-DESIGN.md`). **Incr 1** (`ce081a8`): `datarail-kafka` stays dependency-free —
+  the serve loops are now generic over `S: Read + Write` with a zero-dep `ConnWrap` trait (ships `PlainConn` =
+  identity); behavior-preserving (kafka 51 + all 5 full-binary wire tests green, confirmed on branch CI incl. the
+  real librdkafka round-trip). **Incr 2**: a CLI `tls` feature provides a rustls `TlsConn` (sync `StreamOwned`
+  handshake) + `--tls --tls-cert --tls-key` on `kafka-ingest`/`kafka-broker`; the default binary stays light
+  (feature-gated, 22 cli tests green without it). Proven locally: a real **`openssl s_client` completed a TLSv1.3
+  handshake** (`Verify return code: 0`) against `kafka-broker --tls`. Honest scope: server-side termination
+  (one-way auth); mTLS + SASL tracked; not end-to-end sealing (that's native terminals). **Incr 3 PROVEN** —
+  `kafka-broker-tls.yml` green (run 28333278577): a real kcat/librdkafka client with `security.protocol=SSL`
+  produces + consumes over TLS, on-disk asserted ciphertext-only. (First TLS run read empty — librdkafka rejected
+  the self-signed test cert as a CA; for a throwaway cert the fix is client-side `enable.ssl.certificate
+  .verification=false` — the handshake+encryption still prove the hop works.) PR #9 merged to main. **Hop (1) is
+  now optionally TLS-encrypted, proven against the real Kafka client.**
+
+  > **WAIVER (owner-delegated — "pode seguir, essas decisões são suas", 2026-06-28)** — the zero-dep charter gets
+  > two CLI deps behind the optional `tls` feature: `rustls 0.23` (default-features off, `ring`+`std`) and
+  > `rustls-pemfile 2`. reason: TLS termination needs a vetted TLS stack; `rustls` is ALREADY vetted + in
+  > `Cargo.lock` via the `quic` substrate (no new audit surface), and `rustls-pemfile` is a tiny ring-ecosystem PEM
+  > parser. The default binary is unaffected (feature off). remediation: n/a (feature-gated, like `quic`). tracking:
+  > `KAFKA-TLS-DESIGN.md`. forbid-unsafe holds (our crates stay unsafe-free; the deps' internal `unsafe` is theirs).
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

@@ -100,8 +100,10 @@ fn idempotent_producer_handshake_and_retry_surface_a_stable_eos_coord() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (tx, rx) = mpsc::channel();
+    let conn: std::sync::Arc<dyn datarail_kafka::serve::ConnWrap> =
+        std::sync::Arc::new(datarail_kafka::serve::PlainConn);
     std::thread::spawn(move || {
-        let _ = serve(&listener, "127.0.0.1", addr.port().into(), tx);
+        let _ = serve(&listener, "127.0.0.1", addr.port().into(), tx, &conn);
     });
 
     // The integration layer: drain produced batches and ACK each (ack-after-durable) so `serve` can respond to

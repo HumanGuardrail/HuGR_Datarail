@@ -77,7 +77,9 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
   `read_committed`; abort-on-restart. The idempotent producer (`enable.idempotence=true`) remains supported for
   per-partition exactly-once. The faithful marker/LSO model (concurrent same-partition txns + a true
   `read_uncommitted`) is tracked future work.
-- **No SASL / TLS on the Kafka hop** (see security posture below).
+- **TLS on the Kafka hop EXISTS now** (server-side termination, `--features tls`: `--tls --tls-cert --tls-key`,
+  `KAFKA-TLS-DESIGN.md`) — encrypts hop (1). **No SASL yet**, and **no mTLS / client-cert** yet (one-way auth). See
+  the security posture below.
 - **Single partition per topic, single broker.** No real partitioning/replication on the Kafka-facing side — the
   durability/replication is datarail's own (the rail + substrate), not Kafka-style partition replicas.
 
@@ -86,24 +88,27 @@ datarail's core guarantee is **provider-blind**: the rail, the cheap/untrusted p
 infrastructure never see plaintext. With Kafka ingest, the trust boundary is:
 
 ```
-[Kafka producer] --(1) plaintext Kafka wire-->  [datarail kafka-ingest]  --(2) SEALED cofre-->  [rail → storage → sink]
+[Kafka producer] --(1) Kafka wire (plaintext, or TLS with --tls)-->  [datarail kafka-ingest]  --(2) SEALED cofre-->  [rail → storage → sink]
 ```
 
 - **Hop (2) — the rail and everything downstream — is sealed and provider-blind.** This is the moat and it holds:
   the cheap pipe, any intermediate, and the storage provider see only ciphertext.
-- **Hop (1) — the producer → datarail link — is currently PLAINTEXT** (no TLS/SASL on the Kafka endpoint yet).
-  So the Kafka ingest is **NOT end-to-end sealed from the producer**; it is "seal-on-ingest." Use it when the
-  producer→datarail hop is on a trusted network (same datacenter / mTLS mesh / loopback sidecar), and rely on
-  datarail for provider-blindness DOWNSTREAM (the part that is usually the untrusted, multi-tenant, cost-bearing
-  infrastructure). For a fully end-to-end-sealed source, use datarail's native sealed terminals, not Kafka ingest.
-- **We state this plainly rather than implying "end-to-end sealed from your Kafka producer," which would be false
-  until hop (1) gets TLS.**
+- **Hop (1) — the producer → datarail link — is PLAINTEXT by default, or TLS-encrypted with `--tls`**
+  (`--features tls`, `KAFKA-TLS-DESIGN.md`). With TLS it is encrypted-in-transit and datarail is server-authenticated
+  (proven against real librdkafka over TLS in CI). It is still **NOT end-to-end sealed from the producer** — TLS
+  terminates at datarail's edge, where the record is plaintext only for as long as it takes to seal it into a cofre
+  (the moat). For a fully end-to-end-sealed source, use datarail's native sealed terminals, not Kafka ingest.
+- **Honest framing:** TLS closes the on-the-wire exposure of hop (1) (a passive tap sees ciphertext); it is
+  transport security + server auth, NOT the same as datarail's end-to-end sealing. Cert trust + client auth (mTLS)
+  are the operator's to configure; SASL is a further axis (tracked).
 
 ## Roadmap (next arcs, in rough value order)
 1. ✅ **`Fetch` consumer side — DONE** (2026-06-27, `kafka-broker` mode, `KAFKA-FETCH-DESIGN.md`): datarail is a
    bidirectional Kafka drop-in (produce AND consume), un-sealing on read. Next within this line: **durable store**
    (datarail-topic backing) + **consumer groups** + **multi-partition**.
-2. **TLS on the Kafka hop** → closes hop (1), making Kafka ingest end-to-end sealed.
+2. ✅ **TLS on the Kafka hop — DONE** (2026-06-28, `--features tls`, `KAFKA-TLS-DESIGN.md`): server-side TLS
+   termination (`--tls --tls-cert --tls-key`) encrypts hop (1); proven against real librdkafka over TLS in CI
+   (`kafka-broker-tls.yml`). Next within this line: **mTLS / client-cert** + **SASL**.
 3. **Compression** (at least the common codecs) for throughput parity.
 4. ✅ **Idempotent producer (`InitProducerId`) → exactly-once from idempotent producers — DONE** (2026-06-27,
    `KAFKA-EOS-DESIGN.md`). Next within this line: **transactional** producer (cross-session EOS via a stable

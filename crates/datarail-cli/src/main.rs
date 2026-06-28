@@ -18,6 +18,39 @@
 #![forbid(unsafe_code)]
 
 mod kafka_store;
+#[cfg(feature = "tls")]
+mod tls;
+
+/// Build the Kafka serve-loop connection wrapper: plaintext [`PlainConn`], or — with `--tls` and the `tls`
+/// feature — a rustls TLS terminator ([`tls::TlsConn`]). Shared by `kafka-ingest` and `kafka-broker`.
+#[cfg(feature = "tls")]
+fn build_conn(
+    enable_tls: bool,
+    cert: Option<String>,
+    key: Option<String>,
+) -> Result<std::sync::Arc<dyn datarail_kafka::serve::ConnWrap>, CliError> {
+    if enable_tls {
+        let cert = cert.ok_or_else(|| CliError::Arg("--tls requires --tls-cert <pem>".into()))?;
+        let key = key.ok_or_else(|| CliError::Arg("--tls requires --tls-key <pem>".into()))?;
+        let conn = tls::TlsConn::from_pem(&cert, &key).map_err(|e| CliError::Io(e.to_string()))?;
+        Ok(std::sync::Arc::new(conn))
+    } else {
+        Ok(std::sync::Arc::new(datarail_kafka::serve::PlainConn))
+    }
+}
+
+/// Without the `tls` feature, `--tls` is a clear build-time error; plaintext is always available.
+#[cfg(not(feature = "tls"))]
+fn build_conn(
+    enable_tls: bool,
+    _cert: Option<String>,
+    _key: Option<String>,
+) -> Result<std::sync::Arc<dyn datarail_kafka::serve::ConnWrap>, CliError> {
+    if enable_tls {
+        return Err(CliError::Arg("--tls requires building the binary with `--features tls`".into()));
+    }
+    Ok(std::sync::Arc::new(datarail_kafka::serve::PlainConn))
+}
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
@@ -885,6 +918,9 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     let mut sink_file: Option<String> = None;
     let mut sink_webhook: Option<String> = None;
     let mut at_least_once = false;
+    let mut tls = false;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -912,6 +948,18 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
                 at_least_once = true;
                 i += 1;
             }
+            "--tls" => {
+                tls = true;
+                i += 1;
+            }
+            "--tls-cert" => {
+                tls_cert = Some(require(rest, i + 1, "pem")?.to_string());
+                i += 2;
+            }
+            "--tls-key" => {
+                tls_key = Some(require(rest, i + 1, "pem")?.to_string());
+                i += 2;
+            }
             other => return Err(CliError::Arg(format!("kafka-ingest: unexpected arg `{other}`"))),
         }
     }
@@ -919,8 +967,9 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
     let (tx, rx) = std::sync::mpsc::channel::<datarail_kafka::serve::ProducedBatch>();
     let adv = advertised.clone();
+    let conn_wrap = build_conn(tls, tls_cert, tls_key)?;
     std::thread::spawn(move || {
-        let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx);
+        let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx, &conn_wrap);
     });
 
     // Kafka ingest delivers EXACTLY-ONCE for an idempotent producer (per (producer_id, partition) sequence —
@@ -1186,6 +1235,9 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
     let mut advertised = "127.0.0.1".to_owned();
     let mut data_dir = PathBuf::from("datarail-kafka-data");
     let mut partitions: i32 = 1;
+    let mut tls = false;
+    let mut tls_cert: Option<String> = None;
+    let mut tls_key: Option<String> = None;
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -1209,6 +1261,18 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
                     .ok_or_else(|| CliError::Arg("kafka-broker: --partitions must be a positive integer".into()))?;
                 i += 2;
             }
+            "--tls" => {
+                tls = true;
+                i += 1;
+            }
+            "--tls-cert" => {
+                tls_cert = Some(require(rest, i + 1, "pem")?.to_string());
+                i += 2;
+            }
+            "--tls-key" => {
+                tls_key = Some(require(rest, i + 1, "pem")?.to_string());
+                i += 2;
+            }
             other => return Err(CliError::Arg(format!("kafka-broker: unexpected arg `{other}`"))),
         }
     }
@@ -1217,10 +1281,12 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
     let store = std::sync::Arc::new(KafkaBrokerStore::from_spec(&spec, data_dir.clone()));
     eprintln!(
         "datarail kafka-broker on {listen} (advertised {advertised}:{port}, data {}, {partitions} partition(s)) — \
-         produce sealed, store sealed durably, un-seal on fetch (provider-blind bidirectional Kafka)",
-        data_dir.display()
+         produce sealed, store sealed durably, un-seal on fetch (provider-blind bidirectional Kafka){}",
+        data_dir.display(),
+        if tls { " [TLS]" } else { "" }
     );
-    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store)
+    let conn_wrap = build_conn(tls, tls_cert, tls_key)?;
+    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store, &conn_wrap)
         .map_err(|e| CliError::Io(e.to_string()))?;
     Ok(String::new())
 }

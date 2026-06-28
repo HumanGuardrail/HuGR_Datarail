@@ -86,6 +86,9 @@ provider-blind):
 ```sh
 datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
     --data-dir ./datarail-kafka-data --partitions 3
+# ...and optionally TLS-encrypt the hop (build with `--features tls`):
+#   datarail kafka-broker examples/rail.toml --advertised localhost --tls --tls-cert cert.pem --tls-key key.pem
+# (a real librdkafka client with security.protocol=SSL produces+consumes over TLSv1.3 — proven in CI.)
 # A full consumer-group-capable Kafka drop-in: Produce + Fetch + ListOffsets, durable consumer offsets
 # (OffsetCommit/OffsetFetch/FindCoordinator), automatic group rebalance (JoinGroup/SyncGroup/Heartbeat) for
 # subscribe() consumers, and multi-partition (each an independent durable log). Storage is DURABLE
@@ -96,7 +99,8 @@ datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
 # round-trip, with the on-disk store asserted ciphertext-only — not just our own wire tests. Plus a TRANSACTIONAL
 # producer (buffer-until-commit: atomic multi-partition
 # commit + offsets-in-txn, abort hides records, stale-epoch zombies fenced — audited, `KAFKA-TXN-DESIGN.md`; scope:
-# one producer per partition/txn). (Single-node; TLS/compression need a zero-dep waiver.)
+# one producer per partition/txn). Hop (1) is optionally TLS-encrypted (`--tls`, `--features tls`; server-side
+# termination, proven vs real librdkafka over TLS). (Single-node; compression + SASL + mTLS tracked.)
 ```
 
 Lower-level rehearsals (files, two-process TCP, identity pairing):
