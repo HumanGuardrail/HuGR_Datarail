@@ -16,6 +16,11 @@ use crate::consume::{
     fetch_response, list_offsets_response, parse_fetch, parse_list_offsets, FetchPartitionResult,
     FetchTopicResult, ListOffsetResult, ListOffsetTopicResult, API_FETCH, API_LIST_OFFSETS,
 };
+use crate::groups::{
+    find_coordinator_response, offset_commit_response, offset_fetch_response, parse_find_coordinator,
+    parse_offset_commit, parse_offset_fetch, OffsetFetchPartitionResult, OffsetFetchTopicResult,
+    API_FIND_COORDINATOR, API_OFFSET_COMMIT, API_OFFSET_FETCH,
+};
 use crate::handlers::{
     api_versions_response, init_producer_id_response, metadata_response, parse_metadata_topics,
     API_INIT_PRODUCER_ID, API_METADATA, API_PRODUCE, API_VERSIONS,
@@ -225,6 +230,24 @@ pub trait KafkaBroker: Send + Sync {
 
     /// The logical `(earliest, latest)` offsets for `(topic, partition)` (latest = the next offset to be written).
     fn bounds(&self, topic: &str, partition: i32) -> (i64, i64);
+
+    /// Durably commit a consumer group's offset for `(topic, partition)` (`OffsetCommit`). Default: no-op — a
+    /// broker that does not persist consumer offsets (acked as NONE; the consumer simply gains no durability).
+    ///
+    /// # Errors
+    /// Propagates a durable-store error (the consumer then gets a retriable code, never a false success).
+    fn commit_offset(&self, _group: &str, _topic: &str, _partition: i32, _offset: i64) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// The last durably-committed offset for `(group, topic, partition)`, or `None` if none (`OffsetFetch`).
+    /// Default: `None`.
+    ///
+    /// # Errors
+    /// Propagates a durable-store read error.
+    fn fetch_offset(&self, _group: &str, _topic: &str, _partition: i32) -> io::Result<Option<i64>> {
+        Ok(None)
+    }
 }
 
 /// Serve the bidirectional `datarail kafka-broker` on `listener`: `Produce` (seal+store), `Fetch` (un-seal+return),
@@ -308,26 +331,7 @@ fn handle_broker_connection<B: KafkaBroker>(
             }
             API_FETCH => {
                 let topics = parse_fetch(&mut reader, api_version)?;
-                let mut out = Vec::with_capacity(topics.len());
-                for t in &topics {
-                    let mut parts = Vec::with_capacity(t.partitions.len());
-                    for p in &t.partitions {
-                        let (_, latest) = broker.bounds(&t.name, p.partition);
-                        let (error_code, records) =
-                            match broker.fetch(&t.name, p.partition, p.fetch_offset, p.max_bytes) {
-                                Ok(values) if values.is_empty() => (0, Vec::new()),
-                                Ok(values) => (0, build_record_batch(p.fetch_offset, &values)),
-                                Err(_) => (1, Vec::new()), // 1 = OFFSET_OUT_OF_RANGE
-                            };
-                        parts.push(FetchPartitionResult {
-                            partition: p.partition,
-                            error_code,
-                            high_watermark: latest,
-                            records,
-                        });
-                    }
-                    out.push(FetchTopicResult { name: t.name.clone(), partitions: parts });
-                }
+                let out = fetch_results(broker, &topics);
                 fetch_response(api_version, correlation_id, &out)
             }
             API_LIST_OFFSETS => {
@@ -344,10 +348,73 @@ fn handle_broker_connection<B: KafkaBroker>(
                 }
                 list_offsets_response(api_version, correlation_id, &out)
             }
+            API_FIND_COORDINATOR => {
+                let _group = parse_find_coordinator(&mut reader, api_version)?;
+                // Single-node: THIS broker is the coordinator (node 0, the advertised host/port).
+                find_coordinator_response(api_version, correlation_id, 0, host, port)
+            }
+            API_OFFSET_COMMIT => {
+                let req = parse_offset_commit(&mut reader, api_version)?;
+                // Durably commit every (topic, partition) offset BEFORE acking; any store failure → a retriable
+                // code so the consumer re-commits rather than assuming durability.
+                let mut error_code = 0i16;
+                for t in &req.topics {
+                    for p in &t.partitions {
+                        if broker.commit_offset(&req.group_id, &t.name, p.partition, p.offset).is_err() {
+                            error_code = 16; // COORDINATOR_NOT_AVAILABLE-class: retriable, never a false success
+                        }
+                    }
+                }
+                offset_commit_response(correlation_id, &req.topics, error_code)
+            }
+            API_OFFSET_FETCH => {
+                let req = parse_offset_fetch(&mut reader, api_version)?;
+                let out = offset_fetch_results(broker, &req);
+                offset_fetch_response(api_version, correlation_id, &out)
+            }
             other => return Err(io::Error::other(format!("unsupported Kafka api_key {other}"))),
         };
         stream.write_all(&Writer::frame(&response))?;
         stream.flush()?;
     }
     Ok(())
+}
+
+/// Resolve a parsed `Fetch` request against the broker: un-seal each partition's records at the edge into a v2
+/// `RecordBatch` (or empty), carrying the high-watermark; a read/open error maps to `OFFSET_OUT_OF_RANGE` (1).
+fn fetch_results<B: KafkaBroker>(broker: &B, topics: &[crate::consume::FetchTopic]) -> Vec<FetchTopicResult> {
+    let mut out = Vec::with_capacity(topics.len());
+    for t in topics {
+        let mut parts = Vec::with_capacity(t.partitions.len());
+        for p in &t.partitions {
+            let (_, latest) = broker.bounds(&t.name, p.partition);
+            let (error_code, records) = match broker.fetch(&t.name, p.partition, p.fetch_offset, p.max_bytes) {
+                Ok(values) if values.is_empty() => (0, Vec::new()),
+                Ok(values) => (0, build_record_batch(p.fetch_offset, &values)),
+                Err(_) => (1, Vec::new()), // 1 = OFFSET_OUT_OF_RANGE
+            };
+            parts.push(FetchPartitionResult { partition: p.partition, error_code, high_watermark: latest, records });
+        }
+        out.push(FetchTopicResult { name: t.name.clone(), partitions: parts });
+    }
+    out
+}
+
+/// Resolve a parsed `OffsetFetch` request against the broker's durable offset store. `-1` ("no committed offset",
+/// the Kafka sentinel) on absence OR a store read error — the consumer then falls back to `auto.offset.reset`
+/// rather than resuming at a wrong position.
+fn offset_fetch_results<B: KafkaBroker>(
+    broker: &B,
+    req: &crate::groups::OffsetFetchRequest,
+) -> Vec<OffsetFetchTopicResult> {
+    let mut out = Vec::with_capacity(req.topics.len());
+    for t in &req.topics {
+        let mut parts = Vec::with_capacity(t.partitions.len());
+        for &partition in &t.partitions {
+            let offset = broker.fetch_offset(&req.group_id, &t.name, partition).ok().flatten().unwrap_or(-1);
+            parts.push(OffsetFetchPartitionResult { partition, offset });
+        }
+        out.push(OffsetFetchTopicResult { name: t.name.clone(), partitions: parts });
+    }
+    out
 }
