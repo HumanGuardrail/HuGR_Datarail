@@ -1,4 +1,4 @@
-name: Kafka broker — real librdkafka round-trip (bidirectional; consumer-group diagnostic)
+name: Kafka broker — real librdkafka round-trip (bidirectional + consumer group)
 
 # Proves the `datarail kafka-broker` drop-in against an ACTUAL Kafka client (kcat = librdkafka), not just our
 # hand-rolled wire tests: a real producer writes, a real consumer reads back (provider-blind: storage is sealed),
@@ -57,31 +57,18 @@ jobs:
           fi
           echo "## librdkafka simple consumer ✅ — read back the 3 records; on-disk store is sealed (provider-blind)" >> "$GITHUB_STEP_SUMMARY"
 
-      # DIAGNOSTIC (not a gate yet): the real librdkafka CONSUMER GROUP path. Our hand-rolled wire tests
-      # (kafka_rebalance_wire / kafka_groups_wire) prove the JoinGroup/SyncGroup/Heartbeat/OffsetCommit protocol,
-      # but a first run against real librdkafka -G read back empty — under investigation. continue-on-error keeps
-      # the PROVEN producer+simple-consumer round-trip above as the gate while we capture librdkafka's own debug
-      # (cgrp/fetch/protocol) here to find what the real group client needs. NOT marked green until it reads back.
-      - name: '[diagnostic] Real librdkafka CONSUMER GROUP round-trip — capture librdkafka debug'
-        continue-on-error: true
+      - name: Real librdkafka CONSUMER GROUP round-trip (FindCoordinator/JoinGroup/SyncGroup/Heartbeat/OffsetCommit/Fetch v4)
         run: |
-          set +e
-          docker run --rm --network host edenhill/kcat:1.7.1 \
-            -b 127.0.0.1:9092 -G ci-consumer-group events -e \
-            -X auto.offset.reset=earliest -X debug=cgrp,fetch,protocol,broker -d cgrp,fetch,protocol &
-          KPID=$!
-          OUT=$(timeout 40 docker run --rm --network host edenhill/kcat:1.7.1 \
-                  -b 127.0.0.1:9092 -G ci-consumer-group-2 events -e -q \
-                  -X auto.offset.reset=earliest 2>&1)
-          wait $KPID 2>/dev/null
+          # NOTE: every flag must come BEFORE `-G <group> <topics…>` — kcat treats anything after the group as a
+          # topic name. -e exits at end-of-partition; a fresh group + auto.offset.reset=earliest starts at offset 0.
+          OUT=$(timeout 45 docker run --rm --network host edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 -q -e -X auto.offset.reset=earliest \
+                  -G ci-consumer-group events 2>&1)
           echo "consumer-group read: [$OUT]"
-          MISS=0
-          for m in evt:c1 evt:c2 evt:c3; do echo "$OUT" | grep -qF "$m" || MISS=1; done
-          if [ "$MISS" = "0" ]; then
-            echo "## librdkafka consumer GROUP ✅ — a real subscribe() group read back all records" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "## librdkafka consumer GROUP ⚠️ under investigation — see the debug log in this step (the protocol is proven by our wire tests; real -G read back empty)" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          for m in evt:c1 evt:c2 evt:c3; do
+            echo "$OUT" | grep -qF "$m" || { echo "::error::consumer GROUP missing $m"; echo "--- full output ---"; echo "$OUT"; exit 1; }
+          done
+          echo "## librdkafka consumer GROUP ✅ — a real subscribe() group joined, was assigned, and read back all records (Fetch v4)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop the broker
         if: always()
