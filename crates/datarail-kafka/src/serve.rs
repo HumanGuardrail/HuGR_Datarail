@@ -148,7 +148,8 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             API_VERSIONS => api_versions_response(api_version, correlation_id),
             API_METADATA => {
                 let topics = parse_metadata_topics(&mut reader)?;
-                metadata_response(api_version, correlation_id, &shared.host, shared.port, &topics)
+                // Ingest merges all partitions into one sink, so a single partition is advertised here.
+                metadata_response(api_version, correlation_id, &shared.host, shared.port, &topics, 1)
             }
             API_PRODUCE => {
                 let topics = parse_produce(&mut reader, api_version)?;
@@ -260,6 +261,7 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
     listener: &TcpListener,
     advertised_host: &str,
     advertised_port: i32,
+    partitions: i32,
     broker: &Arc<B>,
 ) -> io::Result<()> {
     let host = advertised_host.to_owned();
@@ -279,7 +281,7 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
         let pid = Arc::clone(&next_producer_id);
         let active = Arc::clone(&active);
         std::thread::spawn(move || {
-            let _ = handle_broker_connection(stream, broker.as_ref(), &host, advertised_port, &pid);
+            let _ = handle_broker_connection(stream, broker.as_ref(), &host, advertised_port, partitions, &pid);
             active.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -291,6 +293,7 @@ fn handle_broker_connection<B: KafkaBroker>(
     broker: &B,
     host: &str,
     port: i32,
+    partitions: i32,
     next_producer_id: &AtomicI64,
 ) -> io::Result<()> {
     while let Some(frame) = read_frame(&mut stream)? {
@@ -306,7 +309,7 @@ fn handle_broker_connection<B: KafkaBroker>(
             API_VERSIONS => api_versions_response(api_version, correlation_id),
             API_METADATA => {
                 let topics = parse_metadata_topics(&mut reader)?;
-                metadata_response(api_version, correlation_id, host, port, &topics)
+                metadata_response(api_version, correlation_id, host, port, &topics, partitions)
             }
             API_INIT_PRODUCER_ID => {
                 let pid = next_producer_id.fetch_add(1, Ordering::Relaxed);

@@ -52,10 +52,11 @@ USAGE:
     datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]   (cross-process dest)
     datarail kafka-ingest <rail.toml> [--listen ADDR] [--advertised HOST] [--sink-postgres CONN|--sink-webhook URL|--sink-file F]
                      a Kafka wire-protocol endpoint: an UNMODIFIED Kafka producer sends -> datarail seals -> sink
-    datarail kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST] [--data-dir DIR]
+    datarail kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST] [--data-dir DIR] [--partitions N]
                      BIDIRECTIONAL Kafka drop-in: an UNMODIFIED producer writes AND an UNMODIFIED consumer reads
                      back; datarail's storage holds only SEALED cofres on disk (provider-blind, durable across
-                     restart), un-sealed at the fetch edge. --data-dir defaults to ./datarail-kafka-data
+                     restart), un-sealed at the fetch edge. Durable consumer offsets (OffsetCommit/Fetch). --data-dir
+                     defaults to ./datarail-kafka-data; --partitions defaults to 1 (each partition an independent log)
     datarail send <rail.toml> --connect ADDR [--source-file F | record ...] (cross-process source)
 
     keygen --noise   mint a Noise_KK static keypair (X25519) for the encrypted hop.
@@ -1115,7 +1116,7 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     }
 }
 
-/// `kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST] [--data-dir DIR]` — the BIDIRECTIONAL Kafka drop-in: an unmodified
+/// `kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST] [--data-dir DIR] [--partitions N]` — the BIDIRECTIONAL Kafka drop-in: an unmodified
 /// Kafka producer writes, an unmodified Kafka consumer reads back, and datarail's storage holds only sealed cofres
 /// (provider-blind; un-sealed only at the Fetch edge). Blocks as a daemon until killed. See `KAFKA-FETCH-DESIGN.md`.
 fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
@@ -1123,6 +1124,7 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
     let mut listen = "0.0.0.0:9092".to_owned();
     let mut advertised = "127.0.0.1".to_owned();
     let mut data_dir = PathBuf::from("datarail-kafka-data");
+    let mut partitions: i32 = 1;
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -1138,6 +1140,14 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
                 data_dir = PathBuf::from(require(rest, i + 1, "dir")?);
                 i += 2;
             }
+            "--partitions" => {
+                partitions = require(rest, i + 1, "n")?
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|&n| n >= 1)
+                    .ok_or_else(|| CliError::Arg("kafka-broker: --partitions must be a positive integer".into()))?;
+                i += 2;
+            }
             other => return Err(CliError::Arg(format!("kafka-broker: unexpected arg `{other}`"))),
         }
     }
@@ -1145,11 +1155,11 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
     let store = std::sync::Arc::new(KafkaBrokerStore::from_spec(&spec, data_dir.clone()));
     eprintln!(
-        "datarail kafka-broker on {listen} (advertised {advertised}:{port}, data {}) — produce sealed, store \
-         sealed durably, un-seal on fetch (provider-blind bidirectional Kafka)",
+        "datarail kafka-broker on {listen} (advertised {advertised}:{port}, data {}, {partitions} partition(s)) — \
+         produce sealed, store sealed durably, un-seal on fetch (provider-blind bidirectional Kafka)",
         data_dir.display()
     );
-    datarail_kafka::serve::serve_broker(&listener, &advertised, port, &store)
+    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store)
         .map_err(|e| CliError::Io(e.to_string()))?;
     Ok(String::new())
 }

@@ -111,7 +111,8 @@ pub fn parse_metadata_topics(reader: &mut Reader) -> io::Result<Vec<String>> {
 }
 
 /// Build the full `Metadata` response (response header v0 + body) for `req_version` (0 or 1). Advertises this
-/// process as the single broker `node 0` at `host:port`, and each requested topic as a single partition led by us.
+/// process as the single broker `node 0` at `host:port`, and each requested topic as `partitions` partitions
+/// (indices `0..partitions`), all led by us. `partitions` is clamped to `>= 1`.
 #[must_use]
 pub fn metadata_response(
     req_version: i16,
@@ -119,6 +120,7 @@ pub fn metadata_response(
     host: &str,
     port: i32,
     topics: &[String],
+    partitions: i32,
 ) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
@@ -147,14 +149,17 @@ pub fn metadata_response(
             w.int8(0); // is_internal = false
         }
         // partitions: ARRAY of { error_code INT16, partition INT32, leader INT32, replicas ARRAY<INT32>, isr ARRAY<INT32> }
-        w.int32(1);
-        w.int16(0); // error_code
-        w.int32(0); // partition_index 0
-        w.int32(0); // leader = node 0
-        w.int32(1);
-        w.int32(0); // replicas = [0]
-        w.int32(1);
-        w.int32(0); // isr = [0]
+        let n = partitions.max(1);
+        w.int32(n);
+        for p in 0..n {
+            w.int16(0); // error_code
+            w.int32(p); // partition_index
+            w.int32(0); // leader = node 0
+            w.int32(1);
+            w.int32(0); // replicas = [0]
+            w.int32(1);
+            w.int32(0); // isr = [0]
+        }
     }
     w.into_bytes()
 }
