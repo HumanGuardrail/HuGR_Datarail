@@ -23,12 +23,17 @@ jobs:
 
       - name: Generate a CA + server cert + client cert; start the mTLS broker
         run: |
-          openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.pem -days 1 -nodes -subj "/CN=test-ca"
+          # CA with CA:TRUE (webpki requires a real CA cert to anchor the client chain).
+          openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.pem -days 1 -nodes -subj "/CN=test-ca" \
+            -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign"
+          # Server cert: SAN 127.0.0.1 + serverAuth EKU, signed by the CA.
           openssl req -newkey rsa:2048 -keyout srv.key -out srv.csr -nodes -subj "/CN=localhost"
           openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -out srv.pem \
-            -extfile <(printf "subjectAltName=IP:127.0.0.1")
+            -extfile <(printf "subjectAltName=IP:127.0.0.1\nextendedKeyUsage=serverAuth")
+          # Client cert: clientAuth EKU (webpki REQUIRES it for client-cert verification), signed by the CA.
           openssl req -newkey rsa:2048 -keyout cli.key -out cli.csr -nodes -subj "/CN=test-client"
-          openssl x509 -req -in cli.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -out cli.pem
+          openssl x509 -req -in cli.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -out cli.pem \
+            -extfile <(printf "extendedKeyUsage=clientAuth")
           cargo build -p datarail-cli --release --features tls
           ./target/release/datarail kafka-broker examples/rail.toml \
             --listen 0.0.0.0:9092 --advertised 127.0.0.1 --data-dir ./kbroker-data --partitions 1 \
