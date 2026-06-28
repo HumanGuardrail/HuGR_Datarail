@@ -277,6 +277,46 @@ fn corrupt_interior_frame_in_sealed_segment_errors() {
     assert!(errored, "corruption inside a sealed segment must surface as an error, not be silently swallowed");
 }
 
+/// Audit CRITICAL regression: `recv` advances the read cursor on DELIVERY, so a crash after delivering-but-not-
+/// acking some cofres — and acking/checkpointing a LATER one — must RE-DELIVER the un-acked ones on restart, never
+/// skip them. Resuming from the persisted ACK FLOOR (not the advanced read cursor) is what guarantees at-least-once.
+#[test]
+fn delivered_but_unacked_records_are_redelivered_after_a_crash() {
+    const N: u64 = 10;
+    let dir = temp_dir("unacked-redeliver");
+    let acked_seq;
+    {
+        let mut log = DurableLog::open(&dir).expect("open");
+        for seq in 0..N {
+            log.send(&cofre_seq(seq)).expect("send");
+        }
+        log.flush().expect("flush");
+        // Deliver 6, then ack ONLY the 6th (a partial / out-of-order ack) → the first 5 are delivered-but-un-acked.
+        let mut delivered = Vec::new();
+        for _ in 0..6 {
+            delivered.push(log.recv().expect("recv").expect("a cofre"));
+        }
+        let last = delivered.last().expect("6 delivered");
+        acked_seq = last.etiqueta.seq;
+        log.ack(last.etiqueta.cofre_id).expect("ack the 6th only");
+        // DROP here = crash. The 5 delivered-but-un-acked cofres MUST remain re-deliverable.
+    }
+    let mut reopened = DurableLog::open(&dir).expect("reopen");
+    let mut got = std::collections::BTreeSet::new();
+    while let Some(c) = reopened.recv().expect("recv") {
+        got.insert(c.etiqueta.seq);
+        reopened.ack(c.etiqueta.cofre_id).expect("ack");
+    }
+    // At-least-once: every record NOT durably acked before the crash is re-delivered (none lost). The single acked
+    // record may or may not reappear (a harmless duplicate either way) — only loss of an UN-acked record is a bug.
+    for seq in 0..N {
+        if seq == acked_seq {
+            continue;
+        }
+        assert!(got.contains(&seq), "un-acked record {seq} was LOST across the crash (recovered {got:?})");
+    }
+}
+
 fn rss_kb() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;

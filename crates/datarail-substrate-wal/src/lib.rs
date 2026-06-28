@@ -141,7 +141,14 @@ impl DurableLog {
     pub fn open_with(dir: impl AsRef<Path>, cfg: WalConfig) -> Result<Self, WalError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        let (read_id, read_off, _ack_id, _ack_off) = load_cursor(&dir);
+        // Resume reads from the persisted ACK FLOOR — the (segment, offset) below which everything is delivered
+        // AND acked — NOT the advanced read cursor. The read cursor moves on DELIVERY (`recv`), so a crash after
+        // delivering-but-not-acking a cofre, then acking/checkpointing a LATER one, would leave the persisted read
+        // cursor past records that were never acked → those would be skipped on restart and silently LOST,
+        // breaking at-least-once (audit CRITICAL). The ack floor is never past an un-acked record, so resuming
+        // there RE-DELIVERS every delivered-but-un-acked cofre; already-acked records re-read from the floor's
+        // segment are harmless duplicates that downstream effectively-once dedup absorbs.
+        let (_read_id, _read_off, ack_id, ack_off) = load_cursor(&dir);
         let active_id = highest_segment(&dir)?.unwrap_or(1);
         let path = seg_path(&dir, active_id);
         let mut active =
@@ -159,8 +166,8 @@ impl DurableLog {
             write_off,
             buf: Vec::with_capacity(cfg.flush_bytes + (MAX_COFRE_WIRE_LEN / 64).min(1 << 20)),
             last_flush: Instant::now(),
-            read_id: read_id.max(1),
-            read_off,
+            read_id: ack_id.max(1),
+            read_off: ack_off,
             read_file: None,
             inflight: HashMap::new(),
             seg_inflight: HashMap::new(),

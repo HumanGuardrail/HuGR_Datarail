@@ -202,6 +202,33 @@ never panic/over-read; single `Mutex`, poisoning via `into_inner`, no nested loc
 `kbroker-{topic}-…` is HMAC'd into `idempotency_key` and the carga is ciphertext → no plaintext (nor the topic)
 reaches disk. Provider-blind-on-disk additionally proven by the rewritten store test + the restart wire test.
 
+## Whole-repo audit (2026-06-27) — WAL CRITICAL fixed; one stale HIGH rejected
+
+A whole-repo background auditor (isolated worktree) swept all 34 crates. Headline findings, each cold-verified by
+the lead against source before acting:
+
+- **CRITICAL — durable WAL silently lost delivered-but-un-acked records on crash → FIXED AT ROOT.** `DurableLog::recv`
+  advances the read cursor on DELIVERY (`lib.rs:298`); `checkpoint` persists that advanced cursor (`:235`) AND the
+  ack floor (`:236-237`); but `open_with` resumed at the advanced `read_off` and **discarded** the persisted ack
+  floor (`:144`). So a crash after delivering-but-not-acking some cofres — then acking/checkpointing a LATER one —
+  left the persisted read cursor past records that were never acked → they were skipped on restart, **lost**, not
+  re-delivered (at-least-once violated). Cold-verified by reading recv/ack/checkpoint/`ack_floor`/`open_with` and
+  reproduced. **Fix:** `open_with` now resumes from the persisted ACK FLOOR `(ack_id, ack_off)` (which is never past
+  an un-acked record), so every delivered-but-un-acked cofre is re-delivered; already-acked records re-read from the
+  floor's segment are harmless duplicates (downstream effectively-once dedup absorbs them). Regression:
+  `delivered_but_unacked_records_are_redelivered_after_a_crash`; the existing `power_loss_recovery_zero_loss` +
+  `rotation_and_gc_zero_loss` still pass (fix is behaviour-preserving for acked records).
+- **HIGH "Tier-A `commit_at` never wired into a product flow" — REJECTED (stale/incorrect).** Cold-verify:
+  `select_sink` picks `AnySink::Txn` for an append-ordered Postgres sink (`main.rs:312,666-667`), whose `commit`/
+  `commit_seq` ARE `pg.commit_at`/`commit_at_seq` (`:592,605`), driven by `ship_batch`/`ship_batch_seq` in BOTH
+  `run` and `kafka-ingest` (`:751,776,951`), and proven end-to-end by `connectors-live.yml` (run ×2 → 3 rows;
+  append +1 → 4 not 7). The auditor's grep for a literal `commit_at` call missed that `AnySink::commit` is the
+  wiring. No change. (The related "`FileOnce` persistent dedup not wired" is not a defect for the product guarantee
+  — the Postgres-resident watermark, not the terminal's in-RAM `Once`, is the exactly-once authority.)
+
+Other findings (shmem send-side `checked_sub`, secret zeroization, replication/tiered durability-before-ack,
+fuzz/CI-gate gaps, honesty-ledger nits) are being triaged in turn; see `BUILD_LOG.md`.
+
 ## Kafka-OFFSETS audit (2026-06-27) — brutal adversarial pass on durable consumer offsets (increment 3)
 
 An 8th auditor (isolated worktree, from `1033745`) attacked the new `FindCoordinator`/`OffsetCommit`/`OffsetFetch`
