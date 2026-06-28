@@ -41,6 +41,9 @@ struct Member {
     assignment: Option<Vec<u8>>,
     last_heartbeat: Instant,
     session_timeout: Duration,
+    /// How long the member is willing to wait for a rebalance (its advertised `rebalance_timeout_ms`); bounds how
+    /// long it parks in `SyncGroup` for the leader's assignments (audit 4b LOW: was a fixed coordinator timeout).
+    rebalance_timeout: Duration,
 }
 
 struct Group {
@@ -160,7 +163,7 @@ impl GroupCoordinator {
         group: &str,
         member_id: &str,
         session_timeout_ms: i32,
-        _rebalance_timeout_ms: i32,
+        rebalance_timeout_ms: i32,
         protocol_type: &str,
         protocols: &[(String, Vec<u8>)],
     ) -> JoinOutcome {
@@ -177,6 +180,8 @@ impl GroupCoordinator {
                 member_id.to_owned()
             };
             let session = Duration::from_millis(u64::try_from(session_timeout_ms).unwrap_or(30_000).clamp(1, 3_600_000));
+            let rebalance =
+                Duration::from_millis(u64::try_from(rebalance_timeout_ms).unwrap_or(30_000).clamp(1, 3_600_000));
             let (proto_names, subscription) = split_protocols(protocols);
             g.members.insert(
                 mid.clone(),
@@ -186,6 +191,7 @@ impl GroupCoordinator {
                     assignment: None,
                     last_heartbeat: now,
                     session_timeout: session,
+                    rebalance_timeout: rebalance,
                 },
             );
             if !protocol_type.is_empty() {
@@ -197,7 +203,7 @@ impl GroupCoordinator {
             // gets an assignment. (Kafka semantics: any join outside an open window re-opens it.)
             if !matches!(g.state, GroupState::PreparingRebalance) {
                 g.state = GroupState::PreparingRebalance;
-                g.generation = g.generation.wrapping_add(1);
+                g.generation = g.generation.checked_add(1).unwrap_or(1); // stay positive — never wrap to the -1 "unknown" sentinel (audit 4b LOW)
                 g.deadline = Some(now + delay);
                 // a new rebalance invalidates prior assignments
                 for m in g.members.values_mut() {
@@ -267,7 +273,7 @@ impl GroupCoordinator {
         assignments: &[(String, Vec<u8>)],
     ) -> SyncOutcome {
         let mut guard = self.lock();
-        {
+        let park_for = {
             let Some(g) = guard.get_mut(group) else {
                 return SyncOutcome { error_code: UNKNOWN_MEMBER_ID, assignment: Vec::new() };
             };
@@ -277,7 +283,10 @@ impl GroupCoordinator {
             if g.generation != generation {
                 return SyncOutcome { error_code: ILLEGAL_GENERATION, assignment: Vec::new() };
             }
-            if !assignments.is_empty() {
+            // ONLY the leader's assignments are authoritative (audit 4b MEDIUM): a non-leader's `SyncGroup` must
+            // not be able to drive the group to Stable or inject assignment bytes for other members. A follower's
+            // assignments (if any) are ignored — it then parks for the leader's like a normal follower.
+            if !assignments.is_empty() && g.leader.as_deref() == Some(member_id) {
                 for (mid, bytes) in assignments {
                     if let Some(m) = g.members.get_mut(mid) {
                         m.assignment = Some(bytes.clone());
@@ -287,9 +296,13 @@ impl GroupCoordinator {
                 g.deadline = None;
                 self.cond.notify_all();
             }
-        }
+            // Park bound = this member's OWN advertised rebalance timeout (already clamped to ≤1h at join), so a
+            // client that declared a long patience for a slow leader is honored and they time out together — not
+            // a fixed coordinator timeout that could give up early (audit 4b LOW).
+            g.members.get(member_id).map_or(self.sync_timeout, |m| m.rebalance_timeout)
+        };
 
-        let deadline = Instant::now() + self.sync_timeout;
+        let deadline = Instant::now() + park_for;
         loop {
             let now = Instant::now();
             let outcome = {
@@ -364,7 +377,7 @@ impl GroupCoordinator {
             g.deadline = None;
         } else {
             g.state = GroupState::PreparingRebalance;
-            g.generation = g.generation.wrapping_add(1);
+            g.generation = g.generation.checked_add(1).unwrap_or(1); // stay positive — never wrap to the -1 "unknown" sentinel (audit 4b LOW)
             g.deadline = Some(now + self.rebalance_delay);
             if g.leader.as_deref() == Some(member_id) {
                 g.leader = g.members.keys().next().cloned();
@@ -461,6 +474,36 @@ mod tests {
         let fs = fh.join().expect("thread");
         assert_eq!(ls.assignment, b"L");
         assert_eq!(fs.assignment, b"F", "follower received the leader's assignment after parking");
+    }
+
+    #[test]
+    fn only_the_leader_can_submit_assignments() {
+        // Audit 4b MEDIUM regression: a FOLLOWER's SyncGroup assignments must be IGNORED — it cannot drive the
+        // group Stable nor inject assignment bytes; only the leader's are authoritative.
+        let c = Arc::new(fast());
+        let c2 = Arc::clone(&c);
+        let h = std::thread::spawn(move || c2.join("g", "", 30_000, 30_000, "consumer", &proto()));
+        std::thread::sleep(Duration::from_millis(20));
+        let a = c.join("g", "", 30_000, 30_000, "consumer", &proto());
+        let b = h.join().expect("thread");
+        let gen = a.generation;
+        let (leader_id, follower_id) =
+            if a.member_id == a.leader { (a.member_id, b.member_id) } else { (b.member_id, a.member_id) };
+
+        // The follower tries to inject assignments for everyone — these must be ignored, so it parks for the
+        // leader's real sync (run in a thread).
+        let cc = Arc::clone(&c);
+        let (fid, lid) = (follower_id.clone(), leader_id.clone());
+        let fh = std::thread::spawn(move || {
+            cc.sync("g", &fid, gen, &[(fid.clone(), b"INJECTED-F".to_vec()), (lid, b"INJECTED-L".to_vec())])
+        });
+        std::thread::sleep(Duration::from_millis(40));
+        // The leader's legit sync is authoritative.
+        let ls = c.sync("g", &leader_id, gen, &[(leader_id.clone(), b"L".to_vec()), (follower_id.clone(), b"F".to_vec())]);
+        let fs = fh.join().expect("thread");
+        assert_eq!(ls.assignment, b"L", "leader gets its own assignment");
+        assert_eq!(fs.assignment, b"F", "follower gets the LEADER's assignment, not its injected bytes");
+        assert_ne!(fs.assignment, b"INJECTED-F", "the follower's self-injected assignment was rejected");
     }
 
     #[test]
