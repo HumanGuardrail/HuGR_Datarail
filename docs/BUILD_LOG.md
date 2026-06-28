@@ -875,6 +875,17 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   gate; bundled the JoinGroup response into a struct instead). Docs: KAFKA-REBALANCE-DESIGN (BUILT+PROVEN),
   KAFKA-COMPAT, LASTRO-MATRIX. **PENDING: the concurrency-focused adversarial audit (part of the owner-requested
   4-way Opus brutal audit, next).**
+- 2026-06-27 — **✅ 4-way Opus audit + re-run + remediation; secret-zeroize hardening.** Ran 4 independent Opus
+  auditors (concurrency/crypto/durability/parse+honesty); 3 of 4 hit STALE worktrees so the lead cold-verified
+  every finding against current `main` (AP-5) and RE-RAN the 3 stale lanes (`CORE-AUDIT.md` §4-way). **Fixed:** 3
+  concurrency defects (leader-only SyncGroup, generation stays positive, follower honors its rebalance_timeout) +
+  1 durability LOW (ingest base-offset advances only on durable land) + honesty refinements (n=3 = manual
+  dispatches; reconciled RAM multipliers). **Rejected** every CRITICAL/HIGH as a stale-worktree artifact
+  (cold-verified already fixed/present on main). Full `cargo test --workspace` GREEN (exit 0, 30 binaries) +
+  clippy -D warnings clean. **Then CLOSED the tracked moat-hygiene gap (`9550128`):** `impl Drop { zeroize }` on
+  every long-lived-secret holder (dest X25519 key, source/sender/once seeds, tenant_secret). Roadmap now
+  exhausted of buildable, non-blocked, in-scope items; remaining = owner-decision (TLS/compression deps waiver,
+  shmem #24) / external (librdkafka CI, OMB n=3 HW) / large-future (transactional EOS). forbid(unsafe); no #[allow].
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

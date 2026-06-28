@@ -375,6 +375,7 @@ version = "0.0.0"
 dependencies = [
  "datarail-blobstore",
  "datarail-broker",
+ "datarail-cofre",
  "datarail-erasure",
  "datarail-kafka",
  "datarail-netblob",
@@ -451,6 +452,7 @@ version = "0.0.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
+ "zeroize",
 ]
 
 [[package]]

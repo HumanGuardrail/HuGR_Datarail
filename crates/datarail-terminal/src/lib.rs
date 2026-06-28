@@ -301,6 +301,13 @@ impl SenderCredential {
 }
 
 /// Redacting `Debug` (never print the sender signing seed).
+/// Wipe the sealed-sender Ed25519 `sender_seed` on drop (defense-in-depth — complements the redacting `Debug`).
+impl Drop for SenderCredential {
+    fn drop(&mut self) {
+        self.sender_seed.zeroize();
+    }
+}
+
 impl core::fmt::Debug for SenderCredential {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SenderCredential")
@@ -588,6 +595,13 @@ pub struct TerminalConfig {
 }
 
 /// Redacting `Debug` (AUDIT-02): never print the `tenant_secret` MAC key. Public route params are shown.
+/// Wipe the `tenant_secret` (HMAC key for idempotency-key derivation) on drop — every clone wipes its own copy.
+impl Drop for TerminalConfig {
+    fn drop(&mut self) {
+        self.tenant_secret.zeroize();
+    }
+}
+
 impl core::fmt::Debug for TerminalConfig {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("TerminalConfig")
@@ -624,6 +638,13 @@ pub struct SourceTerminal {
 }
 
 /// Redacting `Debug` (AUDIT-02): never print the Ed25519 `source_seed`.
+/// Wipe the Ed25519 `source_seed` (the route's signing identity) on drop (defense-in-depth).
+impl Drop for SourceTerminal {
+    fn drop(&mut self) {
+        self.source_seed.zeroize();
+    }
+}
+
 impl core::fmt::Debug for SourceTerminal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SourceTerminal")
@@ -779,6 +800,15 @@ pub struct DestTerminal {
 
 /// Redacting `Debug` (AUDIT-02): never print the destination X25519 secret (the `Once` gate redacts its own
 /// signing seed).
+/// Wipe this destination's X25519 secret — the per-cofre data-key unwrap key whose compromise breaks
+/// provider-blindness for the whole route — on drop (defense-in-depth; the moat key must not linger in freed
+/// heap / a core dump / swap). The nested `config`/`once` zeroize their own secrets via their own `Drop`.
+impl Drop for DestTerminal {
+    fn drop(&mut self) {
+        self.dest_x25519_secret.zeroize();
+    }
+}
+
 impl core::fmt::Debug for DestTerminal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("DestTerminal")
