@@ -53,6 +53,16 @@ pub trait ConnWrap: Send + Sync {
     fn wrap(&self, stream: TcpStream) -> io::Result<Box<dyn ReadWrite + Send>>;
 }
 
+/// A configured SASL/PLAIN credential (`KAFKA-SASL-DESIGN.md`). When `serve_broker` is given `Some`, a client must
+/// authenticate (`SaslHandshake` → `SaslAuthenticate`) before any other API; `None` means SASL is off (as today).
+#[derive(Clone)]
+pub struct SaslCreds {
+    /// The expected username.
+    pub user: String,
+    /// The expected password (checked constant-time; PLAIN sends it in the clear, so pair with TLS).
+    pub pass: String,
+}
+
 /// Plaintext transport: the accepted socket IS the stream, unchanged (no dependency, the default).
 pub struct PlainConn;
 
@@ -341,6 +351,7 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
     partitions: i32,
     broker: &Arc<B>,
     conn_wrap: &Arc<dyn ConnWrap>,
+    creds: Option<SaslCreds>,
 ) -> io::Result<()> {
     let host = advertised_host.to_owned();
     let next_producer_id = Arc::new(AtomicI64::new(1));
@@ -348,6 +359,7 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
     // Transactional producer ids live in a distinct high range so they never collide with the idempotent
     // allocator's (which counts up from 1).
     let txn_coordinator = Arc::new(TxnCoordinator::new(1 << 40));
+    let creds = creds.map(Arc::new); // shared across connection threads; None = SASL off (today's behavior)
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let stream = stream?;
@@ -365,11 +377,12 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
         let txn = Arc::clone(&txn_coordinator);
         let active = Arc::clone(&active);
         let conn_wrap = Arc::clone(conn_wrap);
+        let creds = creds.clone();
         std::thread::spawn(move || {
             let ctx = BrokerCtx { host: &host, port: advertised_port, partitions, next_producer_id: &pid };
             // Wrap the raw socket (identity for plaintext, a TLS handshake otherwise) before serving.
             if let Ok(mut s) = conn_wrap.wrap(stream) {
-                let _ = handle_broker_connection(&mut *s, broker.as_ref(), &ctx, &coord, &txn);
+                let _ = handle_broker_connection(&mut *s, broker.as_ref(), &ctx, &coord, &txn, creds.as_deref());
             }
             active.fetch_sub(1, Ordering::Relaxed);
         });
@@ -391,7 +404,10 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
     ctx: &BrokerCtx<'_>,
     coordinator: &GroupCoordinator,
     txn: &TxnCoordinator,
+    creds: Option<&SaslCreds>,
 ) -> io::Result<()> {
+    // SASL off (no configured credential) → authenticated from the start = today's behavior, byte-identical.
+    let mut authenticated = creds.is_none();
     while let Some(frame) = read_frame(&mut stream)? {
         let mut reader = Reader::new(&frame);
         let api_key = reader.int16()?;
@@ -400,6 +416,25 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
         let _client_id = reader.nullable_string()?;
         if request_is_flexible(api_key, api_version) {
             reader.skip_tagged_fields()?;
+        }
+        // SASL handshake/auth APIs are handled here (and update `authenticated`); a failed auth closes the conn.
+        match handle_sasl(api_key, api_version, correlation_id, &mut reader, creds, &mut authenticated)? {
+            SaslOutcome::Reply(r) => {
+                stream.write_all(&Writer::frame(&r))?;
+                stream.flush()?;
+                continue;
+            }
+            SaslOutcome::CloseAfter(r) => {
+                stream.write_all(&Writer::frame(&r))?;
+                stream.flush()?;
+                return Ok(());
+            }
+            SaslOutcome::Pass => {}
+        }
+        // Pre-auth gating: until authenticated, only ApiVersions (and the SASL APIs, handled above) are served;
+        // any other API closes the connection (a SASL client always authenticates before producing).
+        if !authenticated && api_key != API_VERSIONS {
+            return Ok(());
         }
         let response = match api_key {
             API_VERSIONS => api_versions_response(api_version, correlation_id),
@@ -478,6 +513,43 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
         stream.flush()?;
     }
     Ok(())
+}
+
+/// What the SASL pre-stage decided for a request: send a reply and keep going, send a reply then close (failed
+/// auth), or it was not a SASL request (proceed to the normal dispatch).
+enum SaslOutcome {
+    Reply(Vec<u8>),
+    CloseAfter(Vec<u8>),
+    Pass,
+}
+
+/// Handle the SASL handshake/auth APIs (`KAFKA-SASL-DESIGN.md`). For `SaslHandshake` it negotiates the mechanism;
+/// for `SaslAuthenticate` it verifies the PLAIN credential (constant-time) and flips `authenticated`. Any other API
+/// returns `Pass`. With no configured credential, an auth attempt is accepted (SASL is off).
+fn handle_sasl(
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    reader: &mut Reader<'_>,
+    creds: Option<&SaslCreds>,
+    authenticated: &mut bool,
+) -> io::Result<SaslOutcome> {
+    if api_key == crate::sasl::API_SASL_HANDSHAKE {
+        let mechanism = crate::sasl::parse_sasl_handshake(reader)?;
+        let code = if mechanism == crate::sasl::PLAIN { 0 } else { crate::sasl::UNSUPPORTED_SASL_MECHANISM };
+        return Ok(SaslOutcome::Reply(crate::sasl::sasl_handshake_response(correlation_id, code, &[crate::sasl::PLAIN])));
+    }
+    if api_key == crate::sasl::API_SASL_AUTHENTICATE {
+        let token = crate::sasl::parse_sasl_authenticate(reader, api_version)?;
+        let ok = creds.is_none_or(|c| crate::sasl::verify_plain(&token, &c.user, &c.pass));
+        let resp = |code, msg| crate::sasl::sasl_authenticate_response(correlation_id, api_version, code, msg, &[], 0);
+        if ok {
+            *authenticated = true;
+            return Ok(SaslOutcome::Reply(resp(0, None)));
+        }
+        return Ok(SaslOutcome::CloseAfter(resp(crate::sasl::SASL_AUTHENTICATION_FAILED, Some("authentication failed"))));
+    }
+    Ok(SaslOutcome::Pass)
 }
 
 /// Handle the consumer-group REBALANCE APIs (JoinGroup/SyncGroup/Heartbeat/LeaveGroup) against the coordinator.

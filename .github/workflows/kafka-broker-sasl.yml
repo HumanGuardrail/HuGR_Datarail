@@ -1,0 +1,73 @@
+name: Kafka broker SASL/PLAIN — real librdkafka (security.protocol=SASL_PLAINTEXT)
+
+# Proves SASL/PLAIN client authentication (KAFKA-SASL-DESIGN.md) against a REAL Kafka client: kcat (= librdkafka)
+# with security.protocol=SASL_PLAINTEXT + sasl.mechanism=PLAIN authenticates, then produces+consumes; and a
+# WRONG-password client is rejected (its records never land). Force 127.0.0.1 (avoid the localhost→IPv6 flake).
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/datarail-kafka/**"
+      - "crates/datarail-cli/**"
+      - ".github/workflows/kafka-broker-sasl.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sasl-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build + start the broker with SASL/PLAIN
+        run: |
+          cargo build -p datarail-cli --release
+          ./target/release/datarail kafka-broker examples/rail.toml \
+            --listen 0.0.0.0:9092 --advertised 127.0.0.1 --data-dir ./kbroker-data --partitions 1 \
+            --sasl-user datarail --sasl-pass s3cret > broker.log 2>&1 &
+          echo $! > broker.pid
+          SASL="-X security.protocol=SASL_PLAINTEXT -X sasl.mechanism=PLAIN -X sasl.username=datarail -X sasl.password=s3cret"
+          for i in $(seq 1 20); do
+            if docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9092 $SASL -L -m 5 >/dev/null 2>&1; then
+              echo "SASL broker up"; break
+            fi
+            sleep 1
+          done
+
+      - name: Authenticated producer + consumer round-trip (provider-blind on disk)
+        run: |
+          SASL="-X security.protocol=SASL_PLAINTEXT -X sasl.mechanism=PLAIN -X sasl.username=datarail -X sasl.password=s3cret"
+          printf 'evt:sa-1\nevt:sa-2\nevt:sa-3\n' \
+            | docker run --rm -i --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9092 $SASL -t events -P
+          sleep 1
+          OUT=$(timeout 30 docker run --rm --network host edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 $SASL -t events -C -o beginning -e -q 2>&1)
+          echo "authenticated read: [$OUT]"
+          for n in 1 2 3; do
+            echo "$OUT" | grep -qF "evt:sa-$n" || { echo "::error::authenticated consumer missing evt:sa-$n"; exit 1; }
+          done
+          if grep -rqa "evt:sa-1" ./kbroker-data 2>/dev/null; then
+            echo "::error::plaintext found on disk — provider-blind violated"; exit 1
+          fi
+
+      - name: A WRONG password is rejected — its records never land
+        run: |
+          BAD="-X security.protocol=SASL_PLAINTEXT -X sasl.mechanism=PLAIN -X sasl.username=datarail -X sasl.password=WRONG"
+          GOOD="-X security.protocol=SASL_PLAINTEXT -X sasl.mechanism=PLAIN -X sasl.username=datarail -X sasl.password=s3cret"
+          printf 'evt:bad-1\n' \
+            | docker run --rm -i --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9092 $BAD -t events-bad -P 2>&1 \
+            | sed 's/^/  [wrong-pass] /' || true
+          sleep 1
+          OUT=$(timeout 20 docker run --rm --network host edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 $GOOD -t events-bad -C -o beginning -e -q 2>&1 || true)
+          echo "events-bad after a wrong-password produce: [$OUT]"
+          if echo "$OUT" | grep -qF "evt:bad-1"; then
+            echo "::error::a WRONG-password produce LANDED — SASL is not enforced"; exit 1
+          fi
+          echo "## Kafka SASL/PLAIN ✅ — real librdkafka authenticated round-trip works; a wrong password is rejected (no records land)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the broker
+        if: always()
+        run: '[ -f broker.pid ] && kill "$(cat broker.pid)" 2>/dev/null || true'

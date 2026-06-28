@@ -101,8 +101,9 @@ datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
 # commit + offsets-in-txn, abort hides records, stale-epoch zombies fenced — audited, `KAFKA-TXN-DESIGN.md`; scope:
 # one producer per partition/txn). Hop (1) is optionally TLS-encrypted (`--tls`, `--features tls`; server-side
 # termination, proven vs real librdkafka over TLS). COMPRESSED producers work too (`--features compression`:
-# gzip/lz4/zstd/snappy, decompressed broker-side + sealed — proven vs real librdkafka in CI). (Single-node; SASL +
-# mTLS tracked.)
+# gzip/lz4/zstd/snappy, decompressed broker-side + sealed — proven vs real librdkafka in CI). And SASL/PLAIN auth
+# (`--sasl-user`/`--sasl-pass`; a client must authenticate before producing — proven vs real librdkafka; pair with
+# `--tls` for SASL_SSL). (Single-node; SCRAM + mTLS tracked.)
 ```
 
 Lower-level rehearsals (files, two-process TCP, identity pairing):

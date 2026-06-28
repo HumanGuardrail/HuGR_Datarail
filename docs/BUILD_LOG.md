@@ -966,6 +966,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   > support; all are pure-Rust (no C, unlike the `zstd` crate) and decompress-only. The default binary is unaffected
   > (feature off, like `quic`/`tls`). remediation: n/a (feature-gated). forbid-unsafe holds (our code stays
   > unsafe-free; the codecs' internal `unsafe` is theirs). tracking: `KAFKA-COMPRESSION-DESIGN.md`.
+- 2026-06-28 — **✅ SASL/PLAIN authentication on the Kafka hop (PROVEN vs real librdkafka).** Pairs with the TLS
+  hop — SASL+TLS is the standard enterprise broker-auth combo. With `--sasl-user`/`--sasl-pass`, a client must
+  authenticate (`SaslHandshake` (17) → `SaslAuthenticate` (36), mechanism `PLAIN`) before any other API; a failed
+  auth gets `58` then the connection closes; pre-auth gating closes the connection for any non-`ApiVersions`/non-SASL
+  API. **Zero new deps**: PLAIN is a NUL-split (RFC 4616) + a hand-rolled CONSTANT-TIME compare (`ct_eq`,
+  XOR-accumulate — no `subtle`; `forbid(unsafe)`). The codec (`sasl.rs`) is pure wire like the rest of the crate;
+  the serve gating lives in `serve_broker`/`handle_broker_connection` above the TLS `ConnWrap`. **Default (no
+  `--sasl-*`) is byte-identical to before** (kafka 54 + all broker/tls/rebalance wire tests green). Proven by
+  `kafka-broker-sasl.yml` (run 28336726671): real kcat/librdkafka authenticates (`security.protocol=SASL_PLAINTEXT`)
+  + round-trips, and a WRONG password is rejected (records never land); on-disk ciphertext. Commits 1300f43→cc8dffe
+  on `sasl-kafka-hop` (PR #12). Honest scope: PLAIN only (SCRAM/GSSAPI tracked), single credential, password-in-clear
+  unless combined with `--tls` (the CLI warns); authentication only (no ACLs).
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

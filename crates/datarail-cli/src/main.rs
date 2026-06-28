@@ -1238,6 +1238,8 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
     let mut tls = false;
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
+    let mut sasl_user: Option<String> = None;
+    let mut sasl_pass: Option<String> = None;
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -1273,20 +1275,42 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
                 tls_key = Some(require(rest, i + 1, "pem")?.to_string());
                 i += 2;
             }
+            "--sasl-user" => {
+                sasl_user = Some(require(rest, i + 1, "user")?.to_string());
+                i += 2;
+            }
+            "--sasl-pass" => {
+                sasl_pass = Some(require(rest, i + 1, "pass")?.to_string());
+                i += 2;
+            }
             other => return Err(CliError::Arg(format!("kafka-broker: unexpected arg `{other}`"))),
         }
     }
+    // SASL/PLAIN: both flags or neither. Without --tls the password is on the wire in the clear — warn.
+    let sasl_creds = match (sasl_user, sasl_pass) {
+        (Some(user), Some(pass)) => {
+            if !tls {
+                eprintln!(
+                    "warning: SASL/PLAIN without --tls sends the password in the clear; combine --sasl-* with --tls"
+                );
+            }
+            Some(datarail_kafka::serve::SaslCreds { user, pass })
+        }
+        (None, None) => None,
+        _ => return Err(CliError::Arg("kafka-broker: --sasl-user and --sasl-pass must be given together".into())),
+    };
     let port: i32 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(9092);
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
     let store = std::sync::Arc::new(KafkaBrokerStore::from_spec(&spec, data_dir.clone()));
     eprintln!(
         "datarail kafka-broker on {listen} (advertised {advertised}:{port}, data {}, {partitions} partition(s)) — \
-         produce sealed, store sealed durably, un-seal on fetch (provider-blind bidirectional Kafka){}",
+         produce sealed, store sealed durably, un-seal on fetch (provider-blind bidirectional Kafka){}{}",
         data_dir.display(),
-        if tls { " [TLS]" } else { "" }
+        if tls { " [TLS]" } else { "" },
+        if sasl_creds.is_some() { " [SASL/PLAIN]" } else { "" }
     );
     let conn_wrap = build_conn(tls, tls_cert, tls_key)?;
-    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store, &conn_wrap)
+    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store, &conn_wrap, sasl_creds)
         .map_err(|e| CliError::Io(e.to_string()))?;
     Ok(String::new())
 }

@@ -15,5 +15,6 @@ pub mod coordinator;
 pub mod groups;
 pub mod handlers;
 pub mod produce;
+pub mod sasl;
 pub mod serve;
 pub mod txn;
