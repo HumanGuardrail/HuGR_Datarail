@@ -1,0 +1,75 @@
+name: Kafka broker — real librdkafka round-trip (bidirectional + consumer group)
+
+# Proves the `datarail kafka-broker` drop-in against an ACTUAL Kafka client (kcat = librdkafka), not just our
+# hand-rolled wire tests: a real producer writes, a real consumer reads back (provider-blind: storage is sealed),
+# and a real CONSUMER GROUP reads back too — which drives the full FindCoordinator / JoinGroup / SyncGroup /
+# Heartbeat / OffsetCommit / OffsetFetch protocol. (LASTRO rule: no claim without a committed repro.)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/datarail-kafka/**"
+      - "crates/datarail-cli/**"
+      - ".github/workflows/kafka-broker-librdkafka.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  librdkafka-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the broker + start it
+        run: |
+          cargo build -p datarail-cli --release
+          ./target/release/datarail kafka-broker examples/rail.toml \
+            --listen 0.0.0.0:9092 --advertised 127.0.0.1 \
+            --data-dir ./kbroker-data --partitions 1 &
+          echo $! > broker.pid
+          # wait for the listener
+          for i in $(seq 1 20); do
+            if docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9092 -L -m 5 >/dev/null 2>&1; then
+              echo "broker is up"; break
+            fi
+            sleep 1
+          done
+
+      - name: Real librdkafka PRODUCER → datarail kafka-broker (seal + store)
+        run: |
+          printf 'evt:c1\nevt:c2\nevt:c3\n' \
+            | docker run --rm -i --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9092 -t events -P
+          sleep 1
+
+      - name: Real librdkafka simple CONSUMER reads back the plaintext (provider-blind round-trip)
+        run: |
+          OUT=$(timeout 30 docker run --rm --network host edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 -t events -C -o beginning -e -q 2>/dev/null || true)
+          echo "consumer read: [$OUT]"
+          for m in evt:c1 evt:c2 evt:c3; do
+            echo "$OUT" | grep -qF "$m" || { echo "::error::simple consumer missing $m"; exit 1; }
+          done
+          # The on-disk store must hold ONLY ciphertext (provider-blind) — never the plaintext.
+          if grep -rqa "evt:c1" ./kbroker-data 2>/dev/null; then
+            echo "::error::plaintext found on disk — provider-blind violated"; exit 1
+          fi
+          echo "## librdkafka simple consumer ✅ — read back the 3 records; on-disk store is sealed (provider-blind)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Real librdkafka CONSUMER GROUP round-trip (FindCoordinator/JoinGroup/SyncGroup/Heartbeat/OffsetCommit/Fetch v4)
+        run: |
+          # NOTE: every flag must come BEFORE `-G <group> <topics…>` — kcat treats anything after the group as a
+          # topic name. -e exits at end-of-partition; a fresh group + auto.offset.reset=earliest starts at offset 0.
+          OUT=$(timeout 45 docker run --rm --network host edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 -q -e -X auto.offset.reset=earliest \
+                  -G ci-consumer-group events 2>&1)
+          echo "consumer-group read: [$OUT]"
+          for m in evt:c1 evt:c2 evt:c3; do
+            echo "$OUT" | grep -qF "$m" || { echo "::error::consumer GROUP missing $m"; echo "--- full output ---"; echo "$OUT"; exit 1; }
+          done
+          echo "## librdkafka consumer GROUP ✅ — a real subscribe() group joined, was assigned, and read back all records (Fetch v4)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the broker
+        if: always()
+        run: '[ -f broker.pid ] && kill "$(cat broker.pid)" 2>/dev/null || true'

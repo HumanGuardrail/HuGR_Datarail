@@ -117,11 +117,13 @@ pub fn fetch_response(version: i16, correlation_id: i32, topics: &[FetchTopicRes
             w.int64(p.high_watermark);
             if version >= 4 {
                 w.int64(p.high_watermark); // last_stable_offset (no transactions → = high watermark)
-                w.int32(-1); // aborted_transactions: null array
+                w.int32(0); // aborted_transactions: EMPTY array (not null -1 — real librdkafka rejects -1 here,
+                            // "Protocol parse failure for Fetch v4 at <byte 46>"; a real broker sends 0)
             }
-            // record_set as NULLABLE_BYTES: -1 length for empty, else the batch bytes.
+            // record_set (RECORDS): an EMPTY partition is a ZERO-length set, NOT null (-1) — librdkafka rejects a
+            // -1 size as "invalid MessageSetSize -1", which silently broke real consumer-group fetches.
             if p.records.is_empty() {
-                w.int32(-1);
+                w.int32(0);
             } else {
                 w.bytes(&p.records);
             }
@@ -277,6 +279,40 @@ mod tests {
         // Re-parse the embedded batch (after locating it is fiddly; just assert it round-trips when handed back).
         let parsed = crate::produce::parse_record_batch(&batch).expect("batch parses");
         assert_eq!(parsed.values, vec![b"evt:a".to_vec(), b"evt:b".to_vec()]);
+    }
+
+    #[test]
+    fn fetch_response_v4_empty_partition_uses_zero_not_null() {
+        // Regression (real-librdkafka compat): an EMPTY partition in a Fetch v4 response must encode
+        // aborted_transactions = empty array (0) and record_set = zero-length (0) — NEVER null (-1). Real
+        // librdkafka rejects -1 with "Protocol parse failure for Fetch v4 at <aborted-txns>" / "invalid
+        // MessageSetSize -1", which silently broke real consumer-group fetches (the rebalance worked; the
+        // follow-up Fetch did not). Walk the exact v4 layout and assert the last two int32s are 0.
+        let resp = fetch_response(
+            4,
+            7,
+            &[FetchTopicResult {
+                name: "events".to_owned(),
+                partitions: vec![FetchPartitionResult {
+                    partition: 0,
+                    error_code: 0,
+                    high_watermark: 3,
+                    records: Vec::new(),
+                }],
+            }],
+        );
+        let mut r = Reader::new(&resp);
+        assert_eq!(r.int32().unwrap(), 7, "correlation_id");
+        assert_eq!(r.int32().unwrap(), 0, "throttle_time_ms");
+        assert_eq!(r.int32().unwrap(), 1, "topics count");
+        assert_eq!(r.string().unwrap(), "events");
+        assert_eq!(r.int32().unwrap(), 1, "partitions count");
+        assert_eq!(r.int32().unwrap(), 0, "partition");
+        assert_eq!(r.int16().unwrap(), 0, "error_code");
+        assert_eq!(r.int64().unwrap(), 3, "high_watermark");
+        assert_eq!(r.int64().unwrap(), 3, "last_stable_offset (v4)");
+        assert_eq!(r.int32().unwrap(), 0, "aborted_transactions must be an EMPTY array (0), never null (-1)");
+        assert_eq!(r.int32().unwrap(), 0, "empty record set must be size 0, never -1");
     }
 
     #[test]

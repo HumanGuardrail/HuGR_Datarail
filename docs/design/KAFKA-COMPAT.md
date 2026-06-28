@@ -28,6 +28,15 @@ datarail presents itself as a **single-broker, single-partition-per-topic** Kafk
 (librdkafka emits legacy magic-0 on a fallback path — this was caught by live-testing against real `kcat`, not
 assumed). **Uncompressed only.**
 
+**Proven against the REAL Kafka client (not just our wire tests).** `kafka-broker-librdkafka.yml` (CI) drives
+`datarail kafka-broker` with kcat (= librdkafka 1.7.1): a real producer + a real simple consumer + a real
+`subscribe()` CONSUMER GROUP all round-trip, and the on-disk store is asserted ciphertext-only (provider-blind).
+This caught a genuine compat bug our hand-rolled tests could not — only a real client negotiates **Fetch v4** + the
+group path: we encoded `aborted_transactions` and an empty record-set as null (`-1`); librdkafka rejects `-1`
+("Protocol parse failure for Fetch v4" / "invalid MessageSetSize -1"). Fixed to empty (`0`), as a real broker
+sends (regression: `fetch_response_v4_empty_partition_uses_zero_not_null`). The rebalance / JoinGroup / SyncGroup
+path was already librdkafka-compatible (the real group joined + was assigned cleanly).
+
 **Flow:** `datarail kafka-ingest <rail.toml> --advertised HOST --sink-…` runs the endpoint; each produced batch's
 record values stream into the normal rail (`board` → **seal** → substrate → `offload` → `Sink`). Produced offsets
 are tracked per `(topic, partition)` and returned in the Produce response.
