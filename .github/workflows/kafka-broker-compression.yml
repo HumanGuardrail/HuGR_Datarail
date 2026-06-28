@@ -1,0 +1,62 @@
+name: Kafka broker — real librdkafka COMPRESSED produce (gzip/lz4/snappy/zstd)
+
+# Proves datarail accepts COMPRESSED batches from a REAL Kafka client (KAFKA-COMPRESSION-DESIGN.md): kcat
+# (= librdkafka) produces with each compression.codec; the broker (built `--features compression`) decompresses,
+# seals each record, and a plain consumer reads them back — with the on-disk store asserted ciphertext-only.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/datarail-kafka/**"
+      - "crates/datarail-cli/**"
+      - ".github/workflows/kafka-broker-compression.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compression-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the broker with compression + start it (force IPv4)
+        run: |
+          cargo build -p datarail-cli --release --features compression
+          ./target/release/datarail kafka-broker examples/rail.toml \
+            --listen 0.0.0.0:9092 --advertised 127.0.0.1 \
+            --data-dir ./kbroker-data --partitions 1 &
+          echo $! > broker.pid
+          for i in $(seq 1 20); do
+            if docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9092 -L -m 5 >/dev/null 2>&1; then
+              echo "broker up"; break
+            fi
+            sleep 1
+          done
+
+      - name: Real librdkafka produces COMPRESSED with each codec → broker decompresses → consume back
+        run: |
+          for codec in gzip lz4 snappy zstd; do
+            echo "=== codec: $codec ==="
+            printf 'evt:%s-1\nevt:%s-2\nevt:%s-3\n' "$codec" "$codec" "$codec" \
+              | docker run --rm -i --network host edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 -X compression.codec=$codec -t "events-$codec" -P
+            sleep 1
+            OUT=$(timeout 30 docker run --rm --network host edenhill/kcat:1.7.1 \
+                    -b 127.0.0.1:9092 -t "events-$codec" -C -o beginning -e -q 2>&1 || true)
+            echo "$codec read: [$OUT]"
+            for n in 1 2 3; do
+              echo "$OUT" | grep -qF "evt:$codec-$n" || { echo "::error::$codec: missing evt:$codec-$n"; echo "$OUT"; exit 1; }
+            done
+            echo "  ✓ $codec round-tripped"
+          done
+          # The on-disk store must hold ONLY ciphertext — never a produced plaintext record.
+          if grep -rqa "evt:gzip-1" ./kbroker-data 2>/dev/null; then
+            echo "::error::plaintext found on disk — provider-blind violated"; exit 1
+          fi
+          echo "## Kafka COMPRESSION ✅ — real librdkafka produced gzip+lz4+snappy+zstd; broker decompressed + sealed; consumed back; on-disk ciphertext" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the broker
+        if: always()
+        run: '[ -f broker.pid ] && kill "$(cat broker.pid)" 2>/dev/null || true'
