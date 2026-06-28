@@ -103,7 +103,8 @@ datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
 # termination, proven vs real librdkafka over TLS). COMPRESSED producers work too (`--features compression`:
 # gzip/lz4/zstd/snappy, decompressed broker-side + sealed — proven vs real librdkafka in CI). And SASL/PLAIN auth
 # (`--sasl-user`/`--sasl-pass`; a client must authenticate before producing — proven vs real librdkafka; pair with
-# `--tls` for SASL_SSL). (Single-node; SCRAM + mTLS tracked.)
+# `--tls` for SASL_SSL) AND mutual TLS (`--tls-client-ca`; the broker requires a CA-signed client cert) — both
+# proven vs real librdkafka in CI. (Single-node; SCRAM + cert→ACL tracked.)
 ```
 
 Lower-level rehearsals (files, two-process TCP, identity pairing):
