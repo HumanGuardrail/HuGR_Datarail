@@ -76,6 +76,18 @@ datarail kafka-ingest examples/rail.toml --advertised <reachable-host> \
 # producer retry / ingest restart never double-lands. A non-idempotent producer is at-least-once (Kafka parity).
 ```
 
+**Bidirectional drop-in** — an unmodified producer writes AND an unmodified consumer reads back, with datarail's
+storage holding only **sealed** records (un-sealed only at the fetch edge — a Kafka broker whose storage is
+provider-blind):
+
+```sh
+datarail kafka-broker examples/rail.toml --advertised <reachable-host> --data-dir ./datarail-kafka-data
+# Produce (seal+store) + Fetch (un-seal at the edge) + ListOffsets. Storage is DURABLE (fsync-before-ack) and
+# provider-blind: verified e2e produce 3 → KILL the broker → restart → fetch back the original plaintext, while
+# the on-disk cofres are ciphertext. (Durable single-node store, single partition; consumer groups + multi-
+# partition tracked.)
+```
+
 Lower-level rehearsals (files, two-process TCP, identity pairing):
 
 ```sh

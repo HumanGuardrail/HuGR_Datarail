@@ -460,6 +460,10 @@ pub struct DeadLetter {
 /// destination must not OOM on diverted cofres). 1024 is ample for inspection; the all-time total is preserved.
 const MAX_DEAD_LETTERS_RETAINED: usize = 1024;
 
+/// A cofre opened to its plaintext: the records and the validated sealed-sender id (if any). The read-only
+/// result of [`DestTerminal::open_records`], shared by `offload` (which then dedups + commits) and `open`.
+type OpenedRecords = (Vec<Vec<u8>>, Option<[u8; 32]>);
+
 /// The offloading dead-letter siding: a reason-coded list of diverted cofres (D3), **bounded** to the most
 /// recent [`MAX_DEAD_LETTERS_RETAINED`] (older ones are counted in `dropped`, not retained).
 #[derive(Debug, Default, Clone)]
@@ -874,89 +878,14 @@ impl DestTerminal {
     /// dedup drop is a [`Disposition::Duplicate`]. The `Result` matches the [`datarail_core::Terminal`] seam
     /// and reserves room for a future fallible sink commit.
     pub fn offload(&mut self, cofre: &Cofre) -> Result<Disposition, TerminalError> {
-        // (1) Parse-before-verify: verify the lacre against the route-pinned source key (BLK-4/7, AC-2/3).
-        if let Err(e) = datarail_cofre::verify(cofre, &self.pinned_source_vk) {
-            self.dead_letters
-                .push(cofre.clone(), DeadLetterReason::SealFailed(e));
-            return Ok(Disposition::DeadLettered);
-        }
-
-        // (2) Route binding: the cofre must be addressed to THIS terminal's route + stream.
-        if cofre.etiqueta.route_id != self.config.route_id
-            || cofre.etiqueta.stream_id != self.config.stream_id
-        {
-            self.dead_letters
-                .push(cofre.clone(), DeadLetterReason::RouteMismatch);
-            return Ok(Disposition::DeadLettered);
-        }
-
-        // (3) Schema check: the cofre's claimed contract_fp must match this destination's expected contract.
-        if cofre.etiqueta.contract_fp != self.contract.fingerprint {
-            self.dead_letters
-                .push(cofre.clone(), DeadLetterReason::ContractFingerprintMismatch);
-            return Ok(Disposition::DeadLettered);
-        }
-
-        // (3) Re-derive the per-cofre data key from the authenticated eph_pk, then AEAD-open with the header
-        // bound as AAD (AUDIT-02 F5); a tamper / wrong-key failure dead-letters.
-        let Some(mut data_key) = open_key(&self.dest_x25519_secret, &cofre.etiqueta.eph_pk) else {
-            // S-3: the cofre's eph_pk is a low-order/non-contributory X25519 point — fail closed (the seal was
-            // already verified, so this is belt-and-suspenders, but a malformed key-wrap never derives a key).
-            self.dead_letters.push(cofre.clone(), DeadLetterReason::KeyWrapInvalid);
-            return Ok(Disposition::DeadLettered);
-        };
-        let opened = aead_open(
-            cofre.etiqueta.aead_alg,
-            &data_key,
-            &cofre.etiqueta.nonce,
-            &aead_aad(&cofre.etiqueta),
-            &cofre.carga,
-        );
-        data_key.zeroize(); // wipe the re-derived per-cofre key (AUDIT-02 F4).
-        let Ok(batch) = opened else {
-            self.dead_letters
-                .push(cofre.clone(), DeadLetterReason::OpenFailed);
-            return Ok(Disposition::DeadLettered);
-        };
-
-        // (4) Sealed-sender (SPEC-02 A4): if the (authenticated) header says a SENDER_CERT rides inside, split
-        // and validate it against the pinned issuer + this cofre's eph_pk; the rest is the RECORD_BATCH. The
-        // rail never saw any of this — it was encrypted. A bad/absent cert dead-letters.
-        let (record_bytes, sender_id): (&[u8], Option<[u8; 32]>) = if cofre.etiqueta.sender_present {
-            let Some(issuer_vk) = self.sender_issuer_vk else {
-                self.dead_letters.push(cofre.clone(), DeadLetterReason::SenderCertInvalid);
-                return Ok(Disposition::DeadLettered);
-            };
-            if batch.len() < SENDER_CERT_LEN {
-                self.dead_letters.push(cofre.clone(), DeadLetterReason::SenderCertInvalid);
+        // Verify + open (the read-only core); a rejection becomes a reason-coded dead-letter.
+        let (records, sender_id) = match self.open_records(cofre) {
+            Ok(rs) => rs,
+            Err(reason) => {
+                self.dead_letters.push(cofre.clone(), reason);
                 return Ok(Disposition::DeadLettered);
             }
-            let (cert, rest) = batch.split_at(SENDER_CERT_LEN);
-            if let Some(sid) =
-                validate_sender_cert(cert, &cofre.etiqueta.eph_pk, &issuer_vk, self.min_sender_epoch)
-            {
-                (rest, Some(sid))
-            } else {
-                self.dead_letters.push(cofre.clone(), DeadLetterReason::SenderCertInvalid);
-                return Ok(Disposition::DeadLettered);
-            }
-        } else {
-            (&batch, None)
         };
-
-        // (5) Un-frame the RECORD_BATCH; a malformed batch dead-letters.
-        let Ok(records) = unframe_batch(record_bytes) else {
-            self.dead_letters
-                .push(cofre.clone(), DeadLetterReason::MalformedBatch);
-            return Ok(Disposition::DeadLettered);
-        };
-
-        // (6) Re-validate EVERY record against the offloading contract — any failure dead-letters (AC-9).
-        if !records.iter().all(|r| self.contract.validate(r)) {
-            self.dead_letters
-                .push(cofre.clone(), DeadLetterReason::ContractViolation);
-            return Ok(Disposition::DeadLettered);
-        }
 
         // (7) Effectively-once admission, then commit-on-Delivered only (exactly-once at the sink).
         match self.once.admit(
@@ -972,6 +901,81 @@ impl DestTerminal {
             // A duplicate is dropped without committing; DeadLettered cannot come from the once gate.
             other => Ok(other),
         }
+    }
+
+    /// Verify + open a received cofre to its plaintext records WITHOUT the dedup / commit / dead-letter side
+    /// effects — the read-only core shared by [`DestTerminal::offload`] and [`DestTerminal::open`]. Returns the
+    /// records and the validated sender id, or the [`DeadLetterReason`] that rejects the cofre. Steps mirror the
+    /// offloading pipeline: verify lacre → route binding → schema → key-wrap + AEAD-open → sealed-sender split →
+    /// un-frame → re-validate every record against the offloading contract.
+    fn open_records(&self, cofre: &Cofre) -> Result<OpenedRecords, DeadLetterReason> {
+        // (1) Parse-before-verify: verify the lacre against the route-pinned source key (BLK-4/7, AC-2/3).
+        if let Err(e) = datarail_cofre::verify(cofre, &self.pinned_source_vk) {
+            return Err(DeadLetterReason::SealFailed(e));
+        }
+        // (2) Route binding: the cofre must be addressed to THIS terminal's route + stream.
+        if cofre.etiqueta.route_id != self.config.route_id
+            || cofre.etiqueta.stream_id != self.config.stream_id
+        {
+            return Err(DeadLetterReason::RouteMismatch);
+        }
+        // (3) Schema check: the cofre's claimed contract_fp must match this destination's expected contract.
+        if cofre.etiqueta.contract_fp != self.contract.fingerprint {
+            return Err(DeadLetterReason::ContractFingerprintMismatch);
+        }
+        // (4) Re-derive the per-cofre data key from the authenticated eph_pk, then AEAD-open with the header
+        // bound as AAD (AUDIT-02 F5). S-3: a low-order eph_pk fails closed (no key derived).
+        let Some(mut data_key) = open_key(&self.dest_x25519_secret, &cofre.etiqueta.eph_pk) else {
+            return Err(DeadLetterReason::KeyWrapInvalid);
+        };
+        let opened = aead_open(
+            cofre.etiqueta.aead_alg,
+            &data_key,
+            &cofre.etiqueta.nonce,
+            &aead_aad(&cofre.etiqueta),
+            &cofre.carga,
+        );
+        data_key.zeroize(); // wipe the re-derived per-cofre key (AUDIT-02 F4).
+        let Ok(batch) = opened else {
+            return Err(DeadLetterReason::OpenFailed);
+        };
+
+        // (5) Sealed-sender (SPEC-02 A4): if the header says a SENDER_CERT rides inside, split + validate it.
+        let (record_bytes, sender_id): (&[u8], Option<[u8; 32]>) = if cofre.etiqueta.sender_present {
+            let Some(issuer_vk) = self.sender_issuer_vk else {
+                return Err(DeadLetterReason::SenderCertInvalid);
+            };
+            if batch.len() < SENDER_CERT_LEN {
+                return Err(DeadLetterReason::SenderCertInvalid);
+            }
+            let (cert, rest) = batch.split_at(SENDER_CERT_LEN);
+            match validate_sender_cert(cert, &cofre.etiqueta.eph_pk, &issuer_vk, self.min_sender_epoch) {
+                Some(sid) => (rest, Some(sid)),
+                None => return Err(DeadLetterReason::SenderCertInvalid),
+            }
+        } else {
+            (&batch, None)
+        };
+
+        // (6) Un-frame the RECORD_BATCH, then re-validate EVERY record against the offloading contract (AC-9).
+        let Ok(records) = unframe_batch(record_bytes) else {
+            return Err(DeadLetterReason::MalformedBatch);
+        };
+        if !records.iter().all(|r| self.contract.validate(r)) {
+            return Err(DeadLetterReason::ContractViolation);
+        }
+        Ok((records, sender_id))
+    }
+
+    /// Verify + open a received cofre to its plaintext records — the read-only path a CONSUMER edge (e.g. the
+    /// Kafka `Fetch` broker) uses to return records WITHOUT the dedup/commit of [`DestTerminal::offload`].
+    /// Re-opening the same cofre is idempotent (no dedup state is touched), so a consumer may re-fetch an offset.
+    /// Returns `None` if the cofre is rejected (bad seal / wrong route / wrong schema / bad key-wrap / contract
+    /// violation) — a forged or cross-route cofre never opens. Provider-blindness is preserved: only the holder
+    /// of the dest key (this terminal) can open; the stored ciphertext reveals nothing.
+    #[must_use]
+    pub fn open(&self, cofre: &Cofre) -> Option<Vec<Vec<u8>>> {
+        self.open_records(cofre).ok().map(|(records, _sender)| records)
     }
 }
 

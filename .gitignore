@@ -11,5 +11,8 @@
 .idea/
 .vscode/
 
+# kafka-broker default durable store (datarail kafka-broker --data-dir)
+datarail-kafka-data/
+
 # agent-local settings
 .claude/

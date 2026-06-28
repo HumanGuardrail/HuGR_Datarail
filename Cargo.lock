@@ -326,6 +326,7 @@ dependencies = [
  "datarail-kafka",
  "datarail-manifest",
  "datarail-rail",
+ "datarail-replaylog",
  "datarail-spec",
  "datarail-substrate-objectstore",
  "datarail-substrate-quic",

@@ -12,11 +12,15 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::codec::{Reader, Writer};
+use crate::consume::{
+    fetch_response, list_offsets_response, parse_fetch, parse_list_offsets, FetchPartitionResult,
+    FetchTopicResult, ListOffsetResult, ListOffsetTopicResult, API_FETCH, API_LIST_OFFSETS,
+};
 use crate::handlers::{
     api_versions_response, init_producer_id_response, metadata_response, parse_metadata_topics,
     API_INIT_PRODUCER_ID, API_METADATA, API_PRODUCE, API_VERSIONS,
 };
-use crate::produce::{parse_produce, produce_response, EosCoord};
+use crate::produce::{build_record_batch, parse_produce, produce_response, EosCoord};
 
 /// A produced batch handed to the integration layer for **durable** landing. The producer is **not acked until
 /// `done` reports the landing result** (ack-after-durable — audit A: a broker that acks before the record is
@@ -198,6 +202,150 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
             }
         };
 
+        stream.write_all(&Writer::frame(&response))?;
+        stream.flush()?;
+    }
+    Ok(())
+}
+
+/// The CONSUME-side broker backend (see `KAFKA-FETCH-DESIGN.md`). The `kafka-broker` mode wires this to a sealed
+/// store: `produce` seals + stores the cofre, `fetch` un-seals at the edge. Shared across connection threads.
+pub trait KafkaBroker: Send + Sync {
+    /// Seal + store a produced batch for `(topic, partition)`; return the logical base offset assigned.
+    ///
+    /// # Errors
+    /// Propagates a seal/store error (the producer then gets a retriable code, never a false ack).
+    fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> io::Result<i64>;
+
+    /// Un-seal + return the plaintext records for `(topic, partition)` from `offset`, bounded by `max_bytes`.
+    ///
+    /// # Errors
+    /// Propagates a read/open error.
+    fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> io::Result<Vec<Vec<u8>>>;
+
+    /// The logical `(earliest, latest)` offsets for `(topic, partition)` (latest = the next offset to be written).
+    fn bounds(&self, topic: &str, partition: i32) -> (i64, i64);
+}
+
+/// Serve the bidirectional `datarail kafka-broker` on `listener`: `Produce` (seal+store), `Fetch` (un-seal+return),
+/// `ListOffsets`, plus `Metadata`/`ApiVersions`/`InitProducerId`. Blocks; one bounded thread per connection (like
+/// [`serve`]). The storage holds only sealed cofres — un-sealing happens here, at the serving edge.
+///
+/// # Errors
+/// [`io::Error`] if accepting a connection fails.
+pub fn serve_broker<B: KafkaBroker + 'static>(
+    listener: &TcpListener,
+    advertised_host: &str,
+    advertised_port: i32,
+    broker: &Arc<B>,
+) -> io::Result<()> {
+    let host = advertised_host.to_owned();
+    let next_producer_id = Arc::new(AtomicI64::new(1));
+    let active = Arc::new(AtomicUsize::new(0));
+    for stream in listener.incoming() {
+        let stream = stream?;
+        if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            drop(stream);
+            continue;
+        }
+        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+        active.fetch_add(1, Ordering::Relaxed);
+        let broker = Arc::clone(broker);
+        let host = host.clone();
+        let pid = Arc::clone(&next_producer_id);
+        let active = Arc::clone(&active);
+        std::thread::spawn(move || {
+            let _ = handle_broker_connection(stream, broker.as_ref(), &host, advertised_port, &pid);
+            active.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+    Ok(())
+}
+
+fn handle_broker_connection<B: KafkaBroker>(
+    mut stream: TcpStream,
+    broker: &B,
+    host: &str,
+    port: i32,
+    next_producer_id: &AtomicI64,
+) -> io::Result<()> {
+    while let Some(frame) = read_frame(&mut stream)? {
+        let mut reader = Reader::new(&frame);
+        let api_key = reader.int16()?;
+        let api_version = reader.int16()?;
+        let correlation_id = reader.int32()?;
+        let _client_id = reader.nullable_string()?;
+        if request_is_flexible(api_key, api_version) {
+            reader.skip_tagged_fields()?;
+        }
+        let response = match api_key {
+            API_VERSIONS => api_versions_response(api_version, correlation_id),
+            API_METADATA => {
+                let topics = parse_metadata_topics(&mut reader)?;
+                metadata_response(api_version, correlation_id, host, port, &topics)
+            }
+            API_INIT_PRODUCER_ID => {
+                let pid = next_producer_id.fetch_add(1, Ordering::Relaxed);
+                init_producer_id_response(correlation_id, pid)
+            }
+            API_PRODUCE => {
+                let topics = parse_produce(&mut reader, api_version)?;
+                // Seal + store each partition batch BEFORE acking; the response carries the base offset + code.
+                let mut results: HashMap<(String, i32), (i64, i16)> = HashMap::new();
+                for t in &topics {
+                    for p in &t.partitions {
+                        let outcome = match broker.produce(&t.name, p.partition, &p.values) {
+                            Ok(base) => (base, 0i16),
+                            Err(_) => (-1, 56), // KAFKA_STORAGE_ERROR (retriable) — never a false ack
+                        };
+                        results.insert((t.name.clone(), p.partition), outcome);
+                    }
+                }
+                produce_response(api_version, correlation_id, &topics, &mut |name, part, _count| {
+                    results.get(&(name.to_owned(), part)).copied().unwrap_or((0, 0))
+                })
+            }
+            API_FETCH => {
+                let topics = parse_fetch(&mut reader, api_version)?;
+                let mut out = Vec::with_capacity(topics.len());
+                for t in &topics {
+                    let mut parts = Vec::with_capacity(t.partitions.len());
+                    for p in &t.partitions {
+                        let (_, latest) = broker.bounds(&t.name, p.partition);
+                        let (error_code, records) =
+                            match broker.fetch(&t.name, p.partition, p.fetch_offset, p.max_bytes) {
+                                Ok(values) if values.is_empty() => (0, Vec::new()),
+                                Ok(values) => (0, build_record_batch(p.fetch_offset, &values)),
+                                Err(_) => (1, Vec::new()), // 1 = OFFSET_OUT_OF_RANGE
+                            };
+                        parts.push(FetchPartitionResult {
+                            partition: p.partition,
+                            error_code,
+                            high_watermark: latest,
+                            records,
+                        });
+                    }
+                    out.push(FetchTopicResult { name: t.name.clone(), partitions: parts });
+                }
+                fetch_response(api_version, correlation_id, &out)
+            }
+            API_LIST_OFFSETS => {
+                let topics = parse_list_offsets(&mut reader, api_version)?;
+                let mut out = Vec::with_capacity(topics.len());
+                for t in &topics {
+                    let mut parts = Vec::with_capacity(t.partitions.len());
+                    for p in &t.partitions {
+                        let (earliest, latest) = broker.bounds(&t.name, p.partition);
+                        let offset = if p.timestamp == -2 { earliest } else { latest };
+                        parts.push(ListOffsetResult { partition: p.partition, offset });
+                    }
+                    out.push(ListOffsetTopicResult { name: t.name.clone(), partitions: parts });
+                }
+                list_offsets_response(api_version, correlation_id, &out)
+            }
+            other => return Err(io::Error::other(format!("unsupported Kafka api_key {other}"))),
+        };
         stream.write_all(&Writer::frame(&response))?;
         stream.flush()?;
     }
