@@ -26,6 +26,26 @@ CRITICAL/HIGH findings were against OLD code.** Auditor 1 noticed the staleness 
   flagged was already reconciled in a prior commit — re-verified.) Crypto seal-core + parse-safety: CLEAN (even on
   the stale base, and unchanged/strengthened since).
 
+**Re-run of the 3 stale lanes against current `main` (`76632bc`, with an anti-staleness self-sync):**
+- **Durability — CLEAN.** The auditor synced to `76632bc`, re-verified the WAL ack-floor fix with TWO fresh
+  adversarial crash tests (ack the second-half / ack-every-even-with-gaps → zero loss), and confirmed
+  kafka_store / offsets / postgres_sink / the ack-after-durable wiring sound. **1 LOW (FIXED):** the ingest
+  produce-response advanced the reported base offset even on a FAILED (code-56) batch → a producer retry saw a
+  non-contiguous gap (no loss/dup — the sink watermark is the EOS authority; producer-visible contiguity only).
+  Fixed: advance the reported base ONLY on code 0 (`serve.rs`).
+- **Parse-safety + charter — CLEAN.** Synced to `76632bc`; ran `cargo clippy --workspace --all-targets -- -D
+  warnings` → zero warnings; verified `bounded_count` in EVERY kafka array parse, all non-kafka decoders bounded,
+  only the sanctioned shmem `unsafe`, the CI grep gates correct, no honesty regression.
+- **Crypto — CLEAN (its lone finding REJECTED as stale).** This auditor FAILED to self-sync (wrongly concluded
+  its `d094023` worktree was current) and reported "X25519 `was_contributory` missing" + "no kafka_store" — both
+  FALSE on real `main` (cold-verified: `was_contributory` is at `crypto/src/lib.rs:58`; `kafka_store.rs` exists).
+  Its seal-core verifications (provider-blind holds, AAD binding, domain separation, sealed-sender, CSPRNG
+  clone-resistance, `Once` gate) are valid (that code is unchanged) → seal core CLEAN.
+
+**Net of the whole 4-way audit + re-run:** all real findings fixed (3 concurrency + 1 durability-cosmetic); every
+CRITICAL/HIGH was a stale-worktree artifact already fixed on `main` (cold-verified). The codebase is concurrency-,
+durability-, crypto-, and parse-sound on `76632bc`+.
+
 
 > Two hostile background auditors attacked the code the whole product rests on: the **sealing core** (crypto +
 > cofre + terminal — the provider-blind guarantee) and the **exactly-once / no-loss core** (once + broker + topic

@@ -1,6 +1,9 @@
 # KAFKA-REBALANCE-DESIGN — automatic consumer-group rebalance (increment 4b)
 
-> **STATUS: BUILT + PROVEN (2026-06-27); brutal concurrency audit PENDING (part of the 4-way audit).** The
+> **STATUS: BUILT + PROVEN + AUDITED (2026-06-27).** The 4-way Opus audit's concurrency lane (cold-verified
+> against current `main` with reproducer threads) found 3 defects — all FIXED at root (leader-only `SyncGroup`,
+> generation stays positive, follower honors its own `rebalance_timeout`; `CORE-AUDIT.md` §4-way). No deadlock /
+> lost-wakeup / permanent-park / unbounded-growth bug found. The
 > coordinator (`coordinator.rs`: the `Empty→PreparingRebalance→CompletingRebalance→Stable` state machine, one
 > `Mutex`+`Condvar`, lazy session expiry, bounded `wait_timeout` parks) + the wire codec (`groups.rs`:
 > `JoinGroup` v1–4 / `SyncGroup` v0–2 / `Heartbeat` v0–2 / `LeaveGroup` v0–2) + `serve_broker` dispatch + an

@@ -193,9 +193,12 @@ fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
                     let key = (name.to_owned(), part);
                     let base = *offsets.get(&key).unwrap_or(&0);
                     let code = codes.get(&key).copied().unwrap_or(0); // read before the insert moves `key`
-                    // Bound the map: past the cap, don't retain new keys (they restart at 0) — no unbounded
-                    // growth from attacker-chosen (topic, partition) identities (audit K1). saturating add (K6).
-                    if offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS {
+                    // Advance the reported base offset ONLY on a durable land (code 0). A failed batch (code 56)
+                    // must NOT consume offsets — else a producer retry sees a non-contiguous gap (audit 4b LOW;
+                    // the sink watermark, not this counter, is the EOS authority, so this is producer-visible
+                    // contiguity, not correctness). Bound the map: past the cap, don't retain new keys (no
+                    // unbounded growth from attacker-chosen identities, audit K1); saturating add (K6).
+                    if code == 0 && (offsets.contains_key(&key) || offsets.len() < MAX_OFFSET_KEYS) {
                         offsets.insert(key, base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)));
                     }
                     (base, code)
