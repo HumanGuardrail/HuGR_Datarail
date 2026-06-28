@@ -17,6 +17,11 @@ use crate::consume::{
     FetchTopicResult, ListOffsetResult, ListOffsetTopicResult, API_FETCH, API_LIST_OFFSETS,
 };
 use crate::coordinator::GroupCoordinator;
+use crate::txn::{
+    add_partitions_response, init_producer_id_response as txn_init_producer_id_response, parse_add_offsets,
+    parse_add_partitions, parse_end_txn, parse_init_producer_id, parse_txn_offset_commit, throttle_error_response,
+    TxnCoordinator, API_ADD_OFFSETS_TO_TXN, API_ADD_PARTITIONS_TO_TXN, API_END_TXN, API_TXN_OFFSET_COMMIT,
+};
 use crate::groups::{
     find_coordinator_response, heartbeat_response, join_group_response, leave_group_response,
     offset_commit_response, offset_fetch_response, parse_find_coordinator, parse_heartbeat, parse_join_group,
@@ -274,6 +279,9 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
     let host = advertised_host.to_owned();
     let next_producer_id = Arc::new(AtomicI64::new(1));
     let coordinator = Arc::new(GroupCoordinator::with_defaults());
+    // Transactional producer ids live in a distinct high range so they never collide with the idempotent
+    // allocator's (which counts up from 1).
+    let txn_coordinator = Arc::new(TxnCoordinator::new(1 << 40));
     let active = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
         let stream = stream?;
@@ -288,24 +296,31 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
         let host = host.clone();
         let pid = Arc::clone(&next_producer_id);
         let coord = Arc::clone(&coordinator);
+        let txn = Arc::clone(&txn_coordinator);
         let active = Arc::clone(&active);
         std::thread::spawn(move || {
-            let _ =
-                handle_broker_connection(stream, broker.as_ref(), &host, advertised_port, partitions, &pid, &coord);
+            let ctx = BrokerCtx { host: &host, port: advertised_port, partitions, next_producer_id: &pid };
+            let _ = handle_broker_connection(stream, broker.as_ref(), &ctx, &coord, &txn);
             active.fetch_sub(1, Ordering::Relaxed);
         });
     }
     Ok(())
 }
 
+/// Per-connection broker context (bundled so the connection handler stays within the argument cap).
+struct BrokerCtx<'a> {
+    host: &'a str,
+    port: i32,
+    partitions: i32,
+    next_producer_id: &'a AtomicI64,
+}
+
 fn handle_broker_connection<B: KafkaBroker>(
     mut stream: TcpStream,
     broker: &B,
-    host: &str,
-    port: i32,
-    partitions: i32,
-    next_producer_id: &AtomicI64,
+    ctx: &BrokerCtx<'_>,
     coordinator: &GroupCoordinator,
+    txn: &TxnCoordinator,
 ) -> io::Result<()> {
     while let Some(frame) = read_frame(&mut stream)? {
         let mut reader = Reader::new(&frame);
@@ -320,11 +335,17 @@ fn handle_broker_connection<B: KafkaBroker>(
             API_VERSIONS => api_versions_response(api_version, correlation_id),
             API_METADATA => {
                 let topics = parse_metadata_topics(&mut reader)?;
-                metadata_response(api_version, correlation_id, host, port, &topics, partitions)
+                metadata_response(api_version, correlation_id, ctx.host, ctx.port, &topics, ctx.partitions)
             }
             API_INIT_PRODUCER_ID => {
-                let pid = next_producer_id.fetch_add(1, Ordering::Relaxed);
-                init_producer_id_response(correlation_id, pid)
+                // A transactional_id in the body → the txn coordinator (epoch-fenced); else a bare idempotent id.
+                if let Some(tid) = parse_init_producer_id(&mut reader)? {
+                    let (pid, epoch) = txn.init_producer_id(&tid);
+                    txn_init_producer_id_response(correlation_id, pid, epoch)
+                } else {
+                    let pid = ctx.next_producer_id.fetch_add(1, Ordering::Relaxed);
+                    init_producer_id_response(correlation_id, pid)
+                }
             }
             API_PRODUCE => {
                 let topics = parse_produce(&mut reader, api_version)?;
@@ -365,7 +386,7 @@ fn handle_broker_connection<B: KafkaBroker>(
             API_FIND_COORDINATOR => {
                 let _group = parse_find_coordinator(&mut reader, api_version)?;
                 // Single-node: THIS broker is the coordinator (node 0, the advertised host/port).
-                find_coordinator_response(api_version, correlation_id, 0, host, port)
+                find_coordinator_response(api_version, correlation_id, 0, ctx.host, ctx.port)
             }
             API_OFFSET_COMMIT => {
                 let req = parse_offset_commit(&mut reader, api_version)?;
@@ -377,10 +398,17 @@ fn handle_broker_connection<B: KafkaBroker>(
                 let out = offset_fetch_results(broker, &req);
                 offset_fetch_response(api_version, correlation_id, &out)
             }
-            other => match dispatch_group_api(other, api_version, correlation_id, &mut reader, coordinator)? {
-                Some(resp) => resp,
-                None => return Err(io::Error::other(format!("unsupported Kafka api_key {other}"))),
-            },
+            other => {
+                if let Some(resp) = dispatch_group_api(other, api_version, correlation_id, &mut reader, coordinator)? {
+                    resp
+                } else if let Some(resp) =
+                    dispatch_txn_api(other, api_version, correlation_id, &mut reader, txn, broker)?
+                {
+                    resp
+                } else {
+                    return Err(io::Error::other(format!("unsupported Kafka api_key {other}")));
+                }
+            }
         };
         stream.write_all(&Writer::frame(&response))?;
         stream.flush()?;
@@ -440,6 +468,60 @@ fn dispatch_group_api(
         _ => return Ok(None),
     };
     Ok(Some(resp))
+}
+
+/// Handle the TRANSACTIONAL producer APIs (AddPartitionsToTxn/AddOffsetsToTxn/TxnOffsetCommit/EndTxn) against the
+/// txn coordinator. Returns `None` if `api_key` is not one of them. On `EndTxn(commit)` the staged consumer
+/// offsets are durably committed via the broker; COMMIT/ABORT markers + `read_committed` isolation land in the
+/// next increments (until then a transactional ABORT does NOT yet hide its records — honestly tracked).
+fn dispatch_txn_api<B: KafkaBroker>(
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    reader: &mut Reader,
+    txn: &TxnCoordinator,
+    broker: &B,
+) -> io::Result<Option<Vec<u8>>> {
+    let resp = match api_key {
+        API_ADD_PARTITIONS_TO_TXN => {
+            let req = parse_add_partitions(reader, api_version)?;
+            let parts: Vec<(String, i32)> =
+                req.topics.iter().flat_map(|(t, ps)| ps.iter().map(move |&p| (t.clone(), p))).collect();
+            let code = txn.add_partitions(&req.transactional_id, req.producer_id, req.epoch, &parts);
+            add_partitions_response(correlation_id, &req.topics, code)
+        }
+        API_ADD_OFFSETS_TO_TXN => {
+            let (tid, pid, epoch, group) = parse_add_offsets(reader, api_version)?;
+            let code = txn.add_offsets(&tid, pid, epoch, &group);
+            throttle_error_response(correlation_id, code)
+        }
+        API_TXN_OFFSET_COMMIT => {
+            let req = parse_txn_offset_commit(reader, api_version)?;
+            let code = txn.stage_offsets(&req.transactional_id, req.producer_id, req.epoch, &req.offsets);
+            txn_offset_commit_response(correlation_id, &req.topics, code)
+        }
+        API_END_TXN => {
+            let (tid, pid, epoch, committed) = parse_end_txn(reader, api_version)?;
+            let out = txn.end_txn(&tid, pid, epoch, committed);
+            // On commit, durably apply the staged consumer offsets (atomic with the txn from the client's view).
+            if out.error_code == 0 && out.committed {
+                if let Some(group) = &out.group {
+                    for (topic, partition, offset) in &out.offsets {
+                        let _ = broker.commit_offset(group, topic, *partition, *offset);
+                    }
+                }
+            }
+            throttle_error_response(correlation_id, out.error_code)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(resp))
+}
+
+/// Build a `TxnOffsetCommit` response mirroring the topics/partitions with a per-partition error code.
+fn txn_offset_commit_response(correlation_id: i32, topics: &[(String, Vec<i32>)], error_code: i16) -> Vec<u8> {
+    // Same wire shape as AddPartitionsToTxn's response body (throttle + topics[name, partitions[idx, error]]).
+    add_partitions_response(correlation_id, topics, error_code)
 }
 
 /// Resolve a parsed `Fetch` request against the broker: un-seal each partition's records at the edge into a v2
