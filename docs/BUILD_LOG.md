@@ -935,8 +935,12 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   handshake) + `--tls --tls-cert --tls-key` on `kafka-ingest`/`kafka-broker`; the default binary stays light
   (feature-gated, 22 cli tests green without it). Proven locally: a real **`openssl s_client` completed a TLSv1.3
   handshake** (`Verify return code: 0`) against `kafka-broker --tls`. Honest scope: server-side termination
-  (one-way auth); mTLS + SASL tracked; not end-to-end sealing (that's native terminals). Incr 3 next: kcat-over-TLS
-  CI round-trip (no PROVEN claim until green).
+  (one-way auth); mTLS + SASL tracked; not end-to-end sealing (that's native terminals). **Incr 3 PROVEN** —
+  `kafka-broker-tls.yml` green (run 28333278577): a real kcat/librdkafka client with `security.protocol=SSL`
+  produces + consumes over TLS, on-disk asserted ciphertext-only. (First TLS run read empty — librdkafka rejected
+  the self-signed test cert as a CA; for a throwaway cert the fix is client-side `enable.ssl.certificate
+  .verification=false` — the handshake+encryption still prove the hop works.) PR #9 merged to main. **Hop (1) is
+  now optionally TLS-encrypted, proven against the real Kafka client.**
 
   > **WAIVER (owner-delegated — "pode seguir, essas decisões são suas", 2026-06-28)** — the zero-dep charter gets
   > two CLI deps behind the optional `tls` feature: `rustls 0.23` (default-features off, `ring`+`std`) and
