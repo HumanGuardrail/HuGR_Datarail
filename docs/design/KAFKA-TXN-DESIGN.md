@@ -1,6 +1,19 @@
 # KAFKA-TXN-DESIGN — transactional producer EOS (the last Kafka exactly-once tier)
 
-> **STATUS: DESIGN — FROZEN (2026-06-27), NOT implemented; needs owner ratification of the open questions below.**
+> **STATUS: BUILDING (2026-06-27) — Q1–Q4 RATIFIED BY THE TECHLEAD (autonomy directive: design/scope are my call).**
+> The owner re-armed the autonomous loop rather than answer Q1–Q4, so per the standing "decide+execute, don't ask
+> which-option" directive I ratify them with the recommendations below and build incrementally (each step green +
+> the whole tier audited before any exactly-once claim is made — the delicate semantics are managed by the audit,
+> not by deferring). RATIFICATIONS: **Q1 = (a)** control COMMIT/ABORT markers are stored as a distinct **un-sealed
+> control record** (they carry no secret payload — pure txn-control metadata, like offsets/etiqueta already are →
+> provider-blind preserved). **Q2 = (a)** `read_committed` is **edge-filtered** by us (we are the authoritative
+> coordinator → return only committed records + a correct LSO + an empty aborted-list; wire-compatible with a
+> `read_committed` client, and we never ship aborted plaintext). **Q3 = abort-on-restart** for v1 (txn state is
+> runtime; a broker restart aborts in-flight txns and the producer retries — documented; durable txn state later).
+> **Q4 = IN SCOPE, build now.** Build order: TxnCoordinator (state machine + epoch fencing, unit-tested) → codec →
+> serve wiring → store markers + LSO → `read_committed` Fetch → wire test → brutal audit.
+>
+> **(original frozen design below.)**
 > The idempotent producer EOS (per-partition exactly-once within a session) is already shipped + proven
 > (`KAFKA-EOS-DESIGN.md`). This adds the TRANSACTIONAL tier: atomic multi-partition writes + consumer-offsets-in-
 > the-transaction + `read_committed` consumers. It is the **hardest** Kafka feature (a transaction coordinator with
