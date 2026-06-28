@@ -981,6 +981,12 @@ struct BrokerInner {
     data_dir: PathBuf,
     /// Durable consumer-group committed offsets (`OffsetCommit`/`OffsetFetch`), opened lazily under `data_dir`.
     offsets: Option<datarail_offsets::FileOffsets>,
+    /// In-flight TRANSACTIONAL record buffers, keyed by `(producer_id, epoch, topic, partition)` — held until
+    /// `EndTxn` (`KAFKA-TXN-DESIGN.md`): on commit ONLY the matching epoch flushes to the durable log (then
+    /// visible), on abort they're dropped. The epoch in the key means a stale-epoch record that slipped in via the
+    /// `produce_check`/`buffer_txn` race can never be flushed by a newer incarnation's commit (audit TOCTOU).
+    /// In-memory only → a crash mid-txn drops them = an abort (the correct outcome; Q3 abort-on-restart).
+    txn_buffers: std::collections::HashMap<(i64, i16, String, i32), Vec<Vec<u8>>>,
 }
 
 /// The injective durable-store key for a consumer group's committed offset on a `(topic, partition)`. Length-
@@ -1029,6 +1035,24 @@ impl BrokerInner {
         }
         self.offsets.as_mut().ok_or_else(|| std::io::Error::other("offset store vanished after open"))
     }
+
+    /// Seal each record into a cofre and durably append it to `(topic, partition)`'s log; return the base offset.
+    /// The non-locking core shared by `produce` and the transactional `commit_txn` flush (both already hold the
+    /// `Mutex`, so this must NOT re-lock).
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on a seal or store failure.
+    fn produce_into(&mut self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
+        let base = self.partition_log(topic, partition)?.len();
+        let mut sealed = Vec::with_capacity(records.len());
+        for (i, rec) in records.iter().enumerate() {
+            let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
+            let refs = [rec.as_slice()];
+            let cofre = self.src.board(&refs, rkey.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            sealed.push(datarail_cofre::encode(&cofre));
+        }
+        self.partition_log(topic, partition)?.append_durable(&sealed)
+    }
 }
 
 impl KafkaBrokerStore {
@@ -1050,6 +1074,7 @@ impl KafkaBrokerStore {
                 logs: std::collections::HashMap::new(),
                 data_dir,
                 offsets: None,
+                txn_buffers: std::collections::HashMap::new(),
             }),
         }
     }
@@ -1058,20 +1083,56 @@ impl KafkaBrokerStore {
 impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.produce_into(topic, partition, records)
+    }
+
+    fn buffer_txn(
+        &self,
+        producer_id: i64,
+        epoch: i16,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+    ) -> std::io::Result<i64> {
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let inner = &mut *g;
-        // The next logical offset = the base for this batch's durable board keys (unique AND stable across restart).
-        let base = inner.partition_log(topic, partition)?.len();
-        let mut sealed = Vec::with_capacity(records.len());
-        for (i, rec) in records.iter().enumerate() {
-            // A UNIQUE, durable board key per record from its (topic, partition, logical offset) — the store
-            // appends, dedup is not its job; uniqueness keeps distinct cofres distinct, restart-stable.
-            let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
-            let refs = [rec.as_slice()];
-            let cofre = inner.src.board(&refs, rkey.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
-            sealed.push(datarail_cofre::encode(&cofre));
+        // Provisional base = the durable log end + records already buffered for this (producer, epoch, topic,
+        // partition). Correct as long as this partition has a single concurrent producer during the txn.
+        let durable = inner.partition_log(topic, partition)?.len();
+        let key = (producer_id, epoch, topic.to_owned(), partition);
+        let buf = inner.txn_buffers.entry(key).or_default();
+        let base = i64::try_from(durable + buf.len()).unwrap_or(i64::MAX);
+        buf.extend(records.iter().cloned());
+        Ok(base)
+    }
+
+    fn commit_txn(&self, producer_id: i64, epoch: i16, _partitions: &[(String, i32)]) -> std::io::Result<()> {
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = &mut *g;
+        // Flush ONLY this exact (producer_id, epoch)'s buffers to the durable log; DROP any older-epoch buffers for
+        // the same producer (a stale straggler from the produce_check/buffer_txn re-init race → never committed,
+        // audit TOCTOU). Flush BEFORE removing (records cloned out, releasing the borrow for `produce_into`): on an
+        // append error the buffer stays so an EndTxn RETRY re-flushes it — committed records are never lost.
+        let keys: Vec<(i64, i16, String, i32)> =
+            inner.txn_buffers.keys().filter(|(pid, _, _, _)| *pid == producer_id).cloned().collect();
+        for key in keys {
+            if key.1 == epoch {
+                if let Some(records) = inner.txn_buffers.get(&key).cloned() {
+                    inner.produce_into(&key.2, key.3, &records)?; // on error: buffer kept, retry recovers it
+                    inner.txn_buffers.remove(&key);
+                }
+            } else if key.1 < epoch {
+                inner.txn_buffers.remove(&key); // stale older-epoch straggler → drop, never commit
+            }
         }
-        // Append + fsync + publish offsets atomically w.r.t. visibility (durability-before-ack).
-        inner.partition_log(topic, partition)?.append_durable(&sealed)
+        Ok(())
+    }
+
+    fn abort_txn(&self, producer_id: i64, epoch: i16, _partitions: &[(String, i32)]) {
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Drop this producer's buffers at this epoch AND any older epoch (a re-init aborts the prior incarnation
+        // too) — they never become durable / visible.
+        g.txn_buffers.retain(|(pid, e, _, _), _| !(*pid == producer_id && *e <= epoch));
     }
 
     fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {
@@ -1753,6 +1814,30 @@ mod tests {
         // --at-least-once always forces Tier C, even for an ordered source.
         assert!(!wants_tier_a(true, true), "--at-least-once opts out");
         assert!(!wants_tier_a(true, false));
+    }
+
+    #[test]
+    fn txn_commit_flushes_only_the_matching_epoch_dropping_stale() {
+        // Audit TOCTOU regression: a stale-epoch buffer (a record that slipped past produce_check via the two-lock
+        // window) must NEVER be flushed by a newer incarnation's commit — commit_txn flushes only its own epoch.
+        use datarail_kafka::serve::KafkaBroker as _;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-txn-epoch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
+        // A stale-epoch (epoch 0) record gets buffered under producer 7.
+        store.buffer_txn(7, 0, "events", 0, &[b"evt:zombie".to_vec()]).unwrap();
+        // The live incarnation (epoch 1) buffers + commits at epoch 1.
+        store.buffer_txn(7, 1, "events", 0, &[b"evt:fresh".to_vec()]).unwrap();
+        store.commit_txn(7, 1, &[("events".to_owned(), 0)]).unwrap();
+        // Only the epoch-1 record is durable/visible; the stale epoch-0 buffer was DROPPED, never committed.
+        assert_eq!(
+            store.fetch("events", 0, 0, 1_000_000).unwrap(),
+            vec![b"evt:fresh".to_vec()],
+            "the stale-epoch zombie must not be committed"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[test]

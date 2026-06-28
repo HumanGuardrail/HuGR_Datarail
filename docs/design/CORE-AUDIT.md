@@ -335,3 +335,39 @@ loop acks NONE only after `commit_offset` returns `Ok` → fsync-before-ack hold
 cross-checked vs the Kafka schema for all three APIs at v0/v1/v2 (FindCoordinator v1 throttle+error_message,
 OffsetCommit v1 timestamp / v2 retention, OffsetFetch v2 top-level error_code) — correct; mutex poisoning via
 `into_inner`; offset casts saturate, never panic.
+
+## Kafka-TXN audit (2026-06-28) — brutal 4-Opus pass on transactional EOS (then a confirming re-audit)
+
+The transactional-producer EOS path (`txn.rs` coordinator + epoch fencing, the wire codec, the `serve_broker`
+wiring, the `KafkaBrokerStore` buffer-until-commit) was held for audit BEFORE any exactly-once-abort claim. Four
+independent Opus auditors (concurrency / EOS-semantics / parse+charter / provider-blind+scope) ran worktree-isolated;
+the lead cold-verified every finding (AP-5). **3 real EOS breaks found — ALL FIXED at root:**
+
+- **CRITICAL — the transactional Produce path was UNFENCED** (3 auditors; one demonstrated it live). It buffered on
+  the wire `transactional` bit alone, never consulting the coordinator → a stale-epoch zombie (`producer_id` is
+  reused across an epoch bump) or an un-`AddPartitions`'d partition got its records buffered and committed —
+  bypassing epoch fencing AND the one-txn-per-partition guard. **Fix:** `TxnCoordinator::produce_check`
+  (`producer_id→tid` index + epoch fence + claim check); the produce path rejects a fenced/unclaimed batch BEFORE
+  buffering. Proven end-to-end (the `kafka_txn_wire.rs` zombie-fence phase: a stale-epoch record is NEVER committed).
+- **HIGH — re-init orphaned the store buffers** (`producer_id` reuse). **Fix:** `InitProducerId` drives
+  `broker.abort_txn(pid, epoch)`.
+- **HIGH — commit was non-atomic + the error swallowed** (`let _ = commit_txn`, remove-then-flush). **Fix:** split
+  `end_txn` (PREPARE, no reset) from `finish_txn` (reset only after a successful durable flush); `EndTxn` propagates
+  a flush/offset failure as RETRIABLE and does NOT finish (the producer retries; the flush re-runs); `commit_txn`
+  flushes BEFORE removing each buffer → no loss on a mid-flush error.
+
+**Confirming re-audit (EOS-semantics, on the fixed code):** verified all 3 closed in the sequential path with live
+harnesses, and found **1 new LOW-MED TOCTOU** — `produce_check` (coordinator mutex) and `buffer_txn` (store mutex)
+are two critical sections, so under concurrent same-`transactional_id` produce + re-init a stale-epoch record could
+slip into a buffer after the re-init's abort and be committed (the auditor proved it). **FIXED:** the epoch is now
+part of the buffer key `(producer_id, epoch, topic, partition)` and `commit_txn(pid, epoch)` flushes ONLY that
+epoch (dropping older stragglers) → a stale-epoch race buffer can never be committed (regression:
+`txn_commit_flushes_only_the_matching_epoch_dropping_stale`).
+
+**CLEAN lenses (cold-verified):** the codec is parse-safe (`bounded_count` on every array, no `with_capacity` from
+an untrusted count) + schema-correct for the txn APIs v0–1 + charter-clean (`clippy -D warnings` workspace-clean);
+the coordinator is race-/deadlock-/poison-free (one Mutex over txns+claims+by_producer; disjoint-field borrows);
+provider-blind HOLDS — buffered plaintext lives only in RAM and is SEALED by `produce_into` before it ever reaches
+disk (the on-disk log stays ciphertext-only), and an abort drops it from RAM, never persisted. **Honest scope
+(documented, not hidden):** one producer per partition during a txn (concurrent → retriable `CONCURRENT_TRANSACTIONS`);
+`read_uncommitted` == `read_committed`; abort-on-restart. The faithful marker/LSO model is tracked future work.

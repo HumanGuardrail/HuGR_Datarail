@@ -18,6 +18,10 @@ datarail presents itself as a **single-broker, single-partition-per-topic** Kafk
 | `OffsetCommit` | 8 | v0–v2 | durably commit a consumer group's offset (`kafka-broker` mode, `KAFKA-GROUPS-DESIGN.md`) |
 | `OffsetFetch` | 9 | v0–v2 | read a consumer group's committed offset (`kafka-broker` mode) |
 | `FindCoordinator` | 10 | v0–v2 | names this broker the group coordinator (single-node, `kafka-broker` mode) |
+| `AddPartitionsToTxn` | 24 | v0–v1 | enroll partitions in a transaction (`kafka-broker` mode, `KAFKA-TXN-DESIGN.md`) |
+| `AddOffsetsToTxn` | 25 | v0–v1 | fold a consumer group's offsets into a transaction (`kafka-broker` mode) |
+| `EndTxn` | 26 | v0–v1 | commit/abort a transaction (`kafka-broker` mode) |
+| `TxnOffsetCommit` | 28 | v0–v1 | stage offsets to commit atomically at `EndTxn` (`kafka-broker` mode) |
 | `InitProducerId` | 22 | v0–v1 | grants a `producer_id` so a client can `enable.idempotence=true` → exactly-once ingest (`KAFKA-EOS-DESIGN.md`) |
 
 **Record formats:** both the modern **v2 `RecordBatch`** AND the legacy **v0/v1 `MessageSet`** are parsed
@@ -55,9 +59,15 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
   failed batch, with silent mid-history disk-rot renumbering a known retained-log limit (CRC-detected; tracked).
 - **No compression** (gzip/snappy/lz4/zstd). A compressed batch is rejected with a clear error. Producers must
   send uncompressed (`compression.type=none`) for now.
-- **No TRANSACTIONAL producer** (the `AddPartitionsToTxn` / `EndTxn` / transaction-coordinator APIs, a stable
-  `transactional.id`). The **idempotent** producer (`InitProducerId` + `enable.idempotence=true`) IS supported and
-  gives exactly-once within a producer session; cross-session/transactional EOS is the next increment.
+- **TRANSACTIONAL producer EXISTS now** (`kafka-broker` mode, `KAFKA-TXN-DESIGN.md`): `InitProducerId` with a
+  `transactional.id` (epoch fencing), `AddPartitionsToTxn`/`AddOffsetsToTxn`/`TxnOffsetCommit`/`EndTxn`, on a
+  buffer-until-commit model — a txn's records are buffered (invisible) until `EndTxn(commit)` makes them visible
+  atomically across partitions (offsets too) / `EndTxn(abort)` discards them; a stale-epoch zombie is fenced
+  (proven by `kafka_txn_wire.rs`; AUDITED, `CORE-AUDIT.md` §Kafka-TXN). **Honest scope:** correct for one producer
+  per partition during a txn (concurrent → retriable `CONCURRENT_TRANSACTIONS`); `read_uncommitted` behaves like
+  `read_committed`; abort-on-restart. The idempotent producer (`enable.idempotence=true`) remains supported for
+  per-partition exactly-once. The faithful marker/LSO model (concurrent same-partition txns + a true
+  `read_uncommitted`) is tracked future work.
 - **No SASL / TLS on the Kafka hop** (see security posture below).
 - **Single partition per topic, single broker.** No real partitioning/replication on the Kafka-facing side — the
   durability/replication is datarail's own (the rail + substrate), not Kafka-style partition replicas.

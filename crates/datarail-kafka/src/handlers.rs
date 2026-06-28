@@ -28,7 +28,7 @@ struct ApiRange {
 /// `InitProducerId` is advertised at v0/v1 only (non-flexible) — enough for an idempotent (non-transactional)
 /// producer. `Fetch`/`ListOffsets` are the CONSUME side (only the `kafka-broker` mode serves them; advertising
 /// them is harmless for ingest-only producers). All are non-flexible versions (no KIP-482 tagged fields).
-const SUPPORTED: [ApiRange; 13] = [
+const SUPPORTED: [ApiRange; 17] = [
     ApiRange { key: API_PRODUCE, min: 0, max: 7 },
     ApiRange { key: crate::consume::API_FETCH, min: 0, max: 4 },
     ApiRange { key: crate::consume::API_LIST_OFFSETS, min: 0, max: 2 },
@@ -45,6 +45,11 @@ const SUPPORTED: [ApiRange; 13] = [
     ApiRange { key: crate::groups::API_HEARTBEAT, min: 0, max: 2 },
     ApiRange { key: crate::groups::API_LEAVE_GROUP, min: 0, max: 2 },
     ApiRange { key: crate::groups::API_SYNC_GROUP, min: 0, max: 2 },
+    // Transactional producer (kafka-broker mode): `KAFKA-TXN-DESIGN.md`. Non-flexible caps.
+    ApiRange { key: crate::txn::API_ADD_PARTITIONS_TO_TXN, min: 0, max: 1 },
+    ApiRange { key: crate::txn::API_ADD_OFFSETS_TO_TXN, min: 0, max: 1 },
+    ApiRange { key: crate::txn::API_END_TXN, min: 0, max: 1 },
+    ApiRange { key: crate::txn::API_TXN_OFFSET_COMMIT, min: 0, max: 1 },
 ];
 
 /// Build the full `InitProducerId` response (response header v0 + body v0) granting `producer_id` with epoch 0.
