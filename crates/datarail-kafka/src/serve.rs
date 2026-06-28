@@ -4,7 +4,7 @@
 //! only the wire protocol; it never sees datarail keys or cofres.
 
 use std::collections::HashMap;
-use std::io::{self, Read as _, Write as _};
+use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -35,6 +35,32 @@ use crate::handlers::{
     API_INIT_PRODUCER_ID, API_METADATA, API_PRODUCE, API_VERSIONS,
 };
 use crate::produce::{build_record_batch, parse_produce, produce_response, EosCoord};
+
+/// A connection stream the serve loop reads length-framed requests from and writes responses to. Implemented for
+/// `TcpStream` (plaintext) and — via the CLI's `tls` feature — a rustls TLS stream, so `datarail-kafka` stays
+/// dependency-free and transport-agnostic (`KAFKA-TLS-DESIGN.md`): crypto lives in the CLI, not this wire crate.
+pub trait ReadWrite: Read + Write {}
+impl<T: Read + Write + ?Sized> ReadWrite for T {}
+
+/// Turns a freshly-accepted plaintext `TcpStream` into the stream a connection handler uses. [`PlainConn`] is the
+/// identity (no TLS); the CLI supplies a rustls-wrapping impl behind its `tls` feature. This is the seam that keeps
+/// TLS out of the zero-dep wire crate while letting it terminate TLS at the edge.
+pub trait ConnWrap: Send + Sync {
+    /// Identity, or a completed TLS handshake, over the accepted socket.
+    ///
+    /// # Errors
+    /// A TLS handshake failure — the serve loop then drops the connection.
+    fn wrap(&self, stream: TcpStream) -> io::Result<Box<dyn ReadWrite + Send>>;
+}
+
+/// Plaintext transport: the accepted socket IS the stream, unchanged (no dependency, the default).
+pub struct PlainConn;
+
+impl ConnWrap for PlainConn {
+    fn wrap(&self, stream: TcpStream) -> io::Result<Box<dyn ReadWrite + Send>> {
+        Ok(Box::new(stream))
+    }
+}
 
 /// A produced batch handed to the integration layer for **durable** landing. The producer is **not acked until
 /// `done` reports the landing result** (ack-after-durable — audit A: a broker that acks before the record is
@@ -85,6 +111,7 @@ pub fn serve(
     advertised_host: &str,
     advertised_port: i32,
     tx: Sender<ProducedBatch>,
+    conn_wrap: &Arc<dyn ConnWrap>,
 ) -> io::Result<()> {
     let shared = Arc::new(Shared {
         offsets: Mutex::new(HashMap::new()),
@@ -107,8 +134,13 @@ pub fn serve(
         active.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::clone(&shared);
         let active = Arc::clone(&active);
+        let conn_wrap = Arc::clone(conn_wrap);
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, &shared);
+            // Wrap the raw socket (identity for plaintext, a TLS handshake otherwise) before handling; a failed
+            // handshake just drops the connection.
+            if let Ok(mut s) = conn_wrap.wrap(stream) {
+                let _ = handle_connection(&mut *s, &shared);
+            }
             active.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -125,7 +157,7 @@ fn request_is_flexible(api_key: i16, version: i16) -> bool {
 }
 
 /// Read one length-framed request (`INT32` length prefix + payload), or `None` at a clean EOF.
-fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+fn read_frame<R: Read>(stream: &mut R) -> io::Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -142,7 +174,7 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(buf))
 }
 
-fn handle_connection(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
+fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Result<()> {
     while let Some(frame) = read_frame(&mut stream)? {
         let mut reader = Reader::new(&frame);
         let api_key = reader.int16()?;
@@ -308,6 +340,7 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
     advertised_port: i32,
     partitions: i32,
     broker: &Arc<B>,
+    conn_wrap: &Arc<dyn ConnWrap>,
 ) -> io::Result<()> {
     let host = advertised_host.to_owned();
     let next_producer_id = Arc::new(AtomicI64::new(1));
@@ -331,9 +364,13 @@ pub fn serve_broker<B: KafkaBroker + 'static>(
         let coord = Arc::clone(&coordinator);
         let txn = Arc::clone(&txn_coordinator);
         let active = Arc::clone(&active);
+        let conn_wrap = Arc::clone(conn_wrap);
         std::thread::spawn(move || {
             let ctx = BrokerCtx { host: &host, port: advertised_port, partitions, next_producer_id: &pid };
-            let _ = handle_broker_connection(stream, broker.as_ref(), &ctx, &coord, &txn);
+            // Wrap the raw socket (identity for plaintext, a TLS handshake otherwise) before serving.
+            if let Ok(mut s) = conn_wrap.wrap(stream) {
+                let _ = handle_broker_connection(&mut *s, broker.as_ref(), &ctx, &coord, &txn);
+            }
             active.fetch_sub(1, Ordering::Relaxed);
         });
     }
@@ -348,8 +385,8 @@ struct BrokerCtx<'a> {
     next_producer_id: &'a AtomicI64,
 }
 
-fn handle_broker_connection<B: KafkaBroker>(
-    mut stream: TcpStream,
+fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
+    mut stream: S,
     broker: &B,
     ctx: &BrokerCtx<'_>,
     coordinator: &GroupCoordinator,

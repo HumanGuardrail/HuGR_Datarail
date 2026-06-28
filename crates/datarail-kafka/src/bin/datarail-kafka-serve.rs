@@ -26,5 +26,7 @@ fn main() -> std::io::Result<()> {
             let _ = b.done.send(Ok(())); // this demo "lands" by printing; ack so the producer is acked
         }
     });
-    serve(&listener, advertised, port, tx)
+    let conn: std::sync::Arc<dyn datarail_kafka::serve::ConnWrap> =
+        std::sync::Arc::new(datarail_kafka::serve::PlainConn);
+    serve(&listener, advertised, port, tx, &conn)
 }

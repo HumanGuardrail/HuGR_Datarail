@@ -919,8 +919,10 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
     let (tx, rx) = std::sync::mpsc::channel::<datarail_kafka::serve::ProducedBatch>();
     let adv = advertised.clone();
+    let conn_wrap: std::sync::Arc<dyn datarail_kafka::serve::ConnWrap> =
+        std::sync::Arc::new(datarail_kafka::serve::PlainConn);
     std::thread::spawn(move || {
-        let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx);
+        let _ = datarail_kafka::serve::serve(&listener, &adv, port, tx, &conn_wrap);
     });
 
     // Kafka ingest delivers EXACTLY-ONCE for an idempotent producer (per (producer_id, partition) sequence —
@@ -1220,7 +1222,9 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
          produce sealed, store sealed durably, un-seal on fetch (provider-blind bidirectional Kafka)",
         data_dir.display()
     );
-    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store)
+    let conn_wrap: std::sync::Arc<dyn datarail_kafka::serve::ConnWrap> =
+        std::sync::Arc::new(datarail_kafka::serve::PlainConn);
+    datarail_kafka::serve::serve_broker(&listener, &advertised, port, partitions, &store, &conn_wrap)
         .map_err(|e| CliError::Io(e.to_string()))?;
     Ok(String::new())
 }
