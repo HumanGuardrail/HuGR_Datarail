@@ -298,9 +298,10 @@ the lead against source before acting:
   ≥10× workload, PASS; the per-core Northflank figures retired, no committed repro). `EFFICIENCY-TCO` had a
   Run-11 `PENDING n≥3` already resolved by the n=3 Run 12 (~72×) — marked resolved; the authoritative headline
   re-pointed to Run 12.
-- **TRACKED (defense-in-depth / non-product-tier, not silently shipped):** zeroize-on-drop for long-lived secrets
-  (`Zeroizing<…>` across terminal/identity/once — a cross-crate refactor for a focused follow-up; ephemeral keys
-  are already zeroized); producer-retry dedup in `replicated-topic` (future replication tier); `FileOnce` not
+- **CLOSED (2026-06-27): zeroize-on-drop for long-lived secrets** — `impl Drop { zeroize }` added to every
+  long-lived-secret holder (`DestTerminal.dest_x25519_secret`, `SourceTerminal.source_seed`,
+  `TerminalConfig.tenant_secret`, `SenderCredential.sender_seed`, `Once.seed`); non-invasive (no type changes;
+  none are `Copy`). Was the tracked moat-hygiene gap. Other still-**TRACKED** items: producer-retry dedup in `replicated-topic` (future replication tier); `FileOnce` not
   wired into the terminal (the Postgres-resident watermark is the product's EOS authority, not the terminal's
   in-RAM `Once`); CRC on the WAL cursor + surface `Drop` flush errors; `StaticKeypair::secret` length-mismatch →
   `Err`; explicit element caps on `manifest::ChunkReceiver` / netblob `OP_LIST` (both already bounded); fuzz the
