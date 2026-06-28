@@ -91,7 +91,10 @@ datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
 # subscribe() consumers, and multi-partition (each an independent durable log). Storage is DURABLE
 # (fsync-before-ack) and provider-blind: verified e2e — produce 3 → KILL the broker → restart → fetch back the
 # original plaintext, while the on-disk cofres are ciphertext; a committed offset survives a broker restart; two
-# consumers auto-share one generation. Plus a TRANSACTIONAL producer (buffer-until-commit: atomic multi-partition
+# consumers auto-share one generation. PROVEN against the REAL Kafka client (kcat/librdkafka in CI,
+# `kafka-broker-librdkafka.yml`): a real producer + a real simple consumer + a real subscribe() CONSUMER GROUP
+# round-trip, with the on-disk store asserted ciphertext-only — not just our own wire tests. Plus a TRANSACTIONAL
+# producer (buffer-until-commit: atomic multi-partition
 # commit + offsets-in-txn, abort hides records, stale-epoch zombies fenced — audited, `KAFKA-TXN-DESIGN.md`; scope:
 # one producer per partition/txn). (Single-node; TLS/compression need a zero-dep waiver.)
 ```

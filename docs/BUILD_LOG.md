@@ -911,6 +911,21 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   provider-blind holds (buffered plaintext sealed before disk). Commits `398098e`→`f1295f3`. **HONEST SCOPE:** one
   producer per partition/txn; `read_uncommitted`==`read_committed`; abort-on-restart; faithful marker/LSO model
   tracked. Docs: KAFKA-TXN-DESIGN (AUDITED), CORE-AUDIT, KAFKA-COMPAT, LASTRO-MATRIX, README. kafka 50 + cli green.
+- 2026-06-28 — **✅ Kafka drop-in PROVEN against the REAL client (librdkafka), in CI.** The owner asked to bundle
+  the night's 43 commits into 7 logical stacked PRs (#1–#7, pushed) then chose a real-librdkafka CI proof as next
+  → PR #8 (`pr8-librdkafka-ci`): `kafka-broker-librdkafka.yml` drives `datarail kafka-broker` with kcat
+  (librdkafka 1.7.1) — a real producer + real simple consumer + real `subscribe()` CONSUMER GROUP round-trip,
+  asserting the on-disk store is ciphertext-only (provider-blind). The CI did exactly its job — caught TWO real
+  issues our hand-rolled tests could not: (1) a flaky RSS gate in the WAL (glibc keeps freed pages → RSS doesn't
+  drop on Linux; the assert was allocator-dependent AND the test skipped on macOS) → fixed to assert the
+  data-structure invariant (`DurableLog::inflight_len()`→0) on all platforms; (2) **Fetch v4 incompatibility** —
+  only the real client negotiates v4 + the group path, exposing that we encoded `aborted_transactions` + an empty
+  record-set as null (`-1`), which librdkafka rejects ("Protocol parse failure for Fetch v4" / "invalid
+  MessageSetSize -1") → fixed to empty (`0`) as a real broker sends, regression `fetch_response_v4_empty_partition
+  _uses_zero_not_null`. The rebalance/JoinGroup/SyncGroup path was already compatible (the real group joined +
+  was assigned cleanly). All green: gate + `kafka-broker-librdkafka` (run 28327143722). Commits a2cafc3→1a65a20
+  on pr8. Docs: README, KAFKA-COMPAT, LASTRO-MATRIX. **The drop-in is now proven against the actual Kafka client,
+  not only our wire protocol tests.**
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 
