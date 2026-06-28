@@ -244,28 +244,38 @@ pub trait KafkaBroker: Send + Sync {
     /// The logical `(earliest, latest)` offsets for `(topic, partition)` (latest = the next offset to be written).
     fn bounds(&self, topic: &str, partition: i32) -> (i64, i64);
 
-    /// BUFFER a transactional batch for `producer_id` on `(topic, partition)` — held until `EndTxn`, NOT yet
-    /// durable/visible (`KAFKA-TXN-DESIGN.md`). Returns the provisional base offset (log end + already-buffered).
+    /// BUFFER a transactional batch for `(producer_id, epoch)` on `(topic, partition)` — held until `EndTxn`, NOT
+    /// yet durable/visible (`KAFKA-TXN-DESIGN.md`). The EPOCH is part of the buffer key so a stale-epoch record
+    /// that slips in via the `produce_check`/`buffer_txn` two-lock window can NEVER be flushed by a newer
+    /// incarnation's commit (audit TOCTOU). Returns the provisional base offset (log end + already-buffered).
     /// Default: falls back to a plain `produce` (a non-txn-aware broker simply lands it immediately).
     ///
     /// # Errors
     /// Propagates a seal/store error.
-    fn buffer_txn(&self, _producer_id: i64, topic: &str, partition: i32, records: &[Vec<u8>]) -> io::Result<i64> {
+    fn buffer_txn(
+        &self,
+        _producer_id: i64,
+        _epoch: i16,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+    ) -> io::Result<i64> {
         self.produce(topic, partition, records)
     }
 
-    /// COMMIT `producer_id`'s buffered records on `partitions` — flush them to the durable sealed log (now
-    /// visible). Default: no-op (nothing was buffered).
+    /// COMMIT `(producer_id, epoch)`'s buffered records on `partitions` — flush ONLY this exact epoch's buffers to
+    /// the durable sealed log (now visible), and DROP any older-epoch buffers for the same producer (stale
+    /// stragglers from a re-init race → never committed). Default: no-op.
     ///
     /// # Errors
     /// Propagates a seal/store error (the producer then retries the `EndTxn`).
-    fn commit_txn(&self, _producer_id: i64, _partitions: &[(String, i32)]) -> io::Result<()> {
+    fn commit_txn(&self, _producer_id: i64, _epoch: i16, _partitions: &[(String, i32)]) -> io::Result<()> {
         Ok(())
     }
 
-    /// ABORT `producer_id`'s buffered records on `partitions` — discard them (they never become durable/visible).
-    /// Default: no-op.
-    fn abort_txn(&self, _producer_id: i64, _partitions: &[(String, i32)]) {}
+    /// ABORT — discard every buffer for `producer_id` at epoch `<=` the given one (this incarnation + any stale
+    /// older one). Default: no-op.
+    fn abort_txn(&self, _producer_id: i64, _epoch: i16, _partitions: &[(String, i32)]) {}
 
     /// Durably commit a consumer group's offset for `(topic, partition)` (`OffsetCommit`). Default: no-op — a
     /// broker that does not persist consumer offsets (acked as NONE; the consumer simply gains no durability).
@@ -367,7 +377,7 @@ fn handle_broker_connection<B: KafkaBroker>(
                     // The epoch bump aborted any in-flight txn at the coordinator; the producer_id is REUSED, so
                     // also drop any buffers left from the prior incarnation (audit: re-init orphaned the store
                     // buffers → an old-epoch record could be committed by the new txn).
-                    broker.abort_txn(pid, &[]);
+                    broker.abort_txn(pid, epoch, &[]);
                     txn_init_producer_id_response(correlation_id, pid, epoch)
                 } else {
                     let pid = ctx.next_producer_id.fetch_add(1, Ordering::Relaxed);
@@ -528,7 +538,7 @@ fn dispatch_txn_api<B: KafkaBroker>(
                 // return a RETRIABLE code and do NOT finish the txn — the producer retries EndTxn; the flush
                 // re-runs (already-flushed buffers are gone → harmless) until it fully succeeds (audit: a swallowed
                 // mid-flush error was acked as a successful atomic commit, silently losing committed records).
-                if broker.commit_txn(pid, &out.partitions).is_err() {
+                if broker.commit_txn(pid, epoch, &out.partitions).is_err() {
                     56
                 } else {
                     let mut offsets_ok = true;
@@ -548,7 +558,7 @@ fn dispatch_txn_api<B: KafkaBroker>(
                 }
             } else {
                 // ABORT: discard the buffered records — they never become durable/visible.
-                broker.abort_txn(pid, &out.partitions);
+                broker.abort_txn(pid, epoch, &out.partitions);
                 txn.finish_txn(&tid);
                 0
             };
@@ -579,7 +589,7 @@ fn produce_results<B: KafkaBroker>(
             let outcome = if let Some(eos) = p.eos.filter(|e| e.transactional) {
                 let code = txn.produce_check(eos.producer_id, eos.producer_epoch, &t.name, p.partition);
                 if code == 0 {
-                    match broker.buffer_txn(eos.producer_id, &t.name, p.partition, &p.values) {
+                    match broker.buffer_txn(eos.producer_id, eos.producer_epoch, &t.name, p.partition, &p.values) {
                         Ok(base) => (base, 0i16),
                         Err(_) => (-1, 56),
                     }

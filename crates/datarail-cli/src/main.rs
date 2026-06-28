@@ -981,10 +981,12 @@ struct BrokerInner {
     data_dir: PathBuf,
     /// Durable consumer-group committed offsets (`OffsetCommit`/`OffsetFetch`), opened lazily under `data_dir`.
     offsets: Option<datarail_offsets::FileOffsets>,
-    /// In-flight TRANSACTIONAL record buffers, keyed by `(producer_id, topic, partition)` — held until `EndTxn`
-    /// (`KAFKA-TXN-DESIGN.md`): on commit they flush to the durable log (then visible), on abort they're dropped.
+    /// In-flight TRANSACTIONAL record buffers, keyed by `(producer_id, epoch, topic, partition)` — held until
+    /// `EndTxn` (`KAFKA-TXN-DESIGN.md`): on commit ONLY the matching epoch flushes to the durable log (then
+    /// visible), on abort they're dropped. The epoch in the key means a stale-epoch record that slipped in via the
+    /// `produce_check`/`buffer_txn` race can never be flushed by a newer incarnation's commit (audit TOCTOU).
     /// In-memory only → a crash mid-txn drops them = an abort (the correct outcome; Q3 abort-on-restart).
-    txn_buffers: std::collections::HashMap<(i64, String, i32), Vec<Vec<u8>>>,
+    txn_buffers: std::collections::HashMap<(i64, i16, String, i32), Vec<Vec<u8>>>,
 }
 
 /// The injective durable-store key for a consumer group's committed offset on a `(topic, partition)`. Length-
@@ -1084,41 +1086,53 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
         g.produce_into(topic, partition, records)
     }
 
-    fn buffer_txn(&self, producer_id: i64, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
+    fn buffer_txn(
+        &self,
+        producer_id: i64,
+        epoch: i16,
+        topic: &str,
+        partition: i32,
+        records: &[Vec<u8>],
+    ) -> std::io::Result<i64> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let inner = &mut *g;
-        // Provisional base = the durable log end + records already buffered for this (producer, topic, partition).
-        // Correct as long as this partition has a single concurrent producer during the txn (the documented scope).
+        // Provisional base = the durable log end + records already buffered for this (producer, epoch, topic,
+        // partition). Correct as long as this partition has a single concurrent producer during the txn.
         let durable = inner.partition_log(topic, partition)?.len();
-        let key = (producer_id, topic.to_owned(), partition);
+        let key = (producer_id, epoch, topic.to_owned(), partition);
         let buf = inner.txn_buffers.entry(key).or_default();
         let base = i64::try_from(durable + buf.len()).unwrap_or(i64::MAX);
         buf.extend(records.iter().cloned());
         Ok(base)
     }
 
-    fn commit_txn(&self, producer_id: i64, _partitions: &[(String, i32)]) -> std::io::Result<()> {
+    fn commit_txn(&self, producer_id: i64, epoch: i16, _partitions: &[(String, i32)]) -> std::io::Result<()> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let inner = &mut *g;
-        // Flush EVERY buffer this producer holds to the durable log. Flush BEFORE removing (the records are cloned
-        // out, which releases the `txn_buffers` borrow for `produce_into`): if an append fails, the buffer stays
-        // intact so an EndTxn RETRY re-flushes it — a partition's committed records are never lost on a mid-flush
-        // error (audit). (Cross-partition visibility may be split across the retry — no loss, eventually all visible.)
-        let keys: Vec<(i64, String, i32)> =
-            inner.txn_buffers.keys().filter(|(pid, _, _)| *pid == producer_id).cloned().collect();
+        // Flush ONLY this exact (producer_id, epoch)'s buffers to the durable log; DROP any older-epoch buffers for
+        // the same producer (a stale straggler from the produce_check/buffer_txn re-init race → never committed,
+        // audit TOCTOU). Flush BEFORE removing (records cloned out, releasing the borrow for `produce_into`): on an
+        // append error the buffer stays so an EndTxn RETRY re-flushes it — committed records are never lost.
+        let keys: Vec<(i64, i16, String, i32)> =
+            inner.txn_buffers.keys().filter(|(pid, _, _, _)| *pid == producer_id).cloned().collect();
         for key in keys {
-            if let Some(records) = inner.txn_buffers.get(&key).cloned() {
-                inner.produce_into(&key.1, key.2, &records)?; // on error: buffer kept, retry recovers it
-                inner.txn_buffers.remove(&key);
+            if key.1 == epoch {
+                if let Some(records) = inner.txn_buffers.get(&key).cloned() {
+                    inner.produce_into(&key.2, key.3, &records)?; // on error: buffer kept, retry recovers it
+                    inner.txn_buffers.remove(&key);
+                }
+            } else if key.1 < epoch {
+                inner.txn_buffers.remove(&key); // stale older-epoch straggler → drop, never commit
             }
         }
         Ok(())
     }
 
-    fn abort_txn(&self, producer_id: i64, _partitions: &[(String, i32)]) {
+    fn abort_txn(&self, producer_id: i64, epoch: i16, _partitions: &[(String, i32)]) {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Drop every buffer this producer holds — they never become durable / visible.
-        g.txn_buffers.retain(|(pid, _, _), _| *pid != producer_id);
+        // Drop this producer's buffers at this epoch AND any older epoch (a re-init aborts the prior incarnation
+        // too) — they never become durable / visible.
+        g.txn_buffers.retain(|(pid, e, _, _), _| !(*pid == producer_id && *e <= epoch));
     }
 
     fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {
