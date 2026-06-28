@@ -981,6 +981,10 @@ struct BrokerInner {
     data_dir: PathBuf,
     /// Durable consumer-group committed offsets (`OffsetCommit`/`OffsetFetch`), opened lazily under `data_dir`.
     offsets: Option<datarail_offsets::FileOffsets>,
+    /// In-flight TRANSACTIONAL record buffers, keyed by `(producer_id, topic, partition)` — held until `EndTxn`
+    /// (`KAFKA-TXN-DESIGN.md`): on commit they flush to the durable log (then visible), on abort they're dropped.
+    /// In-memory only → a crash mid-txn drops them = an abort (the correct outcome; Q3 abort-on-restart).
+    txn_buffers: std::collections::HashMap<(i64, String, i32), Vec<Vec<u8>>>,
 }
 
 /// The injective durable-store key for a consumer group's committed offset on a `(topic, partition)`. Length-
@@ -1029,6 +1033,24 @@ impl BrokerInner {
         }
         self.offsets.as_mut().ok_or_else(|| std::io::Error::other("offset store vanished after open"))
     }
+
+    /// Seal each record into a cofre and durably append it to `(topic, partition)`'s log; return the base offset.
+    /// The non-locking core shared by `produce` and the transactional `commit_txn` flush (both already hold the
+    /// `Mutex`, so this must NOT re-lock).
+    ///
+    /// # Errors
+    /// [`std::io::Error`] on a seal or store failure.
+    fn produce_into(&mut self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
+        let base = self.partition_log(topic, partition)?.len();
+        let mut sealed = Vec::with_capacity(records.len());
+        for (i, rec) in records.iter().enumerate() {
+            let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
+            let refs = [rec.as_slice()];
+            let cofre = self.src.board(&refs, rkey.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            sealed.push(datarail_cofre::encode(&cofre));
+        }
+        self.partition_log(topic, partition)?.append_durable(&sealed)
+    }
 }
 
 impl KafkaBrokerStore {
@@ -1050,6 +1072,7 @@ impl KafkaBrokerStore {
                 logs: std::collections::HashMap::new(),
                 data_dir,
                 offsets: None,
+                txn_buffers: std::collections::HashMap::new(),
             }),
         }
     }
@@ -1058,20 +1081,41 @@ impl KafkaBrokerStore {
 impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        g.produce_into(topic, partition, records)
+    }
+
+    fn buffer_txn(&self, producer_id: i64, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let inner = &mut *g;
-        // The next logical offset = the base for this batch's durable board keys (unique AND stable across restart).
-        let base = inner.partition_log(topic, partition)?.len();
-        let mut sealed = Vec::with_capacity(records.len());
-        for (i, rec) in records.iter().enumerate() {
-            // A UNIQUE, durable board key per record from its (topic, partition, logical offset) — the store
-            // appends, dedup is not its job; uniqueness keeps distinct cofres distinct, restart-stable.
-            let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
-            let refs = [rec.as_slice()];
-            let cofre = inner.src.board(&refs, rkey.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
-            sealed.push(datarail_cofre::encode(&cofre));
+        // Provisional base = the durable log end + records already buffered for this (producer, topic, partition).
+        // Correct as long as this partition has a single concurrent producer during the txn (the documented scope).
+        let durable = inner.partition_log(topic, partition)?.len();
+        let key = (producer_id, topic.to_owned(), partition);
+        let buf = inner.txn_buffers.entry(key).or_default();
+        let base = i64::try_from(durable + buf.len()).unwrap_or(i64::MAX);
+        buf.extend(records.iter().cloned());
+        Ok(base)
+    }
+
+    fn commit_txn(&self, producer_id: i64, _partitions: &[(String, i32)]) -> std::io::Result<()> {
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = &mut *g;
+        // Flush EVERY buffer this producer holds (durably) — they become visible together (atomic commit). Collect
+        // the matching keys first to avoid borrowing `txn_buffers` while mutating the logs.
+        let keys: Vec<(i64, String, i32)> =
+            inner.txn_buffers.keys().filter(|(pid, _, _)| *pid == producer_id).cloned().collect();
+        for key in keys {
+            if let Some(records) = inner.txn_buffers.remove(&key) {
+                inner.produce_into(&key.1, key.2, &records)?;
+            }
         }
-        // Append + fsync + publish offsets atomically w.r.t. visibility (durability-before-ack).
-        inner.partition_log(topic, partition)?.append_durable(&sealed)
+        Ok(())
+    }
+
+    fn abort_txn(&self, producer_id: i64, _partitions: &[(String, i32)]) {
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Drop every buffer this producer holds — they never become durable / visible.
+        g.txn_buffers.retain(|(pid, _, _), _| *pid != producer_id);
     }
 
     fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {

@@ -69,25 +69,33 @@ txn state is runtime (a crash aborts in-flight txns) UNLESS we persist it — se
 - v1 of this tier: abort-on-broker-restart (Q3); `read_committed` filtering per the Q2 ruling.
 - NOT: cross-broker txn coordination, exactly-once across a multi-node cluster.
 
-## Steps 5–6 design decision (the delicate isolation core) — DECIDED 2026-06-28
-Two models were weighed for `read_committed` isolation; the decision has real EOS-correctness scope:
-- **Buffer-until-commit (rejected as the primary model).** Hold a txn's records in memory; flush to the durable log
-  only on `EndTxn(commit)`, discard on abort. Then the durable log holds ONLY committed records → no filtering, no
-  markers, no restart-recovery problem. **But** it breaks with **concurrent transactions on the same partition**
-  (two producers each compute a provisional base offset from the log end → overlap) and it makes `read_uncommitted`
-  stricter than Kafka. Acceptable only for the strictly-one-txn-per-partition-at-a-time case.
-- **Full marker / LSO model (CHOSEN).** Transactional records are stored durably and interleaved as produced
-  (real offsets immediately); a durable **un-sealed control marker** (Q1=a) records each `EndTxn` (COMMIT/ABORT) at
-  its offset. The store tracks, per partition, the txn ranges `(producer_id, [start,end), state)`; the **LSO** = the
-  first offset of any still-ongoing txn (everything below it is resolved). `read_committed` Fetch **edge-filters**
-  (Q2=a): return records below the LSO that are not in an aborted range, with an empty aborted-list. On restart
-  (Q3): replay the log + markers to rebuild the ranges; any txn with no terminal marker is treated as **aborted**
-  (its records skipped). This is the Kafka-correct model and the only one sound under concurrent txns + restart.
-- **Implementation shape:** the produce path passes `(producer_id, transactional)` (from the batch attributes bit
-  4 / the `EosCoord`) to the store so it records the range as ongoing; `KafkaBroker` gains `produce_txn` +
-  `end_txn_marker(producer_id, committed, partitions)`; `fetch` gains an isolation flag; the durable marker is a
-  distinct control record in `SealedPartitionLog`. This is the next focused increment (carefully designed +
-  unit-tested + the brutal audit before ANY exactly-once-abort claim).
+## Steps 5–6 design decision (the delicate isolation core) — DECIDED 2026-06-28, REVISED 2026-06-28
+First decided as the full marker/LSO model; **revised to buffer-until-commit after a deeper analysis of the
+implementation surface.** The rigor compact (correctness paramount; never ship subtly-wrong EOS) drove the change:
+- **Full marker / LSO model (revised away).** Faithful Kafka — interleaved durable records + un-sealed COMMIT/ABORT
+  markers, a durable per-partition txn-range journal, restart recovery rebuilding ranges, LSO computation, and
+  `read_committed` edge-filtering. **But** that is ~5 delicate, interlocking pieces (durable per-record txn metadata,
+  resolution journal, recovery, LSO, fetch filtering) — a large correctness surface where an UNATTENDED build is
+  too likely to introduce a subtle exactly-once bug. Tracked as a future enhancement (it alone enables concurrent
+  same-partition txns + a faithful `read_uncommitted`).
+- **Buffer-until-commit (CHOSEN).** Hold a transaction's records in memory (per `producer_id`/partition); flush them
+  to the durable sealed log only on `EndTxn(commit)`, **discard on abort**. The durable log then holds ONLY
+  committed records → **correct by construction**: aborted records never become durable, so they are NEVER visible
+  to any consumer; a crash mid-txn loses the buffer = an abort (the correct outcome, Q3); no markers, no LSO, no
+  journal, no recovery surgery, no storage-format change, `Fetch` unchanged. It delivers the CORE transactional
+  guarantees — **atomic multi-partition commit** (all buffers flush together on commit / all drop on abort),
+  **`read_committed`** (aborted records never visible), and **offsets-in-txn** (already wired). ~2 pieces (the
+  buffer + flush/discard) → low correctness risk → auditable with high confidence.
+- **HONEST SCOPE (the trade-off, documented not hidden):** correct when **each partition has a single concurrent
+  producer during an open txn**. Concurrent writers to a partition mid-txn would conflict on provisional offsets →
+  rejected with a retriable `CONCURRENT_TRANSACTIONS` (the producer retries after the first commits), enforced by
+  the coordinator claiming a partition for one open txn at a time. `read_uncommitted` behaves like `read_committed`
+  (stricter, safe). For a single-node broker this is a reasonable, honest limitation; the faithful marker model
+  lifts it later.
+- **Implementation shape:** `KafkaBroker` gains `buffer_txn(producer_id, topic, partition, records) -> base` +
+  `commit_txn(producer_id, partitions)` + `abort_txn(producer_id, partitions)` (default no-ops); the produce path
+  routes a transactional batch (attributes bit `0x10`, carried on `EosCoord.transactional`) to `buffer_txn`; the
+  coordinator claims partitions (one open txn each) and `EndTxn` drives commit/abort. `Fetch` is unchanged.
 
 ## Build plan (once ratified — each step tested + audited, like every prior increment)
 1. **This doc + owner ratification of Q1–Q4.**

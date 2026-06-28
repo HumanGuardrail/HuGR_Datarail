@@ -19,6 +19,9 @@ pub struct EosCoord {
     pub base_sequence: i32,
     /// The number of records in the batch — the range is `[base_sequence, base_sequence + count)`.
     pub count: i32,
+    /// Whether the batch is TRANSACTIONAL (v2 attributes bit `0x10`) — its records are buffered until `EndTxn`
+    /// (`KAFKA-TXN-DESIGN.md`), not visible until commit.
+    pub transactional: bool,
 }
 
 /// The result of parsing a partition's records blob: the extracted value payloads, plus the exactly-once
@@ -172,6 +175,7 @@ fn parse_v2_records(reader: &mut Reader, values: &mut Vec<Vec<u8>>) -> io::Resul
     if attributes & 0x07 != 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed batches not supported"));
     }
+    let transactional = attributes & 0x10 != 0; // v2 attributes bit 4 = transactional batch
     let _last_offset_delta = reader.int32()?;
     let _base_timestamp = reader.int64()?;
     let _max_timestamp = reader.int64()?;
@@ -203,6 +207,7 @@ fn parse_v2_records(reader: &mut Reader, values: &mut Vec<Vec<u8>>) -> io::Resul
         producer_epoch,
         base_sequence,
         count: record_count,
+        transactional,
     });
     Ok(eos)
 }

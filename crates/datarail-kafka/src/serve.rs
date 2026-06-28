@@ -244,6 +244,29 @@ pub trait KafkaBroker: Send + Sync {
     /// The logical `(earliest, latest)` offsets for `(topic, partition)` (latest = the next offset to be written).
     fn bounds(&self, topic: &str, partition: i32) -> (i64, i64);
 
+    /// BUFFER a transactional batch for `producer_id` on `(topic, partition)` — held until `EndTxn`, NOT yet
+    /// durable/visible (`KAFKA-TXN-DESIGN.md`). Returns the provisional base offset (log end + already-buffered).
+    /// Default: falls back to a plain `produce` (a non-txn-aware broker simply lands it immediately).
+    ///
+    /// # Errors
+    /// Propagates a seal/store error.
+    fn buffer_txn(&self, _producer_id: i64, topic: &str, partition: i32, records: &[Vec<u8>]) -> io::Result<i64> {
+        self.produce(topic, partition, records)
+    }
+
+    /// COMMIT `producer_id`'s buffered records on `partitions` — flush them to the durable sealed log (now
+    /// visible). Default: no-op (nothing was buffered).
+    ///
+    /// # Errors
+    /// Propagates a seal/store error (the producer then retries the `EndTxn`).
+    fn commit_txn(&self, _producer_id: i64, _partitions: &[(String, i32)]) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// ABORT `producer_id`'s buffered records on `partitions` — discard them (they never become durable/visible).
+    /// Default: no-op.
+    fn abort_txn(&self, _producer_id: i64, _partitions: &[(String, i32)]) {}
+
     /// Durably commit a consumer group's offset for `(topic, partition)` (`OffsetCommit`). Default: no-op — a
     /// broker that does not persist consumer offsets (acked as NONE; the consumer simply gains no durability).
     ///
@@ -353,7 +376,14 @@ fn handle_broker_connection<B: KafkaBroker>(
                 let mut results: HashMap<(String, i32), (i64, i16)> = HashMap::new();
                 for t in &topics {
                     for p in &t.partitions {
-                        let outcome = match broker.produce(&t.name, p.partition, &p.values) {
+                        // A TRANSACTIONAL batch is BUFFERED (held until EndTxn — not visible until commit); a plain
+                        // / idempotent batch lands durably immediately.
+                        let landed = if let Some(eos) = p.eos.filter(|e| e.transactional) {
+                            broker.buffer_txn(eos.producer_id, &t.name, p.partition, &p.values)
+                        } else {
+                            broker.produce(&t.name, p.partition, &p.values)
+                        };
+                        let outcome = match landed {
                             Ok(base) => (base, 0i16),
                             Err(_) => (-1, 56), // KAFKA_STORAGE_ERROR (retriable) — never a false ack
                         };
@@ -503,12 +533,19 @@ fn dispatch_txn_api<B: KafkaBroker>(
         API_END_TXN => {
             let (tid, pid, epoch, committed) = parse_end_txn(reader, api_version)?;
             let out = txn.end_txn(&tid, pid, epoch, committed);
-            // On commit, durably apply the staged consumer offsets (atomic with the txn from the client's view).
-            if out.error_code == 0 && out.committed {
-                if let Some(group) = &out.group {
-                    for (topic, partition, offset) in &out.offsets {
-                        let _ = broker.commit_offset(group, topic, *partition, *offset);
+            if out.error_code == 0 {
+                if out.committed {
+                    // COMMIT: flush the buffered records to the durable log (now visible) FIRST, then apply the
+                    // staged consumer offsets — atomic, all-or-nothing, from the client's view.
+                    let _ = broker.commit_txn(pid, &out.partitions);
+                    if let Some(group) = &out.group {
+                        for (topic, partition, offset) in &out.offsets {
+                            let _ = broker.commit_offset(group, topic, *partition, *offset);
+                        }
                     }
+                } else {
+                    // ABORT: discard the buffered records — they never become durable/visible.
+                    broker.abort_txn(pid, &out.partitions);
                 }
             }
             throttle_error_response(correlation_id, out.error_code)
