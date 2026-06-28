@@ -1817,6 +1817,30 @@ mod tests {
     }
 
     #[test]
+    fn txn_commit_flushes_only_the_matching_epoch_dropping_stale() {
+        // Audit TOCTOU regression: a stale-epoch buffer (a record that slipped past produce_check via the two-lock
+        // window) must NEVER be flushed by a newer incarnation's commit — commit_txn flushes only its own epoch.
+        use datarail_kafka::serve::KafkaBroker as _;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-txn-epoch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
+        // A stale-epoch (epoch 0) record gets buffered under producer 7.
+        store.buffer_txn(7, 0, "events", 0, &[b"evt:zombie".to_vec()]).unwrap();
+        // The live incarnation (epoch 1) buffers + commits at epoch 1.
+        store.buffer_txn(7, 1, "events", 0, &[b"evt:fresh".to_vec()]).unwrap();
+        store.commit_txn(7, 1, &[("events".to_owned(), 0)]).unwrap();
+        // Only the epoch-1 record is durable/visible; the stale epoch-0 buffer was DROPPED, never committed.
+        assert_eq!(
+            store.fetch("events", 0, 0, 1_000_000).unwrap(),
+            vec![b"evt:fresh".to_vec()],
+            "the stale-epoch zombie must not be committed"
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
     fn kafka_broker_store_seals_storage_and_unseals_on_fetch() {
         use datarail_kafka::serve::KafkaBroker as _;
         let spec = RailSpec::parse(&sample()).unwrap();
