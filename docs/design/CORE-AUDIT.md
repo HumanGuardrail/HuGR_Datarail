@@ -201,3 +201,32 @@ no `/`/`..`/NUL reaches a path component, injective even for negative partitions
 never panic/over-read; single `Mutex`, poisoning via `into_inner`, no nested locks → no deadlock; the board key
 `kbroker-{topic}-…` is HMAC'd into `idempotency_key` and the carga is ciphertext → no plaintext (nor the topic)
 reaches disk. Provider-blind-on-disk additionally proven by the rewritten store test + the restart wire test.
+
+## Kafka-OFFSETS audit (2026-06-27) — brutal adversarial pass on durable consumer offsets (increment 3)
+
+An 8th auditor (isolated worktree, from `1033745`) attacked the new `FindCoordinator`/`OffsetCommit`/`OffsetFetch`
+path (`groups.rs`, the trait + serve dispatch, the CLI `FileOffsets` backing + `offset_key`). **2 findings (1 HIGH,
+1 LOW); durability / key-injectivity / wire-correctness / concurrency / casts cold-verified CLEAN.**
+
+- **HIGH — memory-amplification DoS via an untrusted array count → FIXED AT ROOT + SYSTEMICALLY.** `bounded()` capped
+  an array count by remaining *bytes*, but each `Vec` element is far larger than its min wire size, and the code then
+  `Vec::with_capacity(count)`'d — a single 16 MiB frame with a lying `topic_count` materialized ~struct-size× the
+  frame (~168 MB measured), and a near-`i32::MAX` `with_capacity` can even ABORT on allocation failure (a remote
+  crash). Cold-verify found the **same pattern pre-existed** in `consume.rs` (`parse_fetch`/`parse_list_offsets`) and
+  `produce.rs` (`parse_produce`) — a prior audit had only stopped the `i32::MAX` count, not the bytes-amplification.
+  **Fix:** a shared `Reader::bounded_count(count, min_entry_bytes)` divides remaining bytes by the smallest possible
+  per-entry size (so the count can never exceed what physically fits), and every parser drops the untrusted
+  `with_capacity` for a grow-on-demand `Vec::new()`. Applied to `groups`, `consume`, AND `produce`. The shipped
+  over-alloc test was strengthened (it previously sent no filler, so it never exercised the large-remaining case).
+- **LOW — `OffsetCommit` collapsed all partitions to one error code → FIXED.** A single failed partition stamped
+  every partition's response with the retriable code (Kafka reports per-partition). Now each partition carries its
+  own `error_code` (`offset_commit_results` + per-partition result types), so one failure never masks another's
+  durable success.
+
+**CLEAN lenses (cold-verified):** `offset_key` = `"{glen}:{group}:{tlen}:{topic}:{partition}"` is injective (the
+exact decimal length precedes each variable field — uniquely decodable regardless of embedded colons/digits; 2 M
+adversarial triples → 0 collisions); `FileOffsets::commit` is `write_all`→`sync_all`(fsync)→update-map and the serve
+loop acks NONE only after `commit_offset` returns `Ok` → fsync-before-ack holds; wire field order + version gating
+cross-checked vs the Kafka schema for all three APIs at v0/v1/v2 (FindCoordinator v1 throttle+error_message,
+OffsetCommit v1 timestamp / v2 retention, OffsetFetch v2 top-level error_code) — correct; mutex poisoning via
+`into_inner`; offset casts saturate, never panic.

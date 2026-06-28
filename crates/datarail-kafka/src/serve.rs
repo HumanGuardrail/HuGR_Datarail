@@ -18,8 +18,8 @@ use crate::consume::{
 };
 use crate::groups::{
     find_coordinator_response, offset_commit_response, offset_fetch_response, parse_find_coordinator,
-    parse_offset_commit, parse_offset_fetch, OffsetFetchPartitionResult, OffsetFetchTopicResult,
-    API_FIND_COORDINATOR, API_OFFSET_COMMIT, API_OFFSET_FETCH,
+    parse_offset_commit, parse_offset_fetch, OffsetCommitPartitionResult, OffsetCommitTopicResult,
+    OffsetFetchPartitionResult, OffsetFetchTopicResult, API_FIND_COORDINATOR, API_OFFSET_COMMIT, API_OFFSET_FETCH,
 };
 use crate::handlers::{
     api_versions_response, init_producer_id_response, metadata_response, parse_metadata_topics,
@@ -355,17 +355,8 @@ fn handle_broker_connection<B: KafkaBroker>(
             }
             API_OFFSET_COMMIT => {
                 let req = parse_offset_commit(&mut reader, api_version)?;
-                // Durably commit every (topic, partition) offset BEFORE acking; any store failure → a retriable
-                // code so the consumer re-commits rather than assuming durability.
-                let mut error_code = 0i16;
-                for t in &req.topics {
-                    for p in &t.partitions {
-                        if broker.commit_offset(&req.group_id, &t.name, p.partition, p.offset).is_err() {
-                            error_code = 16; // COORDINATOR_NOT_AVAILABLE-class: retriable, never a false success
-                        }
-                    }
-                }
-                offset_commit_response(correlation_id, &req.topics, error_code)
+                let out = offset_commit_results(broker, &req);
+                offset_commit_response(correlation_id, &out)
             }
             API_OFFSET_FETCH => {
                 let req = parse_offset_fetch(&mut reader, api_version)?;
@@ -396,6 +387,28 @@ fn fetch_results<B: KafkaBroker>(broker: &B, topics: &[crate::consume::FetchTopi
             parts.push(FetchPartitionResult { partition: p.partition, error_code, high_watermark: latest, records });
         }
         out.push(FetchTopicResult { name: t.name.clone(), partitions: parts });
+    }
+    out
+}
+
+/// Durably commit a parsed `OffsetCommit` request, per `(topic, partition)`, BEFORE the response is sent. Each
+/// partition carries its OWN error: 0 = NONE on a durable commit, else a retriable code (16) so the consumer
+/// re-commits THAT partition — a failure on one never masks another's success, and never a false NONE.
+fn offset_commit_results<B: KafkaBroker>(
+    broker: &B,
+    req: &crate::groups::OffsetCommitRequest,
+) -> Vec<OffsetCommitTopicResult> {
+    let mut out = Vec::with_capacity(req.topics.len());
+    for t in &req.topics {
+        let mut parts = Vec::with_capacity(t.partitions.len());
+        for p in &t.partitions {
+            let error_code = match broker.commit_offset(&req.group_id, &t.name, p.partition, p.offset) {
+                Ok(()) => 0,
+                Err(_) => 16, // COORDINATOR_NOT_AVAILABLE-class: retriable, never a false success
+            };
+            parts.push(OffsetCommitPartitionResult { partition: p.partition, error_code });
+        }
+        out.push(OffsetCommitTopicResult { name: t.name.clone(), partitions: parts });
     }
     out
 }

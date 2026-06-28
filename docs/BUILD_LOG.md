@@ -827,6 +827,20 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   LOW (doc overclaim "a crash" → "a clean crash") fixed. Docs: KAFKA-FETCH-DESIGN, CORE-AUDIT, LASTRO-MATRIX,
   README. forbid(unsafe); no #[allow]; CLI suite green. (Next tracked: consumer-group offsets via
   `datarail-offsets`, multi-partition, transactional cross-session EOS, compression, TLS on the Kafka hop.)
+- 2026-06-27 — **✅ Kafka consumer-group DURABLE OFFSETS increment 3 (`1033745`) + audit fixes (next commit).**
+  Built broker-side durable committed offsets (Kafka `__consumer_offsets`) on the crash-safe
+  `datarail-offsets::FileOffsets`: `groups.rs` (FindCoordinator 10 / OffsetCommit 8 / OffsetFetch 9, v0–2,
+  non-flexible), `KafkaBroker` trait gains `commit_offset`/`fetch_offset` (default no-op), serve dispatch +
+  ApiVersions; CLI `KafkaBrokerStore` backs them with `FileOffsets` under `<data-dir>/consumer-offsets`
+  (fsync-before-ack), length-prefixed injective `offset_key`. PROVEN full-binary (`kafka_groups_wire.rs`):
+  FindCoordinator→self; OffsetFetch→-1; OffsetCommit 7→NONE; OffsetFetch→7; cross-group isolation; **KILL→RESTART
+  same --data-dir→OffsetFetch→7**. **AUDITED** (8th pass, `CORE-AUDIT.md` §Kafka-OFFSETS): durability /
+  key-injectivity / wire-correctness CLEAN; a memory-amplification HIGH (lying array count → ~struct× the frame,
+  near-i32::MAX `with_capacity` could even ABORT) **fixed at root + SYSTEMICALLY** — new `Reader::bounded_count`
+  (divide remaining by min-entry size) + drop untrusted `with_capacity` for grow-on-demand `Vec::new()`, applied to
+  `groups` AND the pre-existing `consume`/`produce` parsers; per-partition OffsetCommit error-code LOW fixed. Docs:
+  KAFKA-GROUPS-DESIGN, CORE-AUDIT, KAFKA-COMPAT, LASTRO-MATRIX. forbid(unsafe); no #[allow]; workspace green.
+  Honest scope: explicit-commit / manual-assignment consumers; automatic rebalance + multi-partition = increment 4.
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

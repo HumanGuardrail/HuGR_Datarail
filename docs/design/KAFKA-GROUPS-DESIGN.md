@@ -1,6 +1,17 @@
 # KAFKA-GROUPS-DESIGN — durable consumer offsets (increment 3)
 
-> **STATUS: DESIGN (2026-06-27).** The next consume-side increment: broker-side **durable committed offsets** so a
+> **STATUS: BUILT + PROVEN + AUDITED (2026-06-27).** `datarail kafka-broker` serves `FindCoordinator` (self),
+> `OffsetCommit`, `OffsetFetch` (v0–2) backed by the crash-safe `datarail-offsets::FileOffsets` under
+> `--data-dir/consumer-offsets`, fsync-before-ack. PROVEN: `groups.rs` unit tests (round-trips, malformed
+> over-alloc) + `kafka_groups_wire.rs` (full binary: FindCoordinator → self; OffsetFetch → -1; OffsetCommit 7 →
+> NONE; OffsetFetch → 7; cross-group isolation; **KILL broker → RESTART same `--data-dir` → OffsetFetch → 7**).
+> **AUDITED (`CORE-AUDIT.md` §Kafka-OFFSETS):** durability, key-injectivity, wire-correctness CLEAN; a memory-
+> amplification HIGH (a lying array count materializing ~struct-size× the frame) **fixed at root** AND systemically
+> across the pre-existing `consume`/`produce` parsers (`Reader::bounded_count` divides remaining bytes by the min
+> per-entry size; untrusted `with_capacity` dropped); a per-partition `OffsetCommit` error-code LOW fixed. Next
+> (increment 4): automatic group rebalance + multi-partition.
+>
+> **(original DESIGN below)** The next consume-side increment: broker-side **durable committed offsets** so a
 > consumer's progress survives its own restart — Kafka's `__consumer_offsets`, built the leaner way on the
 > already-proven crash-safe `datarail-offsets::FileOffsets`. Adds three wire APIs: `FindCoordinator` (10),
 > `OffsetCommit` (8), `OffsetFetch` (9). **Honest scope:** this is the durable-offset layer; it works with a

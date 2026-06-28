@@ -15,6 +15,9 @@ datarail presents itself as a **single-broker, single-partition-per-topic** Kafk
 | `Produce` | 0 | v0–v7 | parses the request envelope + the records blob (incl. the idempotent producer's `producer_id`/`base_sequence`) |
 | `Fetch` | 1 | v0–v4 | CONSUME side (`kafka-broker` mode): returns un-sealed records as a v2 `RecordBatch` with a correct `CRC-32C` (`KAFKA-FETCH-DESIGN.md`) |
 | `ListOffsets` | 2 | v0–v2 | earliest/latest logical offsets for a consumer (`kafka-broker` mode) |
+| `OffsetCommit` | 8 | v0–v2 | durably commit a consumer group's offset (`kafka-broker` mode, `KAFKA-GROUPS-DESIGN.md`) |
+| `OffsetFetch` | 9 | v0–v2 | read a consumer group's committed offset (`kafka-broker` mode) |
+| `FindCoordinator` | 10 | v0–v2 | names this broker the group coordinator (single-node, `kafka-broker` mode) |
 | `InitProducerId` | 22 | v0–v1 | grants a `producer_id` so a client can `enable.idempotence=true` → exactly-once ingest (`KAFKA-EOS-DESIGN.md`) |
 
 **Record formats:** both the modern **v2 `RecordBatch`** AND the legacy **v0/v1 `MessageSet`** are parsed
@@ -40,10 +43,12 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
 - **Consumer side EXISTS now** (`kafka-broker` mode: `Fetch`, `ListOffsets`) — an unmodified consumer reads back,
   un-sealed at the edge, from a provider-blind (sealed) store. The store is **durable on disk** (increment 2:
   `kafka_store::SealedPartitionLog` over `datarail-replaylog`, `fsync`-before-ack, contiguous logical offset) and
-  **survives a restart** (proven by a broker-kill+restart wire test). **Honest limits:** **single partition** per
-  topic; **no consumer-group coordination** (`OffsetCommit`/`OffsetFetch`/group join) — the consumer tracks its own
-  offset (`auto.offset.reset`/seek); offset-stable across a clean crash + failed batch, with silent mid-history
-  disk-rot renumbering a known retained-log limit (CRC-detected; hardening tracked — `CORE-AUDIT.md`).
+  **survives a restart** (proven by a broker-kill+restart wire test). **Durable consumer offsets EXIST now**
+  (increment 3: `OffsetCommit`/`OffsetFetch`/`FindCoordinator`, fsync-before-ack via `FileOffsets`) — a consumer's
+  committed offset survives its own restart AND a broker restart. **Honest limits:** **single partition** per topic;
+  **no automatic group rebalance** (`JoinGroup`/`SyncGroup`/`Heartbeat` — increment 4): this serves explicit-commit
+  / manual-assignment consumers (`KAFKA-GROUPS-DESIGN.md`); offset-stable across a clean crash + failed batch, with
+  silent mid-history disk-rot renumbering a known retained-log limit (CRC-detected; hardening tracked).
 - **No compression** (gzip/snappy/lz4/zstd). A compressed batch is rejected with a clear error. Producers must
   send uncompressed (`compression.type=none`) for now.
 - **No TRANSACTIONAL producer** (the `AddPartitionsToTxn` / `EndTxn` / transaction-coordinator APIs, a stable

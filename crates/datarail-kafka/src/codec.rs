@@ -67,6 +67,18 @@ impl<'a> Reader<'a> {
         self.buf.get(self.pos..).unwrap_or(&[])
     }
 
+    /// Bound an array element count read from the wire to the number of elements that could PHYSICALLY remain
+    /// (`remaining_bytes / min_entry_bytes`), and never negative. A lying length prefix therefore can neither
+    /// drive a giant `Vec::with_capacity` (which could even abort on allocation failure) nor an over-long loop —
+    /// the materialized count is bounded by the frame size, not by the attacker's number. `min_entry_bytes` MUST
+    /// be a true lower bound on the bytes each loop iteration consumes before pushing (e.g. 4 for an `int32`
+    /// partition, 6 for a `string`+`int32` topic), so a valid request is never under-counted.
+    #[must_use]
+    pub fn bounded_count(&self, count: i32, min_entry_bytes: usize) -> usize {
+        let by_bytes = self.remaining().len() / min_entry_bytes.max(1);
+        usize::try_from(count.max(0)).unwrap_or(0).min(by_bytes)
+    }
+
     /// Returns `true` when no bytes remain to be read.
     #[must_use]
     pub fn is_empty(&self) -> bool {

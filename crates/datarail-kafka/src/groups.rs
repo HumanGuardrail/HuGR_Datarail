@@ -15,10 +15,10 @@ pub const API_OFFSET_FETCH: i16 = 9;
 /// `FindCoordinator` API key.
 pub const API_FIND_COORDINATOR: i16 = 10;
 
-/// Bound an array count read from the wire by the bytes that could possibly remain — never trust a length field.
-fn bounded(count: i32, reader: &Reader) -> usize {
-    usize::try_from(count.max(0)).unwrap_or(0).min(reader.remaining().len())
-}
+/// Smallest possible wire size of a topic array entry: a `string` length (2) + a partition-count `int32` (4).
+const MIN_TOPIC_BYTES: usize = 6;
+/// Smallest possible wire size of a partition array entry: at least the partition `int32` (4) read first.
+const MIN_PARTITION_BYTES: usize = 4;
 
 // ---- FindCoordinator (10) ----
 
@@ -98,13 +98,13 @@ pub fn parse_offset_commit(reader: &mut Reader, version: i16) -> io::Result<Offs
         let _retention_time_ms = reader.int64()?;
     }
     let topic_count = reader.int32()?;
-    let tc = bounded(topic_count, reader);
-    let mut topics = Vec::with_capacity(tc);
+    let tc = reader.bounded_count(topic_count, MIN_TOPIC_BYTES);
+    let mut topics = Vec::new();
     for _ in 0..tc {
         let name = reader.string()?;
         let part_count = reader.int32()?;
-        let pc = bounded(part_count, reader);
-        let mut partitions = Vec::with_capacity(pc);
+        let pc = reader.bounded_count(part_count, MIN_PARTITION_BYTES);
+        let mut partitions = Vec::new();
         for _ in 0..pc {
             let partition = reader.int32()?;
             let offset = reader.int64()?;
@@ -119,10 +119,29 @@ pub fn parse_offset_commit(reader: &mut Reader, version: i16) -> io::Result<Offs
     Ok(OffsetCommitRequest { group_id, topics })
 }
 
-/// Build an `OffsetCommit` response mirroring the committed topics/partitions, each with `error_code` (0 = NONE on
-/// a durable success, else a retriable code so the consumer re-commits rather than assuming success).
+/// One partition's `OffsetCommit` outcome: its index and a PER-PARTITION `error_code` (0 = NONE on a durable
+/// success, else a retriable code so the consumer re-commits that partition rather than assuming success).
+#[derive(Debug, Clone)]
+pub struct OffsetCommitPartitionResult {
+    /// Partition index.
+    pub partition: i32,
+    /// Per-partition error code (0 = NONE).
+    pub error_code: i16,
+}
+
+/// A topic's `OffsetCommit` outcomes.
+#[derive(Debug, Clone)]
+pub struct OffsetCommitTopicResult {
+    /// Topic name.
+    pub name: String,
+    /// Per-partition outcomes.
+    pub partitions: Vec<OffsetCommitPartitionResult>,
+}
+
+/// Build an `OffsetCommit` response mirroring the committed topics/partitions, each carrying its OWN `error_code`
+/// (Kafka reports per-partition status — a failure on one partition must not mask another's success).
 #[must_use]
-pub fn offset_commit_response(correlation_id: i32, topics: &[OffsetCommitTopic], error_code: i16) -> Vec<u8> {
+pub fn offset_commit_response(correlation_id: i32, topics: &[OffsetCommitTopicResult]) -> Vec<u8> {
     let mut w = Writer::new();
     write_response_header(&mut w, correlation_id, false);
     w.int32(i32::try_from(topics.len()).unwrap_or(0));
@@ -131,7 +150,7 @@ pub fn offset_commit_response(correlation_id: i32, topics: &[OffsetCommitTopic],
         w.int32(i32::try_from(t.partitions.len()).unwrap_or(0));
         for p in &t.partitions {
             w.int32(p.partition);
-            w.int16(error_code);
+            w.int16(p.error_code);
         }
     }
     w.into_bytes()
@@ -165,13 +184,13 @@ pub struct OffsetFetchRequest {
 pub fn parse_offset_fetch(reader: &mut Reader, _version: i16) -> io::Result<OffsetFetchRequest> {
     let group_id = reader.string()?;
     let topic_count = reader.int32()?;
-    let tc = bounded(topic_count, reader);
-    let mut topics = Vec::with_capacity(tc);
+    let tc = reader.bounded_count(topic_count, MIN_TOPIC_BYTES);
+    let mut topics = Vec::new();
     for _ in 0..tc {
         let name = reader.string()?;
         let part_count = reader.int32()?;
-        let pc = bounded(part_count, reader);
-        let mut partitions = Vec::with_capacity(pc);
+        let pc = reader.bounded_count(part_count, MIN_PARTITION_BYTES);
+        let mut partitions = Vec::new();
         for _ in 0..pc {
             partitions.push(reader.int32()?);
         }
@@ -225,7 +244,8 @@ pub fn offset_fetch_response(version: i16, correlation_id: i32, topics: &[Offset
 mod tests {
     use super::{
         find_coordinator_response, offset_commit_response, offset_fetch_response, parse_find_coordinator,
-        parse_offset_commit, parse_offset_fetch, OffsetFetchPartitionResult, OffsetFetchTopicResult,
+        parse_offset_commit, parse_offset_fetch, OffsetCommitPartitionResult, OffsetCommitTopicResult,
+        OffsetFetchPartitionResult, OffsetFetchTopicResult,
     };
     use crate::codec::{Reader, Writer};
 
@@ -255,8 +275,12 @@ mod tests {
         assert_eq!(req.topics[0].name, "events");
         assert_eq!(req.topics[0].partitions[0].partition, 0);
         assert_eq!(req.topics[0].partitions[0].offset, 42);
-        // The response mirrors the topic/partition with a NONE error.
-        let resp = offset_commit_response(7, &req.topics, 0);
+        // The response mirrors the topic/partition with a per-partition NONE error.
+        let results = vec![OffsetCommitTopicResult {
+            name: "events".to_owned(),
+            partitions: vec![OffsetCommitPartitionResult { partition: 0, error_code: 0 }],
+        }];
+        let resp = offset_commit_response(7, &results);
         let mut rr = Reader::new(&resp);
         assert_eq!(rr.int32().unwrap(), 7, "correlation id echoed");
         assert_eq!(rr.int32().unwrap(), 1, "1 topic");
@@ -319,15 +343,19 @@ mod tests {
 
     #[test]
     fn malformed_offset_commit_does_not_panic_or_overalloc() {
-        // A huge topic count with no body must bound to the remaining bytes, not allocate billions.
+        // A huge topic count followed by a LOT of filler must bound the materialized count to remaining /
+        // min-entry, never `with_capacity(i32::MAX)` (which can even abort) nor build billions of structs.
         let mut w = Writer::new();
         w.string("grp");
         w.int32(5);
         w.string("member");
         w.int64(-1);
         w.int32(i32::MAX); // lying topic count
+        w.raw(&vec![0u8; 64 * 1024]); // 64 KiB of zero filler (would-be entries)
         let body = w.into_bytes();
         let mut r = Reader::new(&body);
-        let _ = parse_offset_commit(&mut r, 2); // returns Err or empty — never panics / over-allocs
+        // bounded_count caps topics at remaining / MIN_TOPIC_BYTES (≈ 10 K), and the Vec grows on demand — the
+        // parse returns Ok/Err well within memory, never panics / aborts / over-allocs.
+        let _ = parse_offset_commit(&mut r, 2);
     }
 }
