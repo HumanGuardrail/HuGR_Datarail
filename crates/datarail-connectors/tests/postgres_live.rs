@@ -66,6 +66,11 @@ fn commit_at_seq_is_idempotent_per_sequence_range_and_advances_past_dead_letters
     // Kafka-EOS sequence model (KAFKA-EOS-DESIGN.md): commit_at_seq treats each batch as a whole unit keyed on
     // the producer's sequence range. A retry/replay of the same range is a committed no-op; a processed range
     // with zero landed records (all dead-lettered upstream) still advances the watermark so a replay no-ops.
+    run_psql("DROP TABLE IF EXISTS datarail_seq");
+    run_psql("CREATE TABLE datarail_seq (data text)");
+    // Clear any stale watermark for this stream (order-independent: create the table first if no prior test made it).
+    run_psql("CREATE TABLE IF NOT EXISTS datarail_watermark (stream bytea PRIMARY KEY, seq bigint NOT NULL)");
+    run_psql("DELETE FROM datarail_watermark WHERE stream = '\\x726f7574652d7365712d7037'"); // 'route-seq-p7'
     let mut sink = PostgresSink::connect(live_cfg("datarail_seq")).expect("connect");
     let stream = b"route-seq-p7";
 
