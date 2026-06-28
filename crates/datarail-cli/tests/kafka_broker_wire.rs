@@ -1,7 +1,9 @@
 //! FULL-CHAIN bidirectional proof: spawn the real `datarail kafka-broker` binary, PRODUCE records over the Kafka
 //! wire, then FETCH them back — getting the original plaintext, having stored only sealed cofres. No external
-//! deps (in-memory store, TCP loopback) so this runs in normal CI. Proves `serve_broker` + the CLI sealed store +
-//! the Fetch/ListOffsets wire end-to-end (see `KAFKA-FETCH-DESIGN.md`).
+//! deps (durable on-disk store under a temp dir, TCP loopback) so this runs in normal CI. Proves `serve_broker` +
+//! the CLI durable sealed store + the Fetch/ListOffsets wire end-to-end (see `KAFKA-FETCH-DESIGN.md`). The second
+//! phase KILLS the broker and restarts it on the SAME data dir — proving records survive a real process restart
+//! (increment 2 durability), the moat over an in-memory store.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -155,8 +157,35 @@ impl Drop for Daemon {
     }
 }
 
+/// Spawn `datarail kafka-broker` on `PORT` over `data_dir`, and return the daemon + a connected stream once it is
+/// listening. (Killing the returned `Daemon` and calling this again with the same `data_dir` simulates a restart.)
+fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, TcpStream) {
+    let child = Command::new(env!("CARGO_BIN_EXE_datarail"))
+        .args([
+            "kafka-broker",
+            rail.to_str().unwrap(),
+            "--listen",
+            &format!("127.0.0.1:{PORT}"),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+        ])
+        .spawn()
+        .expect("spawn datarail kafka-broker");
+    let daemon = Daemon(child);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stream = loop {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "kafka-broker never started listening");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    (daemon, stream)
+}
+
 #[test]
-fn produce_then_fetch_round_trips_through_the_real_kafka_broker_binary() {
+fn produce_then_fetch_round_trips_and_survives_a_broker_restart() {
     let rail = std::env::temp_dir().join(format!("kafka-broker-{}.toml", std::process::id()));
     std::fs::write(
         &rail,
@@ -174,48 +203,85 @@ fn produce_then_fetch_round_trips_through_the_real_kafka_broker_binary() {
          tenant_secret = \"0x2222222222222222222222222222222222222222222222222222222222222222\"\n",
     )
     .expect("write rail.toml");
+    let data_dir = std::env::temp_dir().join(format!("kafka-broker-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_datarail"))
-        .args(["kafka-broker", rail.to_str().unwrap(), "--listen", &format!("127.0.0.1:{PORT}")])
-        .spawn()
-        .expect("spawn datarail kafka-broker");
-    let _daemon = Daemon(child);
+    // ---- PHASE 1: produce + fetch through a live broker ----
+    {
+        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
 
-    let mut stream = {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Ok(s) = TcpStream::connect(("127.0.0.1", PORT)) {
-                break s;
-            }
-            assert!(Instant::now() < deadline, "kafka-broker never started listening");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        // PRODUCE 3 records (sealed + durably stored by the broker).
+        stream.write_all(&produce_req(1, "events", &[b"evt:m0", b"evt:m1", b"evt:m2"])).unwrap();
+        let _ = read_frame(&mut stream);
 
-    // PRODUCE 3 records (sealed + stored by the broker).
-    stream.write_all(&produce_req(1, "events", &[b"evt:m0", b"evt:m1", b"evt:m2"])).unwrap();
-    let _ = read_frame(&mut stream);
+        // FETCH from offset 0 → the original plaintext back (un-sealed at the edge).
+        stream.write_all(&fetch_req(2, "events", 0)).unwrap();
+        let resp = read_frame(&mut stream);
+        let values = fetch_values(&resp);
+        assert_eq!(
+            values,
+            vec![b"evt:m0".to_vec(), b"evt:m1".to_vec(), b"evt:m2".to_vec()],
+            "a consumer fetches back exactly what was produced (provider-blind bidirectional Kafka)"
+        );
 
-    // FETCH from offset 0 → the original plaintext back (un-sealed at the edge).
-    stream.write_all(&fetch_req(2, "events", 0)).unwrap();
-    let resp = read_frame(&mut stream);
-    let values = fetch_values(&resp);
-    assert_eq!(
-        values,
-        vec![b"evt:m0".to_vec(), b"evt:m1".to_vec(), b"evt:m2".to_vec()],
-        "a consumer fetches back exactly what was produced (provider-blind bidirectional Kafka)"
+        // FETCH a suffix (offset 1) → m1, m2.
+        stream.write_all(&fetch_req(3, "events", 1)).unwrap();
+        let resp = read_frame(&mut stream);
+        assert_eq!(fetch_values(&resp), vec![b"evt:m1".to_vec(), b"evt:m2".to_vec()]);
+
+        // LISTOFFSETS latest → 3.
+        stream.write_all(&list_offsets_req(4, "events")).unwrap();
+        let resp = read_frame(&mut stream);
+        assert_eq!(list_offset_latest(&resp), 3, "latest offset = record count");
+        // _daemon dropped here → the broker process is killed (simulating a crash/restart).
+    }
+
+    // The on-disk data dir holds only ciphertext — a snapshot of the killed broker's storage reveals no plaintext.
+    let on_disk = read_all_under(&data_dir);
+    assert!(!on_disk.is_empty(), "the durable log persisted to disk");
+    assert!(
+        !contains(&on_disk, b"evt:m0") && !contains(&on_disk, b"evt:m1") && !contains(&on_disk, b"evt:m2"),
+        "on-disk bytes are sealed ciphertext, never plaintext (provider-blind across restart)"
     );
 
-    // FETCH a suffix (offset 1) → m1, m2.
-    stream.write_all(&fetch_req(3, "events", 1)).unwrap();
-    let resp = read_frame(&mut stream);
-    assert_eq!(fetch_values(&resp), vec![b"evt:m1".to_vec(), b"evt:m2".to_vec()]);
+    // ---- PHASE 2: restart the broker on the SAME data dir → every acked record is recovered ----
+    {
+        let (_daemon, mut stream) = spawn_broker(&rail, &data_dir);
 
-    // LISTOFFSETS latest → 3.
-    stream.write_all(&list_offsets_req(4, "events")).unwrap();
-    let resp = read_frame(&mut stream);
-    assert_eq!(list_offset_latest(&resp), 3, "latest offset = record count");
+        stream.write_all(&list_offsets_req(5, "events")).unwrap();
+        let resp = read_frame(&mut stream);
+        assert_eq!(list_offset_latest(&resp), 3, "all acked records recovered after a real broker restart");
+
+        stream.write_all(&fetch_req(6, "events", 0)).unwrap();
+        let resp = read_frame(&mut stream);
+        assert_eq!(
+            fetch_values(&resp),
+            vec![b"evt:m0".to_vec(), b"evt:m1".to_vec(), b"evt:m2".to_vec()],
+            "a consumer fetches the original plaintext back AFTER the broker restarted (durable provider-blind)"
+        );
+    }
 
     let _ = std::fs::remove_file(&rail);
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+/// Recursively read+concatenate every file under `dir` (for the on-disk provider-blind check).
+fn read_all_under(dir: &std::path::Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(read_all_under(&path));
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                out.extend(bytes);
+            }
+        }
+    }
+    out
+}
+
+/// True if `haystack` contains `needle` as a contiguous subslice.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
 }

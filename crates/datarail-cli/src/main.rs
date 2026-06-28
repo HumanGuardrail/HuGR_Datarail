@@ -17,8 +17,11 @@
 
 #![forbid(unsafe_code)]
 
+mod kafka_store;
+
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -49,9 +52,10 @@ USAGE:
     datarail recv <rail.toml> [--listen ADDR] [--sink-file F] [--count N]   (cross-process dest)
     datarail kafka-ingest <rail.toml> [--listen ADDR] [--advertised HOST] [--sink-postgres CONN|--sink-webhook URL|--sink-file F]
                      a Kafka wire-protocol endpoint: an UNMODIFIED Kafka producer sends -> datarail seals -> sink
-    datarail kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST]
+    datarail kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST] [--data-dir DIR]
                      BIDIRECTIONAL Kafka drop-in: an UNMODIFIED producer writes AND an UNMODIFIED consumer reads
-                     back; datarail's storage holds only SEALED cofres (provider-blind), un-sealed at the fetch edge
+                     back; datarail's storage holds only SEALED cofres on disk (provider-blind, durable across
+                     restart), un-sealed at the fetch edge. --data-dir defaults to ./datarail-kafka-data
     datarail send <rail.toml> --connect ADDR [--source-file F | record ...] (cross-process source)
 
     keygen --noise   mint a Noise_KK static keypair (X25519) for the encrypted hop.
@@ -958,10 +962,11 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
     Ok(pipe.report())
 }
 
-/// The in-memory **sealed** store behind `datarail kafka-broker` (the consume side, `KAFKA-FETCH-DESIGN.md`).
-/// Produce seals each record into a cofre and appends its wire bytes to a per-`(topic, partition)` log (logical
-/// offset = index); Fetch un-seals at the edge. The log holds only ciphertext → provider-blind. Everything is
-/// behind one `Mutex` so the type is `Send + Sync` for the connection-threaded `serve_broker`.
+/// The **durable, sealed** store behind `datarail kafka-broker` (the consume side, `KAFKA-FETCH-DESIGN.md`
+/// increment 2). Produce seals each record into a cofre and appends its wire bytes to a per-`(topic, partition)`
+/// durable log (logical offset = contiguous record index, `fsync`-before-ack); Fetch un-seals at the edge. The log
+/// holds only ciphertext on disk → provider-blind even against a disk snapshot, and records survive a restart.
+/// Everything is behind one `Mutex` so the type is `Send + Sync` for the connection-threaded `serve_broker`.
 struct KafkaBrokerStore {
     inner: std::sync::Mutex<BrokerInner>,
 }
@@ -969,14 +974,45 @@ struct KafkaBrokerStore {
 struct BrokerInner {
     src: SourceTerminal,
     dst: DestTerminal,
-    /// Sealed cofre bytes per `(topic, partition)`; the vec index is the Kafka logical offset.
-    logs: std::collections::HashMap<(String, i32), Vec<Vec<u8>>>,
-    /// Monotonic counter for a unique per-record board key (the store appends; it does not dedup).
-    seq: u64,
+    /// One durable sealed log per `(topic, partition)`, opened/recovered lazily on first access from `data_dir`.
+    logs: std::collections::HashMap<(String, i32), kafka_store::SealedPartitionLog>,
+    /// Root directory holding each partition's durable log (one subdir per `(topic, partition)`).
+    data_dir: PathBuf,
+}
+
+/// The on-disk directory for a `(topic, partition)`'s durable log. The topic is **hex-encoded** so an arbitrary
+/// topic name (which the wire lets a client choose freely) can NEVER traverse the filesystem — no `/`, `..`, NUL,
+/// or other path-significant byte ever reaches a path component. The mapping is forward-only (we always start from
+/// the request's `(topic, partition)`), so no reverse lookup is needed.
+fn partition_dir(data_dir: &Path, topic: &str, partition: i32) -> PathBuf {
+    let mut name = String::with_capacity(topic.len() * 2 + 12);
+    for b in topic.as_bytes() {
+        name.push(char::from(b"0123456789abcdef"[usize::from(b >> 4)]));
+        name.push(char::from(b"0123456789abcdef"[usize::from(b & 0x0f)]));
+    }
+    name.push('-');
+    name.push_str(&partition.to_string());
+    data_dir.join(name)
+}
+
+impl BrokerInner {
+    /// Get (opening/recovering lazily) the durable log for a `(topic, partition)`.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] if the partition log cannot be opened or recovered.
+    fn partition_log(&mut self, topic: &str, partition: i32) -> std::io::Result<&mut kafka_store::SealedPartitionLog> {
+        let key = (topic.to_owned(), partition);
+        if !self.logs.contains_key(&key) {
+            let dir = partition_dir(&self.data_dir, topic, partition);
+            let log = kafka_store::SealedPartitionLog::open(dir)?;
+            self.logs.insert(key.clone(), log);
+        }
+        self.logs.get_mut(&key).ok_or_else(|| std::io::Error::other("partition log vanished after insert"))
+    }
 }
 
 impl KafkaBrokerStore {
-    fn from_spec(spec: &RailSpec) -> Self {
+    fn from_spec(spec: &RailSpec, data_dir: PathBuf) -> Self {
         let cfg = spec.terminal_config();
         let source_vk = verifying_key(&spec.keys.source_seed);
         let src = SourceTerminal::new(cfg.clone(), spec.onboarding_contract(), spec.keys.source_seed);
@@ -988,7 +1024,12 @@ impl KafkaBrokerStore {
             spec.keys.dest_x25519_secret,
         );
         Self {
-            inner: std::sync::Mutex::new(BrokerInner { src, dst, logs: std::collections::HashMap::new(), seq: 0 }),
+            inner: std::sync::Mutex::new(BrokerInner {
+                src,
+                dst,
+                logs: std::collections::HashMap::new(),
+                data_dir,
+            }),
         }
     }
 }
@@ -997,66 +1038,55 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     fn produce(&self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let inner = &mut *g;
-        let key = (topic.to_owned(), partition);
-        let base = i64::try_from(inner.logs.get(&key).map_or(0, Vec::len)).unwrap_or(i64::MAX);
-        for rec in records {
-            // A UNIQUE board key per record (the store appends; dedup is not its job) → distinct cofres/offsets.
-            let rkey = format!("kbroker-{partition}-{}", inner.seq);
-            inner.seq = inner.seq.wrapping_add(1);
+        // The next logical offset = the base for this batch's durable board keys (unique AND stable across restart).
+        let base = inner.partition_log(topic, partition)?.len();
+        let mut sealed = Vec::with_capacity(records.len());
+        for (i, rec) in records.iter().enumerate() {
+            // A UNIQUE, durable board key per record from its (topic, partition, logical offset) — the store
+            // appends, dedup is not its job; uniqueness keeps distinct cofres distinct, restart-stable.
+            let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
             let refs = [rec.as_slice()];
-            let cofre = inner
-                .src
-                .board(&refs, rkey.as_bytes())
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            inner.logs.entry(key.clone()).or_default().push(datarail_cofre::encode(&cofre));
+            let cofre = inner.src.board(&refs, rkey.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            sealed.push(datarail_cofre::encode(&cofre));
         }
-        Ok(base)
+        // Append + fsync + publish offsets atomically w.r.t. visibility (durability-before-ack).
+        inner.partition_log(topic, partition)?.append_durable(&sealed)
     }
 
     fn fetch(&self, topic: &str, partition: i32, offset: i64, max_bytes: i32) -> std::io::Result<Vec<Vec<u8>>> {
-        let g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(log) = g.logs.get(&(topic.to_owned(), partition)) else {
-            return Ok(Vec::new());
-        };
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = &mut *g;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
-        let Some(slice) = log.get(start..) else {
-            return Ok(Vec::new()); // offset past the end → empty (consumer waits / retries)
-        };
+        let sealed = inner.partition_log(topic, partition)?.read_sealed_from(start, i64::from(max_bytes))?;
+        // Un-seal at the edge: decode + open with the dest key. A record we wrote always opens; a corrupt entry is
+        // skipped defensively. (open is read-only → re-fetching the same offset is idempotent.)
         let mut out = Vec::new();
-        let mut bytes = 0i64;
-        for sealed in slice {
-            // Un-seal at the edge: decode + open with the dest key. A record we wrote always opens; a corrupt
-            // entry is skipped defensively. (open is read-only → re-fetching the same offset is idempotent.)
-            if let Ok(cofre) = datarail_cofre::decode(sealed) {
-                if let Some(records) = g.dst.open(&cofre) {
-                    for r in records {
-                        bytes = bytes.saturating_add(i64::try_from(r.len()).unwrap_or(i64::MAX));
-                        out.push(r);
-                    }
+        for bytes in &sealed {
+            if let Ok(cofre) = datarail_cofre::decode(bytes) {
+                if let Some(records) = inner.dst.open(&cofre) {
+                    out.extend(records);
                 }
-            }
-            // Bound by max_bytes, but always return at least one record (Kafka semantics).
-            if !out.is_empty() && bytes >= i64::from(max_bytes) {
-                break;
             }
         }
         Ok(out)
     }
 
     fn bounds(&self, topic: &str, partition: i32) -> (i64, i64) {
-        let g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let len = g.logs.get(&(topic.to_owned(), partition)).map_or(0, Vec::len);
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = &mut *g;
+        let len = inner.partition_log(topic, partition).map_or(0, |l| l.len());
         (0, i64::try_from(len).unwrap_or(i64::MAX))
     }
 }
 
-/// `kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST]` — the BIDIRECTIONAL Kafka drop-in: an unmodified
+/// `kafka-broker <rail.toml> [--listen ADDR] [--advertised HOST] [--data-dir DIR]` — the BIDIRECTIONAL Kafka drop-in: an unmodified
 /// Kafka producer writes, an unmodified Kafka consumer reads back, and datarail's storage holds only sealed cofres
 /// (provider-blind; un-sealed only at the Fetch edge). Blocks as a daemon until killed. See `KAFKA-FETCH-DESIGN.md`.
 fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
     let spec = load_spec(require(rest, 0, "rail.toml")?)?;
     let mut listen = "0.0.0.0:9092".to_owned();
     let mut advertised = "127.0.0.1".to_owned();
+    let mut data_dir = PathBuf::from("datarail-kafka-data");
     let mut i = 1;
     while i < rest.len() {
         match rest[i].as_str() {
@@ -1068,15 +1098,20 @@ fn cmd_kafka_broker(rest: &[String]) -> Result<String, CliError> {
                 advertised = require(rest, i + 1, "host")?.to_string();
                 i += 2;
             }
+            "--data-dir" => {
+                data_dir = PathBuf::from(require(rest, i + 1, "dir")?);
+                i += 2;
+            }
             other => return Err(CliError::Arg(format!("kafka-broker: unexpected arg `{other}`"))),
         }
     }
     let port: i32 = listen.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(9092);
     let listener = TcpListener::bind(&listen).map_err(|e| CliError::Io(e.to_string()))?;
-    let store = std::sync::Arc::new(KafkaBrokerStore::from_spec(&spec));
+    let store = std::sync::Arc::new(KafkaBrokerStore::from_spec(&spec, data_dir.clone()));
     eprintln!(
-        "datarail kafka-broker on {listen} (advertised {advertised}:{port}) — produce sealed, store sealed, \
-         un-seal on fetch (provider-blind bidirectional Kafka)"
+        "datarail kafka-broker on {listen} (advertised {advertised}:{port}, data {}) — produce sealed, store \
+         sealed durably, un-seal on fetch (provider-blind bidirectional Kafka)",
+        data_dir.display()
     );
     datarail_kafka::serve::serve_broker(&listener, &advertised, port, &store)
         .map_err(|e| CliError::Io(e.to_string()))?;
@@ -1678,24 +1713,23 @@ mod tests {
     fn kafka_broker_store_seals_storage_and_unseals_on_fetch() {
         use datarail_kafka::serve::KafkaBroker as _;
         let spec = RailSpec::parse(&sample()).unwrap();
-        let store = super::KafkaBrokerStore::from_spec(&spec);
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-broker-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
         let recs = vec![b"evt:secret-a".to_vec(), b"evt:secret-b".to_vec()];
 
         let base = store.produce("events", 0, &recs).unwrap();
         assert_eq!(base, 0, "first produce lands at logical offset 0");
 
-        // Provider-blind: the STORED bytes are sealed cofres — they must NOT contain the plaintext payload.
-        {
-            let g = store.inner.lock().unwrap();
-            let log = g.logs.get(&("events".to_owned(), 0)).expect("topic log");
-            assert_eq!(log.len(), 2, "one sealed cofre per record");
-            for sealed in log {
-                assert!(
-                    !contains(sealed, b"secret-a") && !contains(sealed, b"secret-b"),
-                    "stored cofre must be sealed ciphertext, never plaintext (provider-blind)"
-                );
-            }
-        }
+        // Provider-blind: the bytes ON DISK are sealed cofres — they must NOT contain the plaintext payload.
+        // (A disk snapshot of the broker's data dir reveals nothing — the moat vs a plaintext Kafka segment.)
+        let on_disk = read_all_under(&data_dir);
+        assert!(!on_disk.is_empty(), "the durable log wrote something to disk");
+        assert!(
+            !contains(&on_disk, b"secret-a") && !contains(&on_disk, b"secret-b"),
+            "on-disk bytes must be sealed ciphertext, never plaintext (provider-blind across restart)"
+        );
 
         // Fetch un-seals at the edge → the original plaintext, in order.
         assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), recs);
@@ -1710,6 +1744,32 @@ mod tests {
         // A second produce appends (logical offset continues).
         assert_eq!(store.produce("events", 0, &[b"evt:secret-c".to_vec()]).unwrap(), 2);
         assert_eq!(store.bounds("events", 0), (0, 3));
+
+        // DURABILITY: a fresh store over the SAME data dir (simulating a restart) recovers every acked record.
+        drop(store);
+        let reopened = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
+        assert_eq!(reopened.bounds("events", 0), (0, 3), "all acked records recovered after restart");
+        assert_eq!(
+            reopened.fetch("events", 0, 0, 1_000_000).unwrap(),
+            vec![b"evt:secret-a".to_vec(), b"evt:secret-b".to_vec(), b"evt:secret-c".to_vec()]
+        );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Recursively read+concatenate every file under `dir` (test helper for the on-disk provider-blind check).
+    fn read_all_under(dir: &std::path::Path) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    out.extend(read_all_under(&path));
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.extend(bytes);
+                }
+            }
+        }
+        out
     }
 
     /// True if `haystack` contains `needle` as a contiguous subslice (test helper for the seal check).
