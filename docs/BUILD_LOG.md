@@ -978,6 +978,18 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   + round-trips, and a WRONG password is rejected (records never land); on-disk ciphertext. Commits 1300f43→cc8dffe
   on `sasl-kafka-hop` (PR #12). Honest scope: PLAIN only (SCRAM/GSSAPI tracked), single credential, password-in-clear
   unless combined with `--tls` (the CLI warns); authentication only (no ACLs).
+- 2026-06-28 — **✅ Mutual TLS (client-cert auth) on the Kafka hop (PROVEN vs real librdkafka).** Completes the
+  TLS mutual-auth story — the cert-based alternative to SASL. `kafka-broker --tls-client-ca <pem>` makes the broker
+  REQUIRE + verify a client cert chaining to that CA. **Reuses the entire TLS machinery** — the only change is the
+  rustls `ServerConfig` verifier: `WebPkiClientVerifier` (mandatory by default) instead of `with_no_client_auth`.
+  **No new dep** (rustls ships it; behind the existing `tls` feature). `--tls-client-ca` requires `--tls`;
+  `kafka-ingest` stays one-way; default (no `tls` feature) + one-way TLS unchanged (22 cli tests; clippy clean both
+  configs; `forbid(unsafe)`). The CI (`kafka-broker-mtls.yml`, run 28337722532) proves it: a CA-signed client cert
+  round-trips, a client with NO cert is rejected — and the FIRST run usefully confirmed enforcement by rejecting a
+  cert that lacked the webpki-required `clientAuth` EKU (fixed in the test cert-gen: `CA:TRUE` + clientAuth/serverAuth
+  EKUs; the code was already correct). Commits 87c232c→99718e6 on `mtls-kafka-hop` (PR #13). Honest scope: client
+  authentication by cert chain (no cert→identity ACL — tracked). **The Kafka hop now supports TLS + SASL/PLAIN +
+  mTLS, all proven against the real client.**
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

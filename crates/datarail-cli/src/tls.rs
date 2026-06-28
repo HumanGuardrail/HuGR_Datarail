@@ -20,12 +20,15 @@ pub struct TlsConn {
 }
 
 impl TlsConn {
-    /// Build a server-side TLS terminator from a PEM cert chain + a PEM private key (PKCS#8 or RSA).
+    /// Build a server-side TLS terminator from a PEM cert chain + a PEM private key (PKCS#8 or RSA). When
+    /// `client_ca` is `Some`, **mutual TLS** is required: the client must present a certificate chaining to that CA
+    /// PEM, else the handshake fails (`KAFKA-MTLS-DESIGN.md`). `None` is one-way TLS (the server is authenticated).
     ///
     /// # Errors
-    /// [`io::Error`] if a file can't be read, the PEM is malformed, no private key is present, or the cert/key
-    /// pair is rejected by rustls.
-    pub fn from_pem(cert_path: &str, key_path: &str) -> io::Result<Self> {
+    /// [`io::Error`] if a file can't be read, the PEM is malformed, no private key is present, the client-CA has no
+    /// usable roots, or the cert/key pair is rejected by rustls.
+    pub fn from_pem(cert_path: &str, key_path: &str, client_ca: Option<String>) -> io::Result<Self> {
+        let bad = |e: &dyn std::fmt::Display| io::Error::new(io::ErrorKind::InvalidData, e.to_string());
         let certs = rustls_pemfile::certs(&mut BufReader::new(File::open(cert_path)?))
             .collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
@@ -36,12 +39,24 @@ impl TlsConn {
         // Explicit ring provider + safe default protocol versions (TLS 1.3/1.2) — no reliance on a process-global
         // default provider being installed.
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let config = ServerConfig::builder_with_provider(provider)
+        let base = ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(|e| bad(&e))?;
+        let with_verifier = if let Some(ca_path) = client_ca {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in
+                rustls_pemfile::certs(&mut BufReader::new(File::open(&ca_path)?)).collect::<Result<Vec<_>, _>>()?
+            {
+                roots.add(cert).map_err(|e| bad(&e))?;
+            }
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|e| bad(&e))?;
+            base.with_client_cert_verifier(verifier)
+        } else {
+            base.with_no_client_auth()
+        };
+        let config = with_verifier.with_single_cert(certs, key).map_err(|e| bad(&e))?;
         Ok(Self { config: Arc::new(config) })
     }
 }

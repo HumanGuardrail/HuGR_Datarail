@@ -85,8 +85,11 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
   `KAFKA-TLS-DESIGN.md`) — encrypts hop (1). **SASL/PLAIN auth EXISTS now** (`--sasl-user`/`--sasl-pass`,
   `KAFKA-SASL-DESIGN.md`): a client must authenticate (`SaslHandshake` → `SaslAuthenticate`, mechanism `PLAIN`)
   before any other API; proven against real librdkafka (`kafka-broker-sasl.yml`). Pair `--sasl-*` with `--tls` for
-  `SASL_SSL` (PLAIN sends the password in the clear). **No SCRAM/GSSAPI yet** (single credential, PLAIN only); **no
-  mTLS / client-cert** yet. See the security posture below.
+  `SASL_SSL` (PLAIN sends the password in the clear). **mTLS / client-cert auth EXISTS now** (`--tls-client-ca <pem>`,
+  `KAFKA-MTLS-DESIGN.md`): the broker requires + verifies a client cert chaining to that CA (the cert-based
+  alternative to SASL) — proven against real librdkafka (`kafka-broker-mtls.yml`). **No SCRAM/GSSAPI yet** (single
+  credential, PLAIN only); **no cert→identity ACL** yet (mTLS authenticates the client, it does not authorize per
+  topic). See the security posture below.
 - **Single partition per topic, single broker.** No real partitioning/replication on the Kafka-facing side — the
   durability/replication is datarail's own (the rail + substrate), not Kafka-style partition replicas.
 
@@ -115,7 +118,8 @@ infrastructure never see plaintext. With Kafka ingest, the trust boundary is:
    (datarail-topic backing) + **consumer groups** + **multi-partition**.
 2. ✅ **TLS on the Kafka hop — DONE** (2026-06-28, `--features tls`, `KAFKA-TLS-DESIGN.md`): server-side TLS
    termination (`--tls --tls-cert --tls-key`) encrypts hop (1); proven against real librdkafka over TLS in CI
-   (`kafka-broker-tls.yml`). Next within this line: **mTLS / client-cert** + **SASL**.
+   (`kafka-broker-tls.yml`). ✅ **mTLS / client-cert — DONE** (`--tls-client-ca`, `KAFKA-MTLS-DESIGN.md`). ✅ **SASL/
+   PLAIN — DONE** (`--sasl-user/--sasl-pass`, `KAFKA-SASL-DESIGN.md`). Next: SCRAM; cert/identity → ACL.
 3. ✅ **Compression — DONE** (2026-06-28, `--features compression`, `KAFKA-COMPRESSION-DESIGN.md`): gzip/lz4/zstd/
    snappy decompression on produce, proven vs real librdkafka in CI. Re-compression on Fetch (bandwidth) is tracked.
 4. ✅ **Idempotent producer (`InitProducerId`) → exactly-once from idempotent producers — DONE** (2026-06-27,
