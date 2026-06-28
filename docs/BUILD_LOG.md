@@ -854,6 +854,15 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   len-last / put-before-evict ordering sound); X25519 `was_contributory` (already implemented); the fork-safety
   comment (accurate). **Tracked (defense-in-depth / non-product tier):** secret zeroize-on-drop, replicated-topic
   dedup, WAL cursor CRC, a few bounded caps + fuzz gaps. forbid(unsafe); no #[allow]; touched crates green.
+- 2026-06-27 — **✅ Kafka MULTI-PARTITION increment 4a (`af38d8c`).** `metadata_response` advertises N partitions
+  (was hardcoded 1); `serve_broker` threads a count; CLI `--partitions N` (default 1). The durable store already
+  keys lazily per `(topic, partition)`, so each partition is an INDEPENDENT log + offset space — no store change.
+  Proven full-binary (`kafka_multipartition_wire.rs`): `--partitions 3` → Metadata advertises 3; produce to
+  partition 2 → fetch partition 2 gets them, partition 0 independent+empty, partition 0 its own offset space.
+  Self-audited (proportionate: small mechanical change over already-audited machinery — no new exploitable
+  surface). Docs: KAFKA-COMPAT, LASTRO-MATRIX. **Next: increment 4b (automatic group rebalance) — DESIGN FROZEN**
+  in `KAFKA-REBALANCE-DESIGN.md` (JoinGroup/SyncGroup/Heartbeat/LeaveGroup coordinator state machine; the
+  highest-concurrency-risk arc → frozen as design-first, to implement + adversarially audit as its own increment).
 
 ## §6 — STOP-THE-LINE / owner-ratification log
 

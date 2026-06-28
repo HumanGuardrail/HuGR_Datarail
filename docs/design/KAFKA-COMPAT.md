@@ -45,10 +45,12 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
   `kafka_store::SealedPartitionLog` over `datarail-replaylog`, `fsync`-before-ack, contiguous logical offset) and
   **survives a restart** (proven by a broker-kill+restart wire test). **Durable consumer offsets EXIST now**
   (increment 3: `OffsetCommit`/`OffsetFetch`/`FindCoordinator`, fsync-before-ack via `FileOffsets`) — a consumer's
-  committed offset survives its own restart AND a broker restart. **Honest limits:** **single partition** per topic;
-  **no automatic group rebalance** (`JoinGroup`/`SyncGroup`/`Heartbeat` — increment 4): this serves explicit-commit
-  / manual-assignment consumers (`KAFKA-GROUPS-DESIGN.md`); offset-stable across a clean crash + failed batch, with
-  silent mid-history disk-rot renumbering a known retained-log limit (CRC-detected; hardening tracked).
+  committed offset survives its own restart AND a broker restart. **Multi-partition** (increment 4a): `--partitions
+  N` → Metadata advertises N partitions, each an INDEPENDENT durable log + offset space (proven by
+  `kafka_multipartition_wire.rs`). **Honest limits:** **no automatic group rebalance**
+  (`JoinGroup`/`SyncGroup`/`Heartbeat` — increment 4b): this serves explicit-commit / manual-assignment consumers
+  (`KAFKA-GROUPS-DESIGN.md`); offset-stable across a clean crash + failed batch, with silent mid-history disk-rot
+  renumbering a known retained-log limit (CRC-detected; hardening tracked).
 - **No compression** (gzip/snappy/lz4/zstd). A compressed batch is rejected with a clear error. Producers must
   send uncompressed (`compression.type=none`) for now.
 - **No TRANSACTIONAL producer** (the `AddPartitionsToTxn` / `EndTxn` / transaction-coordinator APIs, a stable
