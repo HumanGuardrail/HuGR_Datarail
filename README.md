@@ -29,7 +29,10 @@ append-ordered source (`datarail run --source-file`/replay → `--sink-postgres`
 an **idempotent Kafka producer** (kafka-ingest keys dedup on the producer's own `(producer_id, partition,
 sequence)`, `KAFKA-EOS-DESIGN.md`); both land records + the dedup watermark in one atomic Postgres txn so a retry
 / replay never double-lands. HTTP (a non-stable GET) and a non-idempotent producer are honestly at-least-once.
-And the `datarail` CLI moving real data source→sink.
+A **bidirectional, consumer-group-capable Kafka drop-in** (`datarail kafka-broker`): unmodified producers write and
+unmodified `subscribe()` consumers read back, with **durable provider-blind storage** (sealed on disk, un-sealed
+only at the fetch edge, survives restart), **durable consumer offsets**, **automatic group rebalance**, and
+**multi-partition** (`KAFKA-FETCH/GROUPS/REBALANCE-DESIGN.md`). And the `datarail` CLI moving real data source→sink.
 
 **Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
 **~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**
@@ -81,11 +84,15 @@ storage holding only **sealed** records (un-sealed only at the fetch edge — a 
 provider-blind):
 
 ```sh
-datarail kafka-broker examples/rail.toml --advertised <reachable-host> --data-dir ./datarail-kafka-data
-# Produce (seal+store) + Fetch (un-seal at the edge) + ListOffsets. Storage is DURABLE (fsync-before-ack) and
-# provider-blind: verified e2e produce 3 → KILL the broker → restart → fetch back the original plaintext, while
-# the on-disk cofres are ciphertext. (Durable single-node store, single partition; consumer groups + multi-
-# partition tracked.)
+datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
+    --data-dir ./datarail-kafka-data --partitions 3
+# A full consumer-group-capable Kafka drop-in: Produce + Fetch + ListOffsets, durable consumer offsets
+# (OffsetCommit/OffsetFetch/FindCoordinator), automatic group rebalance (JoinGroup/SyncGroup/Heartbeat) for
+# subscribe() consumers, and multi-partition (each an independent durable log). Storage is DURABLE
+# (fsync-before-ack) and provider-blind: verified e2e — produce 3 → KILL the broker → restart → fetch back the
+# original plaintext, while the on-disk cofres are ciphertext; a committed offset survives a broker restart; two
+# consumers auto-share one generation. (Single-node; transactional-producer EOS is designed + held for
+# ratification — `KAFKA-TXN-DESIGN.md`; TLS/compression need a zero-dep waiver.)
 ```
 
 Lower-level rehearsals (files, two-process TCP, identity pairing):
