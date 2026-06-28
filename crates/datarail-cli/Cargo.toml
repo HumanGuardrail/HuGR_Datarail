@@ -15,6 +15,9 @@ workspace = true
 [features]
 # QUIC pulls quinn+tokio+ring (heavy); keep the default binary featherweight (G2), QUIC one flag away.
 quic = ["dep:datarail-substrate-quic"]
+# TLS on the Kafka hop (KAFKA-TLS-DESIGN.md): reuses rustls (already vetted + in Cargo.lock via the quic
+# substrate). Kept behind a flag so the default binary stays dependency-light. WAIVER logged in BUILD_LOG.
+tls = ["dep:rustls", "dep:rustls-pemfile"]
 
 [dependencies]
 datarail-core = { path = "../datarail-core" }
@@ -32,3 +35,6 @@ datarail-identity = { path = "../datarail-identity" }
 datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
 datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }
 datarail-substrate-quic = { path = "../datarail-substrate-quic", optional = true }
+# TLS termination on the Kafka hop (feature = "tls"). ring backend, consistent with the quic substrate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
