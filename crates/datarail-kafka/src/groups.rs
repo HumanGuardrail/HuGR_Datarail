@@ -14,6 +14,14 @@ pub const API_OFFSET_COMMIT: i16 = 8;
 pub const API_OFFSET_FETCH: i16 = 9;
 /// `FindCoordinator` API key.
 pub const API_FIND_COORDINATOR: i16 = 10;
+/// `JoinGroup` API key.
+pub const API_JOIN_GROUP: i16 = 11;
+/// `Heartbeat` API key.
+pub const API_HEARTBEAT: i16 = 12;
+/// `LeaveGroup` API key.
+pub const API_LEAVE_GROUP: i16 = 13;
+/// `SyncGroup` API key.
+pub const API_SYNC_GROUP: i16 = 14;
 
 /// Smallest possible wire size of a topic array entry: a `string` length (2) + a partition-count `int32` (4).
 const MIN_TOPIC_BYTES: usize = 6;
@@ -237,6 +245,209 @@ pub fn offset_fetch_response(version: i16, correlation_id: i32, topics: &[Offset
     if version >= 2 {
         w.int16(0); // top-level error_code = NONE
     }
+    w.into_bytes()
+}
+
+// ---- JoinGroup (11) ----
+
+/// A `(protocol_name, metadata)` a member advertises in `JoinGroup`.
+#[derive(Debug, Clone)]
+pub struct JoinProtocol {
+    /// Assignor protocol name (e.g. `range`).
+    pub name: String,
+    /// Opaque subscription metadata (consumed by the leader's assignor).
+    pub metadata: Vec<u8>,
+}
+
+/// A parsed `JoinGroup` request (v1–v4; group-instance-id v5+ is out of scope).
+#[derive(Debug, Clone)]
+pub struct JoinGroupRequest {
+    /// Consumer group id.
+    pub group_id: String,
+    /// Session timeout (ms) — liveness window.
+    pub session_timeout_ms: i32,
+    /// Rebalance timeout (ms) — how long the member will wait for the rebalance.
+    pub rebalance_timeout_ms: i32,
+    /// The member id (empty on a first join → the coordinator assigns one).
+    pub member_id: String,
+    /// `protocol_type` (e.g. `consumer`).
+    pub protocol_type: String,
+    /// The assignor protocols the member supports.
+    pub protocols: Vec<JoinProtocol>,
+}
+
+/// Parse a `JoinGroup` request body at `version` (v1–v4).
+///
+/// # Errors
+/// [`io::Error`] if malformed / truncated.
+pub fn parse_join_group(reader: &mut Reader, version: i16) -> io::Result<JoinGroupRequest> {
+    let group_id = reader.string()?;
+    let session_timeout_ms = reader.int32()?;
+    let rebalance_timeout_ms = if version >= 1 { reader.int32()? } else { session_timeout_ms };
+    let member_id = reader.string()?;
+    let protocol_type = reader.string()?;
+    let proto_count = reader.int32()?;
+    let pc = reader.bounded_count(proto_count, MIN_TOPIC_BYTES); // each ≥ name(2) + bytes-len(4)
+    let mut protocols = Vec::new();
+    for _ in 0..pc {
+        let name = reader.string()?;
+        let metadata = reader.bytes()?;
+        protocols.push(JoinProtocol { name, metadata });
+    }
+    Ok(JoinGroupRequest { group_id, session_timeout_ms, rebalance_timeout_ms, member_id, protocol_type, protocols })
+}
+
+/// The fields of a `JoinGroup` response (bundled so the builder stays within the argument cap).
+#[derive(Debug, Clone)]
+pub struct JoinGroupResponse {
+    /// Error code (0 = NONE).
+    pub error_code: i16,
+    /// Assigned generation.
+    pub generation: i32,
+    /// Selected assignor protocol name.
+    pub protocol: String,
+    /// Leader member id.
+    pub leader: String,
+    /// This member's id.
+    pub member_id: String,
+    /// `(member_id, metadata)` for the LEADER; empty for followers.
+    pub members: Vec<(String, Vec<u8>)>,
+}
+
+/// Build a `JoinGroup` response (v1–v4) from [`JoinGroupResponse`].
+#[must_use]
+pub fn join_group_response(version: i16, correlation_id: i32, r: &JoinGroupResponse) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false);
+    if version >= 2 {
+        w.int32(0); // throttle_time_ms
+    }
+    w.int16(r.error_code);
+    w.int32(r.generation);
+    w.string(&r.protocol);
+    w.string(&r.leader);
+    w.string(&r.member_id);
+    w.int32(i32::try_from(r.members.len()).unwrap_or(0));
+    for (mid, meta) in &r.members {
+        w.string(mid);
+        w.bytes(meta);
+    }
+    w.into_bytes()
+}
+
+// ---- SyncGroup (14) ----
+
+/// One member's assignment in a leader's `SyncGroup` request.
+#[derive(Debug, Clone)]
+pub struct SyncAssignment {
+    /// The member to assign.
+    pub member_id: String,
+    /// Opaque assignment bytes (produced by the leader's assignor).
+    pub assignment: Vec<u8>,
+}
+
+/// A parsed `SyncGroup` request (v0–v2; group-instance-id v3+ is out of scope).
+#[derive(Debug, Clone)]
+pub struct SyncGroupRequest {
+    /// Consumer group id.
+    pub group_id: String,
+    /// The generation the member believes it is in.
+    pub generation_id: i32,
+    /// The member id.
+    pub member_id: String,
+    /// Assignments — non-empty only from the leader.
+    pub assignments: Vec<SyncAssignment>,
+}
+
+/// Parse a `SyncGroup` request body at `version` (v0–v2).
+///
+/// # Errors
+/// [`io::Error`] if malformed / truncated.
+pub fn parse_sync_group(reader: &mut Reader, _version: i16) -> io::Result<SyncGroupRequest> {
+    let group_id = reader.string()?;
+    let generation_id = reader.int32()?;
+    let member_id = reader.string()?;
+    let count = reader.int32()?;
+    let n = reader.bounded_count(count, MIN_TOPIC_BYTES); // each ≥ member-id(2) + bytes-len(4)
+    let mut assignments = Vec::new();
+    for _ in 0..n {
+        let member_id = reader.string()?;
+        let assignment = reader.bytes()?;
+        assignments.push(SyncAssignment { member_id, assignment });
+    }
+    Ok(SyncGroupRequest { group_id, generation_id, member_id, assignments })
+}
+
+/// Build a `SyncGroup` response (v0–v2) carrying this member's assignment bytes.
+#[must_use]
+pub fn sync_group_response(version: i16, correlation_id: i32, error_code: i16, assignment: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false);
+    if version >= 1 {
+        w.int32(0); // throttle_time_ms
+    }
+    w.int16(error_code);
+    w.bytes(assignment);
+    w.into_bytes()
+}
+
+// ---- Heartbeat (12) ----
+
+/// A parsed `Heartbeat` request (v0–v2).
+#[derive(Debug, Clone)]
+pub struct HeartbeatRequest {
+    /// Consumer group id.
+    pub group_id: String,
+    /// The member's generation.
+    pub generation_id: i32,
+    /// The member id.
+    pub member_id: String,
+}
+
+/// Parse a `Heartbeat` request body at `version` (v0–v2).
+///
+/// # Errors
+/// [`io::Error`] if malformed / truncated.
+pub fn parse_heartbeat(reader: &mut Reader, _version: i16) -> io::Result<HeartbeatRequest> {
+    let group_id = reader.string()?;
+    let generation_id = reader.int32()?;
+    let member_id = reader.string()?;
+    Ok(HeartbeatRequest { group_id, generation_id, member_id })
+}
+
+/// Build a `Heartbeat` response (v0–v2).
+#[must_use]
+pub fn heartbeat_response(version: i16, correlation_id: i32, error_code: i16) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false);
+    if version >= 1 {
+        w.int32(0); // throttle_time_ms
+    }
+    w.int16(error_code);
+    w.into_bytes()
+}
+
+// ---- LeaveGroup (12) ----
+
+/// Parse a `LeaveGroup` request body at `version` (v0–v2): `(group_id, member_id)`.
+///
+/// # Errors
+/// [`io::Error`] if malformed / truncated.
+pub fn parse_leave_group(reader: &mut Reader, _version: i16) -> io::Result<(String, String)> {
+    let group_id = reader.string()?;
+    let member_id = reader.string()?;
+    Ok((group_id, member_id))
+}
+
+/// Build a `LeaveGroup` response (v0–v2).
+#[must_use]
+pub fn leave_group_response(version: i16, correlation_id: i32, error_code: i16) -> Vec<u8> {
+    let mut w = Writer::new();
+    write_response_header(&mut w, correlation_id, false);
+    if version >= 1 {
+        w.int32(0); // throttle_time_ms
+    }
+    w.int16(error_code);
     w.into_bytes()
 }
 

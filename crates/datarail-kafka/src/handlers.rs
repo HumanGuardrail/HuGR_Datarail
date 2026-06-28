@@ -28,7 +28,7 @@ struct ApiRange {
 /// `InitProducerId` is advertised at v0/v1 only (non-flexible) — enough for an idempotent (non-transactional)
 /// producer. `Fetch`/`ListOffsets` are the CONSUME side (only the `kafka-broker` mode serves them; advertising
 /// them is harmless for ingest-only producers). All are non-flexible versions (no KIP-482 tagged fields).
-const SUPPORTED: [ApiRange; 9] = [
+const SUPPORTED: [ApiRange; 13] = [
     ApiRange { key: API_PRODUCE, min: 0, max: 7 },
     ApiRange { key: crate::consume::API_FETCH, min: 0, max: 4 },
     ApiRange { key: crate::consume::API_LIST_OFFSETS, min: 0, max: 2 },
@@ -39,6 +39,12 @@ const SUPPORTED: [ApiRange; 9] = [
     ApiRange { key: crate::groups::API_OFFSET_COMMIT, min: 0, max: 2 },
     ApiRange { key: crate::groups::API_OFFSET_FETCH, min: 0, max: 2 },
     ApiRange { key: crate::groups::API_FIND_COORDINATOR, min: 0, max: 2 },
+    // Consumer-group REBALANCE (kafka-broker mode): automatic assignment (`KAFKA-REBALANCE-DESIGN.md`).
+    // Non-flexible version caps (group-instance-id / KIP-482 tagged fields are out of scope).
+    ApiRange { key: crate::groups::API_JOIN_GROUP, min: 1, max: 4 },
+    ApiRange { key: crate::groups::API_HEARTBEAT, min: 0, max: 2 },
+    ApiRange { key: crate::groups::API_LEAVE_GROUP, min: 0, max: 2 },
+    ApiRange { key: crate::groups::API_SYNC_GROUP, min: 0, max: 2 },
 ];
 
 /// Build the full `InitProducerId` response (response header v0 + body v0) granting `producer_id` with epoch 0.
