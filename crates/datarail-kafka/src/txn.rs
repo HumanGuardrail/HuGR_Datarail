@@ -36,6 +36,9 @@ pub const NONE: i16 = 0;
 pub const INVALID_PRODUCER_EPOCH: i16 = 47;
 /// `INVALID_TXN_STATE` — the operation is not valid in the txn's current state (e.g. `EndTxn` with no open txn).
 pub const INVALID_TXN_STATE: i16 = 48;
+/// `CONCURRENT_TRANSACTIONS` (retriable) — a partition is already claimed by another open txn; the producer must
+/// retry after the holder commits/aborts. Enforces one open txn per partition (the buffer-model scope).
+pub const CONCURRENT_TRANSACTIONS: i16 = 51;
 
 /// Per-`transactional_id` coordinator state.
 struct TxnState {
@@ -86,9 +89,24 @@ pub struct EndTxnOutcome {
     pub offsets: Vec<(String, i32, i64)>,
 }
 
+/// The mutable shared state, behind one `Mutex`: per-id txn state + the global partition-claim table.
+#[derive(Default)]
+struct TxnInner {
+    txns: HashMap<String, TxnState>,
+    /// Which `transactional_id` currently holds each `(topic, partition)` (one open txn per partition).
+    claimed: HashMap<(String, i32), String>,
+}
+
+impl TxnInner {
+    /// Release every partition claim held by `transactional_id` (on `EndTxn` or on re-init/fence).
+    fn release_claims(&mut self, transactional_id: &str) {
+        self.claimed.retain(|_, holder| holder != transactional_id);
+    }
+}
+
 /// The single-node transaction coordinator.
 pub struct TxnCoordinator {
-    txns: Mutex<HashMap<String, TxnState>>,
+    inner: Mutex<TxnInner>,
     /// Allocates `producer_id`s for transactional producers.
     next_producer_id: AtomicI64,
 }
@@ -98,11 +116,11 @@ impl TxnCoordinator {
     /// allocator's range by the caller).
     #[must_use]
     pub fn new(first_producer_id: i64) -> Self {
-        Self { txns: Mutex::new(HashMap::new()), next_producer_id: AtomicI64::new(first_producer_id) }
+        Self { inner: Mutex::new(TxnInner::default()), next_producer_id: AtomicI64::new(first_producer_id) }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, TxnState>> {
-        self.txns.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> std::sync::MutexGuard<'_, TxnInner> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// `InitProducerId` for a `transactional_id`: assign a `producer_id` (new id for a new txn id) and BUMP the
@@ -110,7 +128,7 @@ impl TxnCoordinator {
     /// `(producer_id, epoch)`.
     pub fn init_producer_id(&self, transactional_id: &str) -> (i64, i16) {
         let mut g = self.lock();
-        if let Some(st) = g.get_mut(transactional_id) {
+        if let Some(st) = g.txns.get_mut(transactional_id) {
             // Bump the epoch to fence the prior incarnation; on i16 overflow, mint a fresh producer_id at epoch 0.
             if let Some(next) = st.epoch.checked_add(1) {
                 st.epoch = next;
@@ -119,12 +137,14 @@ impl TxnCoordinator {
                 st.epoch = 0;
             }
             st.reset_txn(); // any in-flight txn of the old epoch is implicitly aborted
-            (st.producer_id, st.epoch)
+            let out = (st.producer_id, st.epoch);
+            g.release_claims(transactional_id); // its old txn aborts → free its partitions
+            out
         } else {
             let pid = self.next_producer_id.fetch_add(1, Ordering::Relaxed);
             let st = TxnState::new(pid);
             let out = (st.producer_id, st.epoch);
-            g.insert(transactional_id.to_owned(), st);
+            g.txns.insert(transactional_id.to_owned(), st);
             out
         }
     }
@@ -147,15 +167,22 @@ impl TxnCoordinator {
         partitions: &[(String, i32)],
     ) -> i16 {
         let mut g = self.lock();
-        let Some(st) = g.get_mut(transactional_id) else {
+        let TxnInner { txns, claimed } = &mut *g;
+        let Some(st) = txns.get_mut(transactional_id) else {
             return INVALID_PRODUCER_EPOCH;
         };
         let code = Self::fence(st, producer_id, epoch);
         if code != NONE {
             return code;
         }
+        // One open txn per partition: if ANY requested partition is already claimed by a DIFFERENT txn, reject the
+        // whole request (claim nothing) with a retriable CONCURRENT_TRANSACTIONS — the producer retries later.
+        if partitions.iter().any(|p| claimed.get(p).is_some_and(|holder| holder.as_str() != transactional_id)) {
+            return CONCURRENT_TRANSACTIONS;
+        }
         st.ongoing = true;
         for p in partitions {
+            claimed.insert(p.clone(), transactional_id.to_owned());
             st.partitions.insert(p.clone());
         }
         NONE
@@ -164,7 +191,7 @@ impl TxnCoordinator {
     /// `AddOffsetsToTxn`: record that this txn will commit offsets for `group` (opening it). Returns an error code.
     pub fn add_offsets(&self, transactional_id: &str, producer_id: i64, epoch: i16, group: &str) -> i16 {
         let mut g = self.lock();
-        let Some(st) = g.get_mut(transactional_id) else {
+        let Some(st) = g.txns.get_mut(transactional_id) else {
             return INVALID_PRODUCER_EPOCH;
         };
         let code = Self::fence(st, producer_id, epoch);
@@ -185,7 +212,7 @@ impl TxnCoordinator {
         offsets: &[(String, i32, i64)],
     ) -> i16 {
         let mut g = self.lock();
-        let Some(st) = g.get_mut(transactional_id) else {
+        let Some(st) = g.txns.get_mut(transactional_id) else {
             return INVALID_PRODUCER_EPOCH;
         };
         let code = Self::fence(st, producer_id, epoch);
@@ -200,7 +227,7 @@ impl TxnCoordinator {
     /// durably apply, then resets the txn to ready-for-next.
     pub fn end_txn(&self, transactional_id: &str, producer_id: i64, epoch: i16, commit: bool) -> EndTxnOutcome {
         let mut g = self.lock();
-        let Some(st) = g.get_mut(transactional_id) else {
+        let Some(st) = g.txns.get_mut(transactional_id) else {
             return EndTxnOutcome {
                 error_code: INVALID_PRODUCER_EPOCH,
                 committed: commit,
@@ -232,6 +259,8 @@ impl TxnCoordinator {
         let (group, offsets) =
             if commit { (st.group.clone(), st.staged_offsets.clone()) } else { (None, Vec::new()) };
         st.reset_txn();
+        // The txn is resolved → free its partition claims so another producer can transact on them.
+        g.release_claims(transactional_id);
         EndTxnOutcome { error_code: NONE, committed: commit, partitions, group, offsets }
     }
 }
@@ -410,9 +439,33 @@ mod tests {
     use super::{
         add_partitions_response, init_producer_id_response, parse_add_offsets, parse_add_partitions,
         parse_end_txn, parse_init_producer_id, parse_txn_offset_commit, throttle_error_response, TxnCoordinator,
-        INVALID_PRODUCER_EPOCH, INVALID_TXN_STATE, NONE,
+        CONCURRENT_TRANSACTIONS, INVALID_PRODUCER_EPOCH, INVALID_TXN_STATE, NONE,
     };
     use crate::codec::{Reader, Writer};
+
+    #[test]
+    fn one_open_txn_per_partition_is_enforced() {
+        let c = TxnCoordinator::new(1000);
+        let (pa, ea) = c.init_producer_id("tx-A");
+        let (pb, eb) = c.init_producer_id("tx-B");
+        // A claims events:0.
+        assert_eq!(c.add_partitions("tx-A", pa, ea, &[("events".to_owned(), 0)]), NONE);
+        // B cannot claim the same partition while A's txn is open → retriable CONCURRENT_TRANSACTIONS.
+        assert_eq!(
+            c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 0)]),
+            CONCURRENT_TRANSACTIONS,
+            "a second open txn on the same partition is rejected"
+        );
+        // B CAN claim a different partition.
+        assert_eq!(c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 1)]), NONE);
+        // After A ends, B can claim events:0.
+        assert_eq!(c.end_txn("tx-A", pa, ea, true).error_code, NONE);
+        assert_eq!(
+            c.add_partitions("tx-B", pb, eb, &[("events".to_owned(), 0)]),
+            NONE,
+            "the partition frees on EndTxn"
+        );
+    }
 
     #[test]
     fn init_bumps_epoch_and_fences_the_prior_incarnation() {
