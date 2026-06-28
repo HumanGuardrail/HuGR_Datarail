@@ -67,6 +67,13 @@ impl<'a> Reader<'a> {
         self.buf.get(self.pos..).unwrap_or(&[])
     }
 
+    /// The current read cursor (bytes consumed so far). Used to bound a length-counted region — e.g. a compressed
+    /// records blob whose size is `batch_end - position()` (`KAFKA-COMPRESSION-DESIGN.md`).
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     /// Bound an array element count read from the wire to the number of elements that could PHYSICALLY remain
     /// (`remaining_bytes / min_entry_bytes`), and never negative. A lying length prefix therefore can neither
     /// drive a giant `Vec::with_capacity` (which could even abort on allocation failure) nor an over-long loop —

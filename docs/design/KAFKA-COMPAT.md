@@ -66,8 +66,12 @@ the real binary lands exactly once (3 rows, not 6). Continuously gated, not a on
   state (not persisted across a broker restart — committed OFFSETS are); server-side assignment / KIP-848,
   static membership, cooperative-incremental rebalance are out of scope; offset-stable across a clean crash +
   failed batch, with silent mid-history disk-rot renumbering a known retained-log limit (CRC-detected; tracked).
-- **No compression** (gzip/snappy/lz4/zstd). A compressed batch is rejected with a clear error. Producers must
-  send uncompressed (`compression.type=none`) for now.
+- **COMPRESSION EXISTS now** (`--features compression`, `KAFKA-COMPRESSION-DESIGN.md`): a producer with
+  `compression.type=gzip|lz4|zstd|snappy` works — the broker decompresses the batch, seals each record, and a
+  consumer reads them back uncompressed. Proven against real librdkafka (kcat) over all four codecs in CI
+  (`kafka-broker-compression.yml`). The codecs are pure-Rust decompress-only crates behind the feature (default
+  binary stays dependency-light + rejects compressed). Snappy accepts Kafka's xerial/snappy-java framing OR raw/
+  frame snappy (librdkafka's variant). Each decompression is bounded (16 MiB zip-bomb cap).
 - **TRANSACTIONAL producer EXISTS now** (`kafka-broker` mode, `KAFKA-TXN-DESIGN.md`): `InitProducerId` with a
   `transactional.id` (epoch fencing), `AddPartitionsToTxn`/`AddOffsetsToTxn`/`TxnOffsetCommit`/`EndTxn`, on a
   buffer-until-commit model — a txn's records are buffered (invisible) until `EndTxn(commit)` makes them visible
@@ -109,7 +113,8 @@ infrastructure never see plaintext. With Kafka ingest, the trust boundary is:
 2. ✅ **TLS on the Kafka hop — DONE** (2026-06-28, `--features tls`, `KAFKA-TLS-DESIGN.md`): server-side TLS
    termination (`--tls --tls-cert --tls-key`) encrypts hop (1); proven against real librdkafka over TLS in CI
    (`kafka-broker-tls.yml`). Next within this line: **mTLS / client-cert** + **SASL**.
-3. **Compression** (at least the common codecs) for throughput parity.
+3. ✅ **Compression — DONE** (2026-06-28, `--features compression`, `KAFKA-COMPRESSION-DESIGN.md`): gzip/lz4/zstd/
+   snappy decompression on produce, proven vs real librdkafka in CI. Re-compression on Fetch (bandwidth) is tracked.
 4. ✅ **Idempotent producer (`InitProducerId`) → exactly-once from idempotent producers — DONE** (2026-06-27,
    `KAFKA-EOS-DESIGN.md`). Next within this line: **transactional** producer (cross-session EOS via a stable
    `transactional.id`).

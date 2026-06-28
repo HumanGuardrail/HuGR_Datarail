@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 pub mod codec;
+#[cfg(feature = "compression")]
+pub mod compress;
 pub mod consume;
 pub mod coordinator;
 pub mod groups;
