@@ -29,7 +29,7 @@ pub fn decompress(codec: u8, input: &[u8], max: usize) -> io::Result<Vec<u8>> {
 }
 
 /// Read a decompressing reader to completion, bounded at `max` bytes (the shared zip-bomb guard).
-#[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
+#[cfg(any(feature = "compression-lz4", feature = "compression-zstd", feature = "compression-snappy"))]
 fn read_capped(mut r: impl std::io::Read, max: usize) -> io::Result<Vec<u8>> {
     use std::io::Read as _;
     let cap = u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1);
@@ -60,11 +60,29 @@ fn unzstd(input: &[u8], max: usize) -> io::Result<Vec<u8>> {
 /// run of `[int32 block_len][raw-snappy block]` chunks. We parse the framing and decode each block with `snap`.
 #[cfg(feature = "compression-snappy")]
 fn unsnappy(input: &[u8], max: usize) -> io::Result<Vec<u8>> {
-    const MAGIC: [u8; 8] = [0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00];
+    const XERIAL_MAGIC: [u8; 8] = [0x82, b'S', b'N', b'A', b'P', b'P', b'Y', 0x00];
     let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
-    if input.get(..8) != Some(&MAGIC[..]) {
-        return Err(bad("not a xerial/snappy-java snappy frame"));
+    // Detect the actual snappy variant a producer sent (librdkafka may use any): xerial/snappy-java framing,
+    // the standard snappy frame stream (starts 0xFF), or a single raw snappy block. Be liberal in what we accept.
+    if input.get(..8) == Some(&XERIAL_MAGIC[..]) {
+        return unsnappy_xerial(input, max);
     }
+    if input.first() == Some(&0xFF) {
+        return read_capped(snap::read::FrameDecoder::new(input), max);
+    }
+    let decoded = snap::raw::Decoder::new()
+        .decompress_vec(input)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if decoded.len() > max {
+        return Err(bad("decompressed batch exceeds the size cap"));
+    }
+    Ok(decoded)
+}
+
+/// Decode the xerial / snappy-java framing: magic + version words + a run of `[int32 len][raw-snappy block]`.
+#[cfg(feature = "compression-snappy")]
+fn unsnappy_xerial(input: &[u8], max: usize) -> io::Result<Vec<u8>> {
+    let bad = |m: &'static str| io::Error::new(io::ErrorKind::InvalidData, m);
     // 8-byte magic + int32 version + int32 compatible-version = a 16-byte header; then framed blocks.
     let mut pos = 16usize;
     let mut out = Vec::new();

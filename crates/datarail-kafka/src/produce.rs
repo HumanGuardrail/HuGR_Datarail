@@ -647,4 +647,15 @@ mod tests {
         let out = reframe_compressed(&plain, 2, &xerial);
         assert_eq!(parse_record_batch(&out).expect("snappy batch parses").values, values);
     }
+
+    #[test]
+    #[cfg(feature = "compression-snappy")]
+    fn parse_raw_snappy_block_v2_batch() {
+        // Some producers send a single RAW snappy block (no xerial framing) — unsnappy must accept that too.
+        let values = vec![b"evt:raw-a".to_vec(), b"evt:raw-b".to_vec()];
+        let plain = super::build_record_batch(0, &values);
+        let raw = snap::raw::Encoder::new().compress_vec(&plain[61..]).expect("snappy compress");
+        let out = reframe_compressed(&plain, 2, &raw);
+        assert_eq!(parse_record_batch(&out).expect("raw snappy batch parses").values, values);
+    }
 }
