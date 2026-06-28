@@ -587,4 +587,48 @@ mod tests {
         let err = crate::compress::decompress(1, &compressed, 1024).expect_err("must reject over-cap");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
+
+    /// Re-frame a plain (uncompressed) v2 batch as a compressed one: set the attributes codec + swap in the
+    /// compressed records blob + fix batchLength. Header is 61 bytes; attributes at [21..23]; batchLength at [8..12].
+    #[cfg(any(feature = "compression-lz4", feature = "compression-zstd"))]
+    fn reframe_compressed(plain: &[u8], codec: i16, compressed: &[u8]) -> Vec<u8> {
+        let mut out = plain[..61].to_vec();
+        out[21..23].copy_from_slice(&codec.to_be_bytes());
+        out.extend_from_slice(compressed);
+        let batch_len = i32::try_from(out.len() - 12).expect("len");
+        out[8..12].copy_from_slice(&batch_len.to_be_bytes());
+        out
+    }
+
+    #[test]
+    #[cfg(feature = "compression-lz4")]
+    fn parse_lz4_frame_compressed_v2_batch() {
+        use std::io::Write as _;
+        let values = vec![b"evt:lz-a".to_vec(), b"evt:lz-b".to_vec()];
+        let plain = super::build_record_batch(0, &values);
+        let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        enc.write_all(&plain[61..]).expect("lz4 write");
+        let compressed = enc.finish().expect("lz4 finish");
+        let out = reframe_compressed(&plain, 3, &compressed);
+        assert_eq!(parse_record_batch(&out).expect("lz4 batch parses").values, values);
+    }
+
+    #[test]
+    #[cfg(feature = "compression-zstd")]
+    fn parse_zstd_compressed_v2_batch() {
+        // Hand-build a valid zstd frame with a single RAW block (no encoder dep): magic + frame-header
+        // (single-segment, 1-byte content size) + block-header ((len<<3)|last|raw) + the raw records bytes.
+        let values = vec![b"evt:zs-a".to_vec(), b"evt:zs-b".to_vec()];
+        let plain = super::build_record_batch(0, &values);
+        let records = &plain[61..];
+        assert!(records.len() < 256, "test payload fits a 1-byte content size");
+        let mut zstd = vec![0x28, 0xB5, 0x2F, 0xFD]; // zstd magic
+        zstd.push(0x20); // FHD: single-segment → 1-byte Frame_Content_Size, no checksum/dict
+        zstd.push(u8::try_from(records.len()).expect("fits")); // content size
+        let block_header = (u32::try_from(records.len()).expect("fits") << 3) | 1; // raw block (type 0), last
+        zstd.extend_from_slice(&block_header.to_le_bytes()[..3]);
+        zstd.extend_from_slice(records);
+        let out = reframe_compressed(&plain, 4, &zstd);
+        assert_eq!(parse_record_batch(&out).expect("zstd batch parses").values, values);
+    }
 }
