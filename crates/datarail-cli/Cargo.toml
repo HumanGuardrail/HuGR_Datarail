@@ -27,6 +27,7 @@ datarail-spec = { path = "../datarail-spec" }
 datarail-connectors = { path = "../datarail-connectors" }
 datarail-kafka = { path = "../datarail-kafka" }
 datarail-replaylog = { path = "../datarail-replaylog" }
+datarail-offsets = { path = "../datarail-offsets" }
 datarail-identity = { path = "../datarail-identity" }
 datarail-substrate-shmem = { path = "../datarail-substrate-shmem" }
 datarail-substrate-objectstore = { path = "../datarail-substrate-objectstore" }

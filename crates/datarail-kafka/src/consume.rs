@@ -52,13 +52,13 @@ pub fn parse_fetch(reader: &mut Reader, version: i16) -> io::Result<Vec<FetchTop
         let _session_epoch = reader.int32()?;
     }
     let topic_count = reader.int32()?;
-    let tc = usize::try_from(topic_count.max(0)).unwrap_or(0).min(reader.remaining().len());
-    let mut topics = Vec::with_capacity(tc);
+    let tc = reader.bounded_count(topic_count, 6); // 6 = min topic entry (string len 2 + partition count 4)
+    let mut topics = Vec::new();
     for _ in 0..tc {
         let name = reader.string()?;
         let part_count = reader.int32()?;
-        let pc = usize::try_from(part_count.max(0)).unwrap_or(0).min(reader.remaining().len());
-        let mut partitions = Vec::with_capacity(pc);
+        let pc = reader.bounded_count(part_count, 4); // 4 = min partition entry (the int32 partition)
+        let mut partitions = Vec::new();
         for _ in 0..pc {
             let partition = reader.int32()?;
             if version >= 9 {
@@ -159,13 +159,13 @@ pub fn parse_list_offsets(reader: &mut Reader, version: i16) -> io::Result<Vec<L
         let _isolation_level = reader.int8()?;
     }
     let topic_count = reader.int32()?;
-    let tc = usize::try_from(topic_count.max(0)).unwrap_or(0).min(reader.remaining().len());
-    let mut topics = Vec::with_capacity(tc);
+    let tc = reader.bounded_count(topic_count, 6); // 6 = min topic entry (string len 2 + partition count 4)
+    let mut topics = Vec::new();
     for _ in 0..tc {
         let name = reader.string()?;
         let part_count = reader.int32()?;
-        let pc = usize::try_from(part_count.max(0)).unwrap_or(0).min(reader.remaining().len());
-        let mut partitions = Vec::with_capacity(pc);
+        let pc = reader.bounded_count(part_count, 4); // 4 = min partition entry (the int32 partition)
+        let mut partitions = Vec::new();
         for _ in 0..pc {
             let partition = reader.int32()?;
             let timestamp = reader.int64()?;

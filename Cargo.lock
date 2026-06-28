@@ -325,6 +325,7 @@ dependencies = [
  "datarail-identity",
  "datarail-kafka",
  "datarail-manifest",
+ "datarail-offsets",
  "datarail-rail",
  "datarail-replaylog",
  "datarail-spec",

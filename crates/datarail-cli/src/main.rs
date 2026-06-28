@@ -978,6 +978,14 @@ struct BrokerInner {
     logs: std::collections::HashMap<(String, i32), kafka_store::SealedPartitionLog>,
     /// Root directory holding each partition's durable log (one subdir per `(topic, partition)`).
     data_dir: PathBuf,
+    /// Durable consumer-group committed offsets (`OffsetCommit`/`OffsetFetch`), opened lazily under `data_dir`.
+    offsets: Option<datarail_offsets::FileOffsets>,
+}
+
+/// The injective durable-store key for a consumer group's committed offset on a `(topic, partition)`. Length-
+/// prefixed so arbitrary group/topic bytes can never alias (`"a/b"+"c"` vs `"a"+"b/c"` map to distinct keys).
+fn offset_key(group: &str, topic: &str, partition: i32) -> String {
+    format!("{}:{group}:{}:{topic}:{partition}", group.len(), topic.len())
 }
 
 /// The on-disk directory for a `(topic, partition)`'s durable log. The topic is **hex-encoded** so an arbitrary
@@ -1009,6 +1017,17 @@ impl BrokerInner {
         }
         self.logs.get_mut(&key).ok_or_else(|| std::io::Error::other("partition log vanished after insert"))
     }
+
+    /// Get (opening/recovering lazily) the durable consumer-offset store under `data_dir/consumer-offsets`.
+    ///
+    /// # Errors
+    /// [`std::io::Error`] if the offset store cannot be opened or recovered.
+    fn offset_store(&mut self) -> std::io::Result<&mut datarail_offsets::FileOffsets> {
+        if self.offsets.is_none() {
+            self.offsets = Some(datarail_offsets::FileOffsets::open(self.data_dir.join("consumer-offsets"))?);
+        }
+        self.offsets.as_mut().ok_or_else(|| std::io::Error::other("offset store vanished after open"))
+    }
 }
 
 impl KafkaBrokerStore {
@@ -1029,6 +1048,7 @@ impl KafkaBrokerStore {
                 dst,
                 logs: std::collections::HashMap::new(),
                 data_dir,
+                offsets: None,
             }),
         }
     }
@@ -1076,6 +1096,22 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
         let inner = &mut *g;
         let len = inner.partition_log(topic, partition).map_or(0, |l| l.len());
         (0, i64::try_from(len).unwrap_or(i64::MAX))
+    }
+
+    fn commit_offset(&self, group: &str, topic: &str, partition: i32, offset: i64) -> std::io::Result<()> {
+        use datarail_offsets::OffsetStore as _;
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = offset_key(group, topic, partition);
+        // Kafka committed offsets are >= 0; a negative offset (shouldn't happen) clamps to 0.
+        let value = u64::try_from(offset).unwrap_or(0);
+        g.offset_store()?.commit(&key, value) // fsync-durable before the OffsetCommit is acked
+    }
+
+    fn fetch_offset(&self, group: &str, topic: &str, partition: i32) -> std::io::Result<Option<i64>> {
+        use datarail_offsets::OffsetStore as _;
+        let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = offset_key(group, topic, partition);
+        Ok(g.offset_store()?.fetch(&key).map(|o| i64::try_from(o).unwrap_or(i64::MAX)))
     }
 }
 

@@ -9,6 +9,7 @@
 
 pub mod codec;
 pub mod consume;
+pub mod groups;
 pub mod handlers;
 pub mod produce;
 pub mod serve;

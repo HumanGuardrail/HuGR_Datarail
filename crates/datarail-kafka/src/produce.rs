@@ -239,13 +239,13 @@ pub fn parse_produce(reader: &mut Reader, version: i16) -> io::Result<Vec<Produc
     // Bound the count by the bytes actually remaining (each element is ≥1 byte): a small frame cannot claim
     // billions of topics/partitions and drive an over-allocation (audit K3). A genuine over-claim then fails
     // fast when the per-element reads run out of buffer.
-    let tc = usize::try_from(topic_count.max(0)).unwrap_or(0).min(reader.remaining().len());
-    let mut topics = Vec::with_capacity(tc);
+    let tc = reader.bounded_count(topic_count, 6); // 6 = min topic entry (string len 2 + partition count 4)
+    let mut topics = Vec::new();
     for _ in 0..tc {
         let name = reader.string()?;
         let part_count = reader.int32()?;
-        let pc = usize::try_from(part_count.max(0)).unwrap_or(0).min(reader.remaining().len());
-        let mut partitions = Vec::with_capacity(pc);
+        let pc = reader.bounded_count(part_count, 4); // 4 = min partition entry (the int32 partition)
+        let mut partitions = Vec::new();
         for _ in 0..pc {
             let partition = reader.int32()?;
             let (values, eos) = match reader.nullable_bytes()? {
