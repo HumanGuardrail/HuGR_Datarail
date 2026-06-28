@@ -218,6 +218,15 @@ impl DurableLog {
         Ok(())
     }
 
+    /// Number of delivered-but-un-acked cofres currently tracked in the in-flight bookkeeping. The ack-cost
+    /// invariant (`DURABLE-LOG.md`): this grows with the un-acked backlog and returns to 0 once everything is
+    /// acked — the bookkeeping is RECLAIMED, not leaked. (Asserted at the data-structure level because RSS reclaim
+    /// is allocator-dependent: glibc malloc retains freed pages in its arenas, so RSS need not drop on Linux.)
+    #[must_use]
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.len()
+    }
+
     /// Start a fresh segment file. The new file's dir-entry is made durable by fsync'ing the directory, so a
     /// power-loss can't leave fsync'd segment data unreachable because its name never hit the directory.
     fn rotate(&mut self) -> Result<(), WalError> {
