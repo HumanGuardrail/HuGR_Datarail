@@ -1,0 +1,72 @@
+name: Kafka broker mTLS — real librdkafka (client certificate required)
+
+# Proves mutual TLS (KAFKA-MTLS-DESIGN.md): a CA signs a server cert AND a client cert; the broker is started with
+# --tls-client-ca, so a real kcat/librdkafka client WITH a CA-signed client cert authenticates + round-trips, and a
+# client WITHOUT a client cert is REJECTED (its records never land). Force 127.0.0.1 (avoid the localhost→IPv6 flake).
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/datarail-kafka/**"
+      - "crates/datarail-cli/**"
+      - ".github/workflows/kafka-broker-mtls.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  mtls-roundtrip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate a CA + server cert + client cert; start the mTLS broker
+        run: |
+          openssl req -x509 -newkey rsa:2048 -keyout ca.key -out ca.pem -days 1 -nodes -subj "/CN=test-ca"
+          openssl req -newkey rsa:2048 -keyout srv.key -out srv.csr -nodes -subj "/CN=localhost"
+          openssl x509 -req -in srv.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -out srv.pem \
+            -extfile <(printf "subjectAltName=IP:127.0.0.1")
+          openssl req -newkey rsa:2048 -keyout cli.key -out cli.csr -nodes -subj "/CN=test-client"
+          openssl x509 -req -in cli.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 1 -out cli.pem
+          cargo build -p datarail-cli --release --features tls
+          ./target/release/datarail kafka-broker examples/rail.toml \
+            --listen 0.0.0.0:9092 --advertised 127.0.0.1 --data-dir ./kbroker-data --partitions 1 \
+            --tls --tls-cert srv.pem --tls-key srv.key --tls-client-ca ca.pem > broker.log 2>&1 &
+          echo $! > broker.pid
+          sleep 3
+
+      - name: WITH a CA-signed client cert → mutual-TLS round-trip
+        run: |
+          CERTS="-X ssl.ca.location=/certs/ca.pem -X ssl.certificate.location=/certs/cli.pem -X ssl.key.location=/certs/cli.key"
+          printf 'evt:m-1\nevt:m-2\nevt:m-3\n' \
+            | docker run --rm -i --network host -v "$(pwd):/certs" edenhill/kcat:1.7.1 \
+                -b 127.0.0.1:9092 -X security.protocol=SSL $CERTS -t events -P
+          sleep 1
+          OUT=$(timeout 30 docker run --rm --network host -v "$(pwd):/certs" edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 -X security.protocol=SSL $CERTS -t events -C -o beginning -e -q 2>&1)
+          echo "mTLS read: [$OUT]"
+          for n in 1 2 3; do
+            echo "$OUT" | grep -qF "evt:m-$n" || { echo "::error::mTLS consumer missing evt:m-$n"; exit 1; }
+          done
+
+      - name: WITHOUT a client cert → REJECTED (records never land)
+        run: |
+          # Trusts the server (ssl.ca.location) but presents NO client cert → the broker must reject the handshake.
+          printf 'evt:noclient-1\n' \
+            | docker run --rm -i --network host -v "$(pwd):/certs" edenhill/kcat:1.7.1 \
+                -b 127.0.0.1:9092 -X security.protocol=SSL -X ssl.ca.location=/certs/ca.pem -t events-noclient -P 2>&1 \
+            | sed 's/^/  [no-client-cert] /' || true
+          sleep 1
+          CERTS="-X ssl.ca.location=/certs/ca.pem -X ssl.certificate.location=/certs/cli.pem -X ssl.key.location=/certs/cli.key"
+          OUT=$(timeout 20 docker run --rm --network host -v "$(pwd):/certs" edenhill/kcat:1.7.1 \
+                  -b 127.0.0.1:9092 -X security.protocol=SSL $CERTS -t events-noclient -C -o beginning -e -q 2>&1 || true)
+          echo "events-noclient after a no-client-cert produce: [$OUT]"
+          if echo "$OUT" | grep -qF "evt:noclient-1"; then
+            echo "::error::a NO-client-cert produce LANDED — mTLS is not enforced"; exit 1
+          fi
+          echo "## Kafka mTLS ✅ — a CA-signed client cert round-trips; a client with NO cert is rejected" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the broker
+        if: always()
+        run: '[ -f broker.pid ] && kill "$(cat broker.pid)" 2>/dev/null || true'
