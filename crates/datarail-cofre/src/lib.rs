@@ -155,8 +155,10 @@ fn parse_etiqueta(bytes: &[u8]) -> Result<Etiqueta, CofreError> {
 
 fn signed_region(e: &Etiqueta, carga: &[u8]) -> Vec<u8> {
     let et = encode_etiqueta(e);
-    let et_len = u32::try_from(et.len()).expect("etiqueta is a fixed-width header");
-    let carga_len = u64::try_from(carga.len()).expect("carga length fits u64");
+    // Both casts are unreachable-by-construction (the etiqueta is a small fixed-width header; `usize` ≤ `u64` on
+    // supported targets), but the charter forbids `expect()` in non-test code → saturate instead of panicking.
+    let et_len = u32::try_from(et.len()).unwrap_or(u32::MAX);
+    let carga_len = u64::try_from(carga.len()).unwrap_or(u64::MAX);
     let mut v = Vec::with_capacity(4 + 1 + 4 + et.len() + 8 + carga.len());
     v.extend_from_slice(&MAGIC);
     v.push(VERSION);

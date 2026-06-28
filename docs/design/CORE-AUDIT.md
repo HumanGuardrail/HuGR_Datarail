@@ -226,8 +226,38 @@ the lead against source before acting:
   wiring. No change. (The related "`FileOnce` persistent dedup not wired" is not a defect for the product guarantee
   — the Postgres-resident watermark, not the terminal's in-RAM `Once`, is the exactly-once authority.)
 
-Other findings (shmem send-side `checked_sub`, secret zeroization, replication/tiered durability-before-ack,
-fuzz/CI-gate gaps, honesty-ledger nits) are being triaged in turn; see `BUILD_LOG.md`.
+**Other findings — full disposition (each cold-verified before acting):**
+- **HIGH shmem `send` unchecked cursor subtraction → FIXED.** `send` did raw `capacity - (write - read)` on the
+  peer-controllable ring cursors (`recv` already guarded with `checked_sub`); a corrupt consumer (`read > write`)
+  underflowed → debug panic / release back-pressure bypass. Now `checked_sub`/`checked_add` throughout, mirroring
+  `recv` (`shmem/src/lib.rs`).
+- **HIGH "no continuous CI gate" → FIXED.** Added `.github/workflows/ci.yml` (push + PR): forbid-unsafe charter
+  check (no `allow(unsafe_code)` outside shmem, no `allow(clippy::…)`), `clippy --workspace --all-targets -D
+  warnings`, `cargo test --workspace`.
+- **HIGH replication tier "acks before shards durable" → REJECTED (sub-agent over-trace).** `FsBlob::put` fsyncs
+  every blob (data + dir, `blobstore/src/lib.rs:170,177`) and `len_key` is written LAST (the commit point after
+  all shards are durable), so "len present ⟹ all shards durable" — the torn-write case cannot occur on the real
+  backend. The sub-agent assumed `put` doesn't fsync.
+- **HIGH tieredlog "evicts before cold offload durable" → REJECTED (same reason).** `seal_and_rotate` `blob.put`s
+  (fsync'd) BEFORE `remove_file` (`tieredlog/src/lib.rs:170` "durable FIRST", with prior WP1 audit fixes).
+- **INFO cofre `expect()` in non-test code → FIXED.** `signed_region`'s two unreachable `expect()` casts are now
+  panic-free saturating casts (charter: no `expect` in non-test code).
+- **LOW X25519 `was_contributory` → REJECTED (already implemented).** `x25519_shared` already returns `None` on a
+  non-contributory (low-order) DH and fails closed (`crypto/src/lib.rs:56-58`).
+- **INFO terminal "stale fork-safety comment" → REJECTED (comment is accurate).** It correctly describes the
+  current design (fresh OS entropy mixed into EVERY draw) and contrasts the rejected PID-keyed approach.
+- **Honesty ledger → FIXED.** `DOD-01` carried a stale `GATE-WARP PROVEN PASS @ 1.43/10.5 GB/s/core` that the
+  owner-ratified re-scope (`DECISION-GATE-WARP.md`) had RETIRED — reconciled (the metric is re-scoped to aggregate
+  ≥10× workload, PASS; the per-core Northflank figures retired, no committed repro). `EFFICIENCY-TCO` had a
+  Run-11 `PENDING n≥3` already resolved by the n=3 Run 12 (~72×) — marked resolved; the authoritative headline
+  re-pointed to Run 12.
+- **TRACKED (defense-in-depth / non-product-tier, not silently shipped):** zeroize-on-drop for long-lived secrets
+  (`Zeroizing<…>` across terminal/identity/once — a cross-crate refactor for a focused follow-up; ephemeral keys
+  are already zeroized); producer-retry dedup in `replicated-topic` (future replication tier); `FileOnce` not
+  wired into the terminal (the Postgres-resident watermark is the product's EOS authority, not the terminal's
+  in-RAM `Once`); CRC on the WAL cursor + surface `Drop` flush errors; `StaticKeypair::secret` length-mismatch →
+  `Err`; explicit element caps on `manifest::ChunkReceiver` / netblob `OP_LIST` (both already bounded); fuzz the
+  remaining parsers (`parse_metadata_topics`, `reliable_udp::decode_frame_at`, cofre `decode`).
 
 ## Kafka-OFFSETS audit (2026-06-27) — brutal adversarial pass on durable consumer offsets (increment 3)
 
