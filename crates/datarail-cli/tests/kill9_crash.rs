@@ -82,7 +82,7 @@ fn produce_req(correlation_id: i32, topic: &str, values: &[&[u8]]) -> Vec<u8> {
     Writer::frame(&w.into_bytes())
 }
 
-/// Parse a Produce v7 response payload → (base_offset, error_code) of its single topic/partition.
+/// Parse a Produce v7 response payload → (`base_offset`, `error_code`) of its single topic/partition.
 fn produce_ack(resp: &[u8]) -> (i64, i16) {
     let mut r = Reader::new(resp);
     let _corr = r.int32().unwrap();
@@ -185,6 +185,8 @@ fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, 
 
 #[test]
 fn every_acked_record_survives_repeated_kill_minus_9() {
+    const ROUNDS: usize = 4;
+    const BATCHES_PER_ROUND: usize = 3;
     let rail = std::env::temp_dir().join(format!("kill9-{}.toml", std::process::id()));
     std::fs::write(
         &rail,
@@ -209,8 +211,6 @@ fn every_acked_record_survives_repeated_kill_minus_9() {
     let mut acked: Vec<(i64, Vec<u8>)> = Vec::new();
     let mut corr = 0i32;
 
-    const ROUNDS: usize = 4;
-    const BATCHES_PER_ROUND: usize = 3;
     for round in 0..ROUNDS {
         let (mut daemon, mut stream) = spawn_broker(&rail, &data_dir);
 
