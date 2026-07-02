@@ -437,6 +437,29 @@ struct BrokerCtx<'a> {
     next_producer_id: &'a AtomicI64,
 }
 
+// The ListOffsets arm, extracted from `handle_broker_connection` to keep that
+// dispatch loop under clippy's `too_many_lines`. Resolves each requested
+// partition's earliest/latest bound (timestamp -2 ⇒ earliest, else latest).
+fn list_offsets_arm<B: KafkaBroker>(
+    reader: &mut Reader<'_>,
+    api_version: i16,
+    correlation_id: i32,
+    broker: &B,
+) -> io::Result<Vec<u8>> {
+    let topics = parse_list_offsets(reader, api_version)?;
+    let mut out = Vec::with_capacity(topics.len());
+    for t in &topics {
+        let mut parts = Vec::with_capacity(t.partitions.len());
+        for p in &t.partitions {
+            let (earliest, latest) = broker.bounds(&t.name, p.partition);
+            let offset = if p.timestamp == -2 { earliest } else { latest };
+            parts.push(ListOffsetResult { partition: p.partition, offset });
+        }
+        out.push(ListOffsetTopicResult { name: t.name.clone(), partitions: parts });
+    }
+    Ok(list_offsets_response(api_version, correlation_id, &out))
+}
+
 fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
     mut stream: S,
     broker: &B,
@@ -515,20 +538,7 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
                 let out = fetch_results(broker, &topics);
                 fetch_response(api_version, correlation_id, &out)
             }
-            API_LIST_OFFSETS => {
-                let topics = parse_list_offsets(&mut reader, api_version)?;
-                let mut out = Vec::with_capacity(topics.len());
-                for t in &topics {
-                    let mut parts = Vec::with_capacity(t.partitions.len());
-                    for p in &t.partitions {
-                        let (earliest, latest) = broker.bounds(&t.name, p.partition);
-                        let offset = if p.timestamp == -2 { earliest } else { latest };
-                        parts.push(ListOffsetResult { partition: p.partition, offset });
-                    }
-                    out.push(ListOffsetTopicResult { name: t.name.clone(), partitions: parts });
-                }
-                list_offsets_response(api_version, correlation_id, &out)
-            }
+            API_LIST_OFFSETS => list_offsets_arm(&mut reader, api_version, correlation_id, broker)?,
             API_FIND_COORDINATOR => {
                 let _group = parse_find_coordinator(&mut reader, api_version)?;
                 // Single-node: THIS broker is the coordinator (node 0, the advertised host/port).
@@ -779,10 +789,10 @@ fn produce_results<B: KafkaBroker>(
 /// Map a produce/buffer failure for `(topic, partition)` to its Kafka error code, and LOG the real error to
 /// stderr (broker-side visibility — otherwise the detail is swallowed and a stuck producer looks silent).
 ///
-/// - `InvalidData` ⇒ **87 = INVALID_RECORD (non-retriable)**: a PERMANENT rejection (e.g. a content-contract
+/// - `InvalidData` ⇒ **87 = `INVALID_RECORD` (non-retriable)**: a PERMANENT rejection (e.g. a content-contract
 ///   violation — the record can never land). It MUST NOT be retried; a retriable code would make librdkafka
 ///   re-send the identical, still-rejected batch every ~100ms forever (a silent hot loop).
-/// - anything else ⇒ **56 = KAFKA_STORAGE_ERROR (retriable)**: a transient store/seal failure, so the producer
+/// - anything else ⇒ **56 = `KAFKA_STORAGE_ERROR` (retriable)**: a transient store/seal failure, so the producer
 ///   retries rather than treating the records as durably stored — never a false NONE ack (audit A).
 fn produce_error_code(topic: &str, partition: i32, e: &io::Error) -> i16 {
     if e.kind() == io::ErrorKind::InvalidData {
