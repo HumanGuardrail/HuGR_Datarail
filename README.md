@@ -37,6 +37,40 @@ All intelligence and all secrets live in a small terminal at the edge; the rail 
 dumbest substrate available, because a breach of the pipe yields ciphertext. In broker mode the same sealing
 buys you a disk that never holds plaintext — the running broker remains a trusted keyholder.
 
+```mermaid
+graph LR
+    subgraph RailMode ["Rail mode — zero-knowledge pipe"]
+        direction LR
+        A["Source Terminal<br/>(holds keys, seals)"]
+        B["sealed cofre<br/>(ciphertext)"]
+        C["dumb pipe<br/>TCP / QUIC / shmem / S3<br/>sees ciphertext only"]
+        D["Dest Terminal<br/>(holds keys, opens, Merkle receipt)"]
+        A --> B --> C --> D
+    end
+
+    subgraph BrokerMode ["Broker mode — provider-blind storage"]
+        direction LR
+        E["Kafka producer<br/>(unmodified)"]
+        F["plaintext over TCP / TLS"]
+        G["datarail kafka-broker<br/>HOLDS ALL KEYS<br/>seals on produce<br/>un-seals on fetch"]
+        H["sealed log on disk<br/>(ciphertext only)"]
+        I["Kafka consumer<br/>(unmodified)"]
+        E --> F --> G
+        G --> H
+        G --> I
+    end
+
+    classDef zk fill:#d4edda,stroke:#28a745,color:#155724
+    classDef tb fill:#fff3cd,stroke:#ffc107,color:#856404
+    classDef pipe fill:#f8f9fa,stroke:#6c757d,color:#495057
+
+    class A,D zk
+    class G tb
+    class C,H pipe
+```
+
+> **Trust boundary note:** In Rail mode nothing in the middle can open a cofre — zero-knowledge holds end-to-end. In Broker mode the broker process is a trusted keyholder; the disk is provider-blind, but the running broker can read everything.
+
 ## Measured
 
 Numbers from a benchmark of the **real `datarail kafka-broker` binary**, run by a **separate AI auditor
@@ -71,7 +105,7 @@ substrates behind one conformance harness (**shmem · QUIC · object-store/S3**,
 congestion control with a WAN/netem harness; BLAKE3-`bao` chunk resume; a stateless DoS cookie; and a
 `Noise_KK` + SPAKE2 identity/pairing layer.
 
-Product-side: **HTTP → sealed rail → Postgres** on a zero-dependency, hand-rolled Postgres driver;
+Product-side: **HTTP → sealed rail → Postgres** on a hand-rolled Postgres driver (no client library; SCRAM-SHA-256 included);
 **exactly-once into Postgres** for append-ordered sources and for idempotent Kafka producers (dedup keyed on
 the producer's own `(producer_id, partition, sequence)`, landed atomically with the records — CI-gated against
 real Postgres 16); and the **bidirectional Kafka drop-in**: unmodified producers and `subscribe()`
@@ -97,8 +131,10 @@ datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
 #   printf 'evt:hello\n' | kcat -P -b <host>:9092 -t demo
 #   kcat -C -b <host>:9092 -t demo -o beginning -e
 # Durable (fsync-before-ack): produce → restart the broker → fetch returns the records; committed consumer
-# offsets survive restart; on-disk cofres are ciphertext. (Restart survival is test-verified via store
-# reopen; a hard kill -9 / power-loss harness is future work.) Optional hop security, each CI-gated vs real
+# offsets survive restart; on-disk cofres are ciphertext. (Restart survival is verified two ways: store
+# reopen AND a SIGKILL harness — tests/kill9_crash.rs kills the broker mid-produce across 4 rounds and
+# asserts every acked record at its exact offset. True power-loss — the page cache does not survive — is
+# still future work.) Optional hop security, each CI-gated vs real
 # librdkafka: --tls / --tls-client-ca (mTLS) / --sasl-user (SASL/PLAIN; pair with --tls for SASL_SSL),
 # compressed producer batches behind --features compression. Transactional producers work in a
 # buffer-until-commit model (scope and crash caveats: docs/design/KAFKA-TXN-DESIGN.md and Known limitations).
@@ -151,8 +187,9 @@ The sharp edges, before you find them:
 - **QUIC substrate ships dev-only embedded certs and the client accepts any server cert** — an active MITM on
   that hop can read envelope (*etiqueta*) metadata — route/stream ids, sequence, timing — never payloads.
   Dev/test only; documented in the crate.
-- **The hand-rolled Postgres driver speaks trust/cleartext/MD5 only** — it will not authenticate against a
-  default PostgreSQL 14+ (SCRAM). Tracked.
+- **Postgres driver: no TLS to the database, no SCRAM-SHA-256-PLUS (channel binding).** Plain
+  **SCRAM-SHA-256 landed 2026-07-02** (RFC 7677 vectors tested; non-ASCII passwords rejected rather than
+  mis-prepped) alongside trust/cleartext/MD5 — a default PostgreSQL 14+ now authenticates.
 - **`acks=0` is still answered** (a real broker stays silent). Minor, tracked.
 - **Self-audited, not third-party audited.** "Fuzz" in this repo means deterministic property tests, not
   coverage-guided fuzzing; "chaos" means in-process fault injection, not a distributed harness. The crypto uses

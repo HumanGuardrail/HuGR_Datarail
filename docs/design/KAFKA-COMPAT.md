@@ -126,6 +126,27 @@ infrastructure never see plaintext. With Kafka ingest, the trust boundary is:
    `KAFKA-EOS-DESIGN.md`). Next within this line: **transactional** producer (cross-session EOS via a stable
    `transactional.id`).
 
+## Tested client matrix (honest)
+
+Every row below reflects something that was actually exercised against the real binary, either in CI or during the independent audit. Nothing here is inferred from wire-test coverage alone.
+
+| Client | Version | Produce | Simple consume | Consumer group | TLS | mTLS | SASL/PLAIN | Compression | Transactions | Where | Status |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| kcat (librdkafka) | 1.7.1 (edenhill/kcat docker image) | yes | yes | yes (subscribe + rebalance) | yes | yes | yes | yes (gzip, lz4, snappy, zstd) | not exercised in this workflow | CI: `kafka-broker-librdkafka.yml`, `kafka-broker-tls.yml`, `kafka-broker-mtls.yml`, `kafka-broker-sasl.yml`, `kafka-broker-compression.yml` | passing |
+| kafkacat (librdkafka) | 1.6.0 / librdkafka 1.8.0 (Ubuntu 22.04 package) | yes | yes | not exercised | not exercised | not exercised | not exercised | not exercised | not exercised | independent bench (`docs/BENCH-INDEPENDENT-2026-07-01.md`) | passing; 1.8.0 found the INVALID\_RECORD bug (fixed same day) |
+| datarail wire tests (hand-rolled) | — | yes (all API versions in scope) | yes | yes (JoinGroup/SyncGroup/Heartbeat/LeaveGroup paths) | — | — | — | — | yes (commit/abort/epoch-fencing) | CI: `ci.yml` | self-referential; a real client is always the definitive test |
+
+**NOT yet tested** — no CI workflow and no independent run has driven these against the real binary:
+
+- Apache Kafka Java client (any version)
+- franz-go
+- kafka-python
+- Sarama (Go)
+- librdkafka 2.x (only 1.7.1 in CI; 1.8.0 in the independent bench — 2.x API negotiation differences are untested)
+- Any client exercising transactional producers end-to-end (the wire path is tested by the hand-rolled suite, not a real client)
+
+A conformance run against the above clients is tracked but not yet scheduled.
+
 ## Why this is still a big deal even produce-only + seal-on-ingest
 The expensive, untrusted, always-on part of a Kafka deployment is the **broker cluster + its storage**. datarail
 replaces exactly that with a serverless, provider-blind, ~70×-leaner rail — while the producer keeps its existing
