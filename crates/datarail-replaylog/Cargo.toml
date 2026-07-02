@@ -3,6 +3,8 @@ name = "datarail-replaylog"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-replaylog — a segmented, retained, durable log with replay-from-arbitrary-offset at flat RAM: Kafka's killer feature (durable history replay) without Kafka's RAM-grows-with-retention tax."
 
 [lints]

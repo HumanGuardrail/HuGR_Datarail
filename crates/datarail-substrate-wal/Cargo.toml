@@ -3,6 +3,8 @@ name = "datarail-substrate-wal"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail write-ahead-log substrate — fsync-durable, O(1)-RAM, group-commit (SPEC 10 / DURABLE-LOG.md)."
 
 [lints]

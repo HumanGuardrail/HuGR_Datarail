@@ -3,6 +3,8 @@ name = "datarail-replicated-topic"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-replicated-topic — a topic whose records are ALSO erasure-coded into a BlobStore, so a record survives losing any m shards (node-loss durability at 1.5x, composing topic + replication)."
 [lints]
 workspace = true

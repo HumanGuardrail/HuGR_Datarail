@@ -3,6 +3,8 @@ name = "datarail-substrate-objectstore"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail object-store (S3) substrate — dumb, provider-blind durable holding pen (SPEC 10/07)."
 
 [lints]

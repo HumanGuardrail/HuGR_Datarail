@@ -3,6 +3,8 @@ name = "datarail-broker"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-broker — a minimal sealed network protocol exposing a datarail-topic (produce/subscribe/poll/commit) over TCP, with durable offsets."
 [lints]
 workspace = true

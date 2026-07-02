@@ -3,6 +3,8 @@ name = "datarail-substrate-quic"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail QUIC substrate — cross-host streams over quinn; transport only, the cofre stays sealed (SPEC 07)."
 
 [lints]

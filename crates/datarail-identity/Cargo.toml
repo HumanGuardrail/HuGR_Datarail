@@ -3,6 +3,8 @@ name = "datarail-identity"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-identity — Noise_KK channel session (SPEC-08 F2) + SPAKE2 short-code pairing bootstrap (F3)."
 
 [lints]

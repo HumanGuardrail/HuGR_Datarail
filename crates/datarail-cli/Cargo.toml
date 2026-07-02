@@ -3,6 +3,8 @@ name = "datarail-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-cli — the `datarail` binary (validate/keygen/run/verify/ticket), SPEC 09."
 
 [[bin]]

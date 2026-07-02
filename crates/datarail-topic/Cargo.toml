@@ -3,6 +3,8 @@ name = "datarail-topic"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-topic — the integration layer: composes the retained replay log + rendezvous routing into Kafka's core behaviour (durable multi-consumer log + consumer groups + replay) with flat RAM and no stop-the-world rebalance."
 
 [lints]

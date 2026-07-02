@@ -3,6 +3,8 @@ name = "datarail-crypto"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-crypto — BLAKE3, domain-separated Ed25519, pluggable AEAD (GCM-SIV default) per SPEC 03."
 
 [lints]

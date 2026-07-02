@@ -3,6 +3,8 @@ name = "datarail-metrics"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-metrics — idle-footprint (GATE-FEATHER) + board/offload latency percentiles (GATE-LATENCY) measurement binary."
 
 [[bin]]

@@ -3,6 +3,8 @@ name = "datarail-rail"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-rail — ephemeral, substrate-polymorphic transport moving cofres by header+seal (SPEC 07)."
 
 [lints]

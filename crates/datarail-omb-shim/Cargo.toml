@@ -3,6 +3,8 @@ name = "datarail-omb-shim"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-omb-shim — a mini-broker on datarail's real sealed terminals so the OpenMessaging Benchmark can drive datarail (see docs/design/OMB-PROTOCOL.md). Benchmark adapter, NOT a product component."
 
 [[bin]]

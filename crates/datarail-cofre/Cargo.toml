@@ -3,6 +3,8 @@ name = "datarail-cofre"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-cofre — canonical Cofre wire encoding + seal/verify (SPEC 02; parse-before-verify, BLK-4/7/8)."
 
 [lints]

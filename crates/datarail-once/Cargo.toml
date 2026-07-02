@@ -3,6 +3,8 @@ name = "datarail-once"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-once — effectively-once: dedup index + signed monotonic watermark (SPEC 05)."
 
 [lints]

@@ -3,6 +3,8 @@ name = "datarail-fuzz"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-fuzz — deterministic property/fuzz harness: hammers every untrusted-bytes parser (broker/netblob codecs, erasure, blobstore keys, replaylog frames) with random + adversarial input, proving no-panic + roundtrip identity. Zero-dep PRNG."
 [lints]
 workspace = true

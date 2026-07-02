@@ -3,6 +3,8 @@ name = "datarail-stress"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-stress — violent resilience/stress suite proving 0-loss/0-dup/0-leak under assault across the 5 flagship use cases."
 
 [lints]

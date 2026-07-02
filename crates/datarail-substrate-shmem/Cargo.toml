@@ -3,6 +3,8 @@ name = "datarail-substrate-shmem"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail shmem substrate — lock-free SPSC ring over shared memory, µs same-host hops (SPEC 07)."
 
 # WAIVER (owner-delegated to the tech lead, 2026-06-22; logged BUILD_LOG §6) — this crate alone may use ONE

@@ -3,6 +3,8 @@ name = "datarail-acceptance"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 description = "datarail-acceptance — cross-crate end-to-end acceptance tests (the MF-4 vertical slice)."
 
 [lints]
