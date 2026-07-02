@@ -39,6 +39,26 @@ pub struct ParsedRecords {
     pub eos: Option<EosCoord>,
 }
 
+/// Why parsing a partition's records blob failed. The two kinds are handled DIFFERENTLY by the caller:
+/// - [`ParseError::Corrupt`] — a v2 `RecordBatch` whose CRC-32C did not match: the data is corrupt on the wire.
+///   This is a PER-PARTITION failure (Kafka `CORRUPT_MESSAGE`, error code 2) — no record from the batch is
+///   stored, but the connection keeps serving and other partitions are unaffected.
+/// - [`ParseError::Malformed`] — the blob is structurally broken (truncated, bad magic, over-long length): the
+///   frame cannot be trusted at all, so the caller propagates it and closes the connection (today's behavior).
+#[derive(Debug)]
+pub enum ParseError {
+    /// A v2 batch CRC-32C mismatch — reject the batch with `CORRUPT_MESSAGE` (2), keep the connection alive.
+    Corrupt,
+    /// A structurally malformed blob — propagate as an [`io::Error`] and close the connection.
+    Malformed(io::Error),
+}
+
+impl From<io::Error> for ParseError {
+    fn from(e: io::Error) -> Self {
+        ParseError::Malformed(e)
+    }
+}
+
 /// A produced partition: its index, the record VALUES extracted from the batch, and (when present) the
 /// idempotent-producer EOS coordinate for exactly-once dedup.
 #[derive(Debug, Clone)]
@@ -49,6 +69,11 @@ pub struct ProducedPartition {
     pub values: Vec<Vec<u8>>,
     /// The idempotent-producer EOS coordinate, if this partition carried a single idempotent v2 batch.
     pub eos: Option<EosCoord>,
+    /// A NON-ZERO Kafka error code set at PARSE time for THIS partition alone (`None` ⇒ the batch parsed
+    /// cleanly). Today this is `Some(2)` = `CORRUPT_MESSAGE` when the v2 `RecordBatch` CRC-32C fails: the batch
+    /// is rejected without storing any record, but only THAT partition errors — the connection keeps serving and
+    /// other partitions/topics in the same request are unaffected.
+    pub error_code: Option<i16>,
 }
 
 /// A produced topic: its name and the partitions in this request.
@@ -58,6 +83,18 @@ pub struct ProducedTopic {
     pub name: String,
     /// Partitions produced to.
     pub partitions: Vec<ProducedPartition>,
+}
+
+/// A parsed `Produce` request: the `acks` setting plus the produced topics. `acks == 0` is a FIRE-AND-FORGET
+/// produce — Kafka semantics require the broker to write **no response frame** at all (a response would
+/// desynchronize the client's correlation-id stream). The records are still landed durably; only the response
+/// is suppressed. `acks == 1` (leader) / `-1` (all) get a normal response.
+#[derive(Debug, Clone)]
+pub struct ProducedRequest {
+    /// The producer's `acks` setting: `0` = no response expected, `1` = leader ack, `-1` = all-replica ack.
+    pub acks: i16,
+    /// The topics (and their partitions) produced in this request.
+    pub topics: Vec<ProducedTopic>,
 }
 
 /// Take a varint-length-prefixed byte run from `reader` (`-1` ⇒ `None`/absent), returning the bytes.
@@ -138,11 +175,13 @@ pub fn build_record_batch(base_offset: i64, values: &[Vec<u8>]) -> Vec<u8> {
 /// Parse a producer's records blob into the record VALUE payloads. Handles BOTH the v2 `RecordBatch` (magic 2,
 /// modern clients) and the legacy `MessageSet` (magic 0/1, older clients and some librdkafka fallbacks) — they
 /// share a layout up to the magic byte at offset 16 (`int64`, `int32`, 4 bytes, then magic), so we read that far
-/// and dispatch. Uncompressed only — a compressed entry is a clear error.
+/// and dispatch. Uncompressed only unless the `compression` feature is on. Every v2 batch's CRC-32C is validated
+/// (over the wire bytes `attributes..end`, before any decompression); a mismatch is a [`ParseError::Corrupt`].
 ///
 /// # Errors
-/// [`io::Error`] on a malformed blob, an unsupported magic byte, or a compressed entry.
-pub fn parse_record_batch(blob: &[u8]) -> io::Result<ParsedRecords> {
+/// [`ParseError::Corrupt`] on a v2 CRC mismatch (reject the batch, keep serving); [`ParseError::Malformed`] on a
+/// structurally broken blob, an unsupported magic byte, or a compressed entry with the feature off.
+pub fn parse_record_batch(blob: &[u8]) -> Result<ParsedRecords, ParseError> {
     let mut reader = Reader::new(blob);
     let mut values = Vec::new();
     let mut batches = 0u32;
@@ -156,14 +195,17 @@ pub fn parse_record_batch(blob: &[u8]) -> io::Result<ParsedRecords> {
         let magic = reader.int8()?;
         match magic {
             2 => {
-                let coord = parse_v2_records(&mut reader, batch_end, &mut values)?;
+                let coord = parse_v2_records(blob, &mut reader, batch_end, &mut values)?;
                 if batches == 0 {
                     first_coord = coord;
                 }
             }
             0 | 1 => parse_legacy_message(&mut reader, magic, &mut values)?,
             other => {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported record magic {other}")));
+                return Err(ParseError::Malformed(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported record magic {other}"),
+                )));
             }
         }
         batches += 1;
@@ -176,8 +218,36 @@ pub fn parse_record_batch(blob: &[u8]) -> io::Result<ParsedRecords> {
 
 /// Parse the v2 `RecordBatch` fields after the magic byte, pushing each record's value. Returns the
 /// idempotent-producer [`EosCoord`] when the batch carries one (`producer_id >= 0` and `base_sequence >= 0`).
-fn parse_v2_records(reader: &mut Reader, batch_end: usize, values: &mut Vec<Vec<u8>>) -> io::Result<Option<EosCoord>> {
-    let _crc = reader.uint32()?;
+///
+/// VALIDATES the batch's `CRC-32C` before touching any record: the v2 CRC covers the WIRE bytes from `attributes`
+/// (the byte right after the 4-byte crc field) to the end of the batch (`batch_end`) — for a COMPRESSED batch
+/// that is the compressed records blob, so the check runs BEFORE decompression, exactly as a real broker does.
+/// On mismatch we reject with `CORRUPT_MESSAGE` semantics (error code 2 at the produce layer): an `InvalidData`
+/// error, so no record from a corrupt batch is ever stored. `blob` is the full partition records blob (the CRC
+/// range is sliced from it by absolute position).
+fn parse_v2_records(
+    blob: &[u8],
+    reader: &mut Reader,
+    batch_end: usize,
+    values: &mut Vec<Vec<u8>>,
+) -> Result<Option<EosCoord>, ParseError> {
+    let stored_crc = reader.uint32()?;
+    // The CRC covers `attributes..batch_end`: `attributes` starts at the current cursor (right after the crc
+    // field), and `batch_end` is the batch's end computed by the caller from `batchLength`. Both are absolute
+    // positions into `blob`. A malformed `batch_end` (past the buffer) is clamped so the slice never panics.
+    let crc_start = reader.position();
+    let crc_end = batch_end.min(blob.len());
+    let covered = blob.get(crc_start..crc_end).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "record batch length runs past the buffer")
+    })?;
+    let computed = crc32c(covered);
+    if computed != stored_crc {
+        // CORRUPT_MESSAGE (Kafka error code 2): the batch is corrupt on the wire. Fail the whole batch — no
+        // record from it is parsed or stored — and surface the mismatch on stderr for broker-side visibility.
+        // Validated over the WIRE bytes (still compressed for a compressed batch) BEFORE any decompression.
+        eprintln!("kafka: produce record batch CRC mismatch (corrupt): stored={stored_crc:#010x} computed={computed:#010x}");
+        return Err(ParseError::Corrupt);
+    }
     let attributes = reader.int16()?;
     let codec = u8::try_from(attributes & 0x07).unwrap_or(0); // bits 0-2: 0=none, 1=gzip, 2=snappy, 3=lz4, 4=zstd
     let transactional = attributes & 0x10 != 0; // v2 attributes bit 4 = transactional batch
@@ -207,7 +277,10 @@ fn parse_v2_records(reader: &mut Reader, batch_end: usize, values: &mut Vec<Vec<
         #[cfg(not(feature = "compression"))]
         {
             let _ = batch_end;
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "compressed batches not supported"));
+            return Err(ParseError::Malformed(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compressed batches not supported",
+            )));
         }
     }
     // An idempotent producer stamps producer_id >= 0 + a real base_sequence; a non-idempotent one sends -1.
@@ -246,6 +319,11 @@ fn parse_records_into(reader: &mut Reader, n: usize, values: &mut Vec<Vec<u8>>) 
 /// Parse one legacy `MessageSet` message (magic 0/1) after the magic byte, pushing its value. The crc and the
 /// preceding `int64` offset + `int32` size were already consumed by the caller; key/value are classic `INT32`-
 /// length `BYTES`.
+///
+/// NOTE: legacy v0/v1 messages DO carry a per-message CRC (the `int32` the caller consumed as `_crc_or_epoch`),
+/// but it is a CRC-32 over the IEEE polynomial — a DIFFERENT algorithm from the CRC-32C the codec implements and
+/// that v2 batches use. Validating it would need a second, distinct CRC just for a legacy fallback path; that is
+/// not worth the code, so legacy CRCs are intentionally left unvalidated (only v2 batches are CRC-checked).
 fn parse_legacy_message(reader: &mut Reader, magic: i8, values: &mut Vec<Vec<u8>>) -> io::Result<()> {
     let attributes = reader.int8()?;
     if attributes & 0x07 != 0 {
@@ -261,15 +339,21 @@ fn parse_legacy_message(reader: &mut Reader, magic: i8, values: &mut Vec<Vec<u8>
     Ok(())
 }
 
-/// Parse a `Produce` request body (after the request header) at `version`, returning the produced topics.
+/// Parse a `Produce` request body (after the request header) at `version`, returning the `acks` setting and the
+/// produced topics. `acks == 0` signals a fire-and-forget produce: the caller must still land the records but
+/// write NO response frame (see [`ProducedRequest`]).
+///
+/// A per-partition v2 CRC-32C mismatch does NOT fail the whole request — that partition alone carries
+/// `error_code = Some(2)` (`CORRUPT_MESSAGE`) with no values, and parsing continues. A STRUCTURALLY malformed
+/// blob still errors out (the frame is untrustworthy → close the connection).
 ///
 /// # Errors
-/// [`io::Error`] if the request or any embedded record batch is malformed.
-pub fn parse_produce(reader: &mut Reader, version: i16) -> io::Result<Vec<ProducedTopic>> {
+/// [`io::Error`] if the request envelope or an embedded batch is structurally malformed (not a mere CRC failure).
+pub fn parse_produce(reader: &mut Reader, version: i16) -> io::Result<ProducedRequest> {
     if version >= 3 {
         let _transactional_id = reader.nullable_string()?;
     }
-    let _acks = reader.int16()?;
+    let acks = reader.int16()?;
     let _timeout_ms = reader.int32()?;
     let topic_count = reader.int32()?;
     // Bound the count by the bytes actually remaining (each element is ≥1 byte): a small frame cannot claim
@@ -284,18 +368,22 @@ pub fn parse_produce(reader: &mut Reader, version: i16) -> io::Result<Vec<Produc
         let mut partitions = Vec::new();
         for _ in 0..pc {
             let partition = reader.int32()?;
-            let (values, eos) = match reader.nullable_bytes()? {
-                Some(blob) => {
-                    let parsed = parse_record_batch(&blob)?;
-                    (parsed.values, parsed.eos)
-                }
-                None => (Vec::new(), None),
+            let (values, eos, error_code) = match reader.nullable_bytes()? {
+                Some(blob) => match parse_record_batch(&blob) {
+                    Ok(parsed) => (parsed.values, parsed.eos, None),
+                    // A CRC mismatch is a PER-PARTITION CORRUPT_MESSAGE (2): drop the batch (no values stored),
+                    // flag only this partition, and keep parsing the rest of the request + serving the connection.
+                    Err(ParseError::Corrupt) => (Vec::new(), None, Some(2)),
+                    // A structurally malformed blob poisons the frame — propagate and close the connection.
+                    Err(ParseError::Malformed(e)) => return Err(e),
+                },
+                None => (Vec::new(), None, None),
             };
-            partitions.push(ProducedPartition { partition, values, eos });
+            partitions.push(ProducedPartition { partition, values, eos, error_code });
         }
         topics.push(ProducedTopic { name, partitions });
     }
-    Ok(topics)
+    Ok(ProducedRequest { acks, topics })
 }
 
 /// Build the full `Produce` response (header v0 + body) at `version`. `outcome_for` yields, per
@@ -318,9 +406,15 @@ pub fn produce_response(
         let pcount = i32::try_from(topic.partitions.len()).unwrap_or(0);
         w.int32(pcount);
         for part in &topic.partitions {
-            // `outcome_for` returns (base_offset, error_code) — the error_code reflects the DURABLE landing
-            // result (0 = NONE only after the records are durably committed; non-zero ⇒ retriable, audit A).
-            let (base, error_code) = outcome_for(&topic.name, part.partition, part.values.len());
+            // A PARSE-time per-partition error (today: CORRUPT_MESSAGE 2 on a v2 CRC mismatch) short-circuits the
+            // landing path entirely — the batch was never stored, so we report the parse code with a -1 base
+            // offset and never invoke `outcome_for`. Otherwise `outcome_for` returns (base_offset, error_code) —
+            // the error_code reflects the DURABLE landing result (0 = NONE only after the records are durably
+            // committed; non-zero ⇒ retriable, audit A).
+            let (base, error_code) = match part.error_code {
+                Some(code) => (-1, code),
+                None => outcome_for(&topic.name, part.partition, part.values.len()),
+            };
             w.int32(part.partition);
             w.int16(error_code);
             w.int64(base); // base_offset
@@ -340,8 +434,17 @@ pub fn produce_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_produce, parse_record_batch};
+    use super::{parse_produce, parse_record_batch, ParseError};
     use crate::codec::Writer;
+
+    /// Stamp the CORRECT CRC-32C into a v2 batch body `after` (the bytes after `base_offset` + `batch_length`,
+    /// i.e. `partition_leader_epoch(4) magic(1) crc(4) attributes..records`). The CRC covers `attributes..end`,
+    /// which begins at offset 9 of `after`; the 4-byte crc field sits at `after[5..9]`. Now that the parser
+    /// VALIDATES the CRC, every hand-built v2 test batch must carry a real one.
+    fn fix_v2_crc(after: &mut [u8]) {
+        let crc = super::crc32c(&after[9..]);
+        after[5..9].copy_from_slice(&crc.to_be_bytes());
+    }
 
     /// Build a minimal uncompressed v2 `RecordBatch` carrying the given values (null keys, no headers).
     fn record_batch(values: &[&[u8]]) -> Vec<u8> {
@@ -374,7 +477,8 @@ mod tests {
         b.int32(-1); // base sequence
         b.int32(i32::try_from(values.len()).unwrap()); // record count
         b.raw(&records);
-        let after = b.into_bytes();
+        let mut after = b.into_bytes();
+        fix_v2_crc(&mut after);
 
         let mut full = Writer::new();
         full.int64(0); // base offset
@@ -411,8 +515,8 @@ mod tests {
         req.int32(i32::MAX);
         let bytes = req.into_bytes();
         let mut reader = crate::codec::Reader::new(&bytes);
-        let topics = parse_produce(&mut reader, 7).expect("bounded parse, no over-alloc");
-        assert!(topics.len() < 1024, "count must be bounded by remaining bytes, got {}", topics.len());
+        let req = parse_produce(&mut reader, 7).expect("bounded parse, no over-alloc");
+        assert!(req.topics.len() < 1024, "count must be bounded by remaining bytes, got {}", req.topics.len());
     }
 
     /// Build a v2 `RecordBatch` with an explicit idempotent-producer identity (`producer_id` / `base_sequence`).
@@ -445,7 +549,8 @@ mod tests {
         b.int32(base_sequence);
         b.int32(i32::try_from(values.len()).unwrap());
         b.raw(&records);
-        let after = b.into_bytes();
+        let mut after = b.into_bytes();
+        fix_v2_crc(&mut after);
         let mut full = Writer::new();
         full.int64(0);
         full.int32(i32::try_from(after.len()).unwrap());
@@ -527,29 +632,46 @@ mod tests {
         let bytes = req.into_bytes();
 
         let mut reader = crate::codec::Reader::new(&bytes);
-        let topics = parse_produce(&mut reader, 7).expect("parse produce");
-        assert_eq!(topics.len(), 1);
-        assert_eq!(topics[0].name, "events");
-        assert_eq!(topics[0].partitions[0].values, vec![b"evt:a".to_vec(), b"evt:b".to_vec()]);
+        let parsed = parse_produce(&mut reader, 7).expect("parse produce");
+        assert_eq!(parsed.acks, 1, "acks is parsed and threaded out of parse_produce");
+        assert_eq!(parsed.topics.len(), 1);
+        assert_eq!(parsed.topics[0].name, "events");
+        assert_eq!(parsed.topics[0].partitions[0].values, vec![b"evt:a".to_vec(), b"evt:b".to_vec()]);
+        assert_eq!(parsed.topics[0].partitions[0].error_code, None, "a valid CRC → no parse error");
     }
 
     #[test]
     fn compressed_batch_is_rejected() {
-        let mut b = Writer::new();
-        b.int64(0);
-        b.int32(20);
-        b.int32(0);
-        b.int8(2); // magic
-        b.uint32(0);
-        b.int16(1); // attributes: gzip compression bit set
-        b.int32(0);
-        b.int64(0);
-        b.int64(0);
-        b.int64(-1);
-        b.int16(-1);
-        b.int32(-1);
-        b.int32(1);
-        assert!(parse_record_batch(&b.into_bytes()).is_err());
+        // Start from a VALID uncompressed batch (correct CRC), then flip the gzip codec bit in `attributes` and
+        // re-stamp the CRC so the batch passes the CRC gate and actually reaches the compression path. Without
+        // the `compression` feature that is "compressed batches not supported"; with it, the still-uncompressed
+        // body fails to gzip-decompress — either way, an error (never a false accept).
+        let mut blob = record_batch(&[b"evt:a"]);
+        // Layout: base_offset(8) batch_len(4) ple(4) magic(1) crc(4) attributes(2) ...; attributes at [21..23].
+        blob[21..23].copy_from_slice(&1i16.to_be_bytes()); // attributes: gzip codec bit
+        let crc = super::crc32c(&blob[21..]);
+        blob[17..21].copy_from_slice(&crc.to_be_bytes()); // re-stamp CRC over the mutated body
+        assert!(parse_record_batch(&blob).is_err());
+    }
+
+    #[test]
+    fn v2_batch_with_flipped_records_byte_is_corrupt_and_stores_nothing() {
+        // A valid v2 batch parses to its values; flipping ONE byte in the records section makes the stored CRC no
+        // longer match the recomputed CRC over `attributes..end` → ParseError::Corrupt (produce error code 2),
+        // and NO record is extracted. This is the record-batch CRC guard on the produce path.
+        let good = record_batch(&[b"evt:one", b"evt:two"]);
+        assert_eq!(
+            parse_record_batch(&good).expect("valid CRC parses").values,
+            vec![b"evt:one".to_vec(), b"evt:two".to_vec()],
+        );
+        let mut bad = good.clone();
+        // Flip a byte deep in the records section (well past the 61-byte v2 header) — a value payload byte.
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF;
+        match parse_record_batch(&bad) {
+            Err(ParseError::Corrupt) => {}
+            other => panic!("a flipped records byte must be ParseError::Corrupt, got {other:?}"),
+        }
     }
 
     /// gzip a byte slice (test helper — the `compression-gzip` feature pulls flate2).
@@ -574,6 +696,10 @@ mod tests {
         out.extend_from_slice(&compressed);
         let batch_len = i32::try_from(out.len() - 12).expect("len");
         out[8..12].copy_from_slice(&batch_len.to_be_bytes());
+        // The CRC covers the WIRE bytes `attributes..end` (the COMPRESSED body) — re-stamp it after reframing so
+        // the parser's CRC gate (which runs BEFORE decompression) accepts the batch.
+        let crc = super::crc32c(&out[21..]);
+        out[17..21].copy_from_slice(&crc.to_be_bytes());
 
         let parsed = parse_record_batch(&out).expect("gzip batch parses");
         assert_eq!(parsed.values, values, "gzip records were decompressed + parsed in order");
@@ -597,6 +723,10 @@ mod tests {
         out.extend_from_slice(compressed);
         let batch_len = i32::try_from(out.len() - 12).expect("len");
         out[8..12].copy_from_slice(&batch_len.to_be_bytes());
+        // The v2 CRC covers the WIRE bytes `attributes..end` (the COMPRESSED body); re-stamp it after reframing
+        // so the parser's CRC gate (which runs BEFORE decompression) accepts the batch.
+        let crc = super::crc32c(&out[21..]);
+        out[17..21].copy_from_slice(&crc.to_be_bytes());
         out
     }
 

@@ -52,7 +52,11 @@ fn record_batch(values: &[&[u8]]) -> Vec<u8> {
     b.int32(-1);
     b.int32(i32::try_from(values.len()).unwrap());
     b.raw(&records);
-    let after = b.into_bytes();
+    let mut after = b.into_bytes();
+    // Stamp the real CRC-32C (the broker VALIDATES it on produce since 2026-07-02): the 4-byte crc
+    // field sits at after[5..9] and covers attributes..end = after[9..].
+    let crc = datarail_kafka::produce::crc32c(&after[9..]);
+    after[5..9].copy_from_slice(&crc.to_be_bytes());
     let mut full = Writer::new();
     full.int64(0);
     full.int32(i32::try_from(after.len()).unwrap());

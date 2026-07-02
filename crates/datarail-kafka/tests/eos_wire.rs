@@ -52,7 +52,7 @@ fn idempotent_batch(producer_id: i64, base_sequence: i32, values: &[&[u8]]) -> V
     let mut b = Writer::new();
     b.int32(0); // partition_leader_epoch
     b.int8(2); // magic
-    b.uint32(0); // crc (not validated)
+    b.uint32(0); // crc placeholder — stamped with the real CRC-32C below (the broker validates it on produce)
     b.int16(0); // attributes (uncompressed)
     b.int32(i32::try_from(values.len().saturating_sub(1)).unwrap());
     b.int64(0);
@@ -62,7 +62,12 @@ fn idempotent_batch(producer_id: i64, base_sequence: i32, values: &[&[u8]]) -> V
     b.int32(base_sequence);
     b.int32(i32::try_from(values.len()).unwrap());
     b.raw(&records);
-    let after = b.into_bytes();
+    let mut after = b.into_bytes();
+    // The broker now VALIDATES the v2 CRC-32C on produce (over `attributes..end`). `after` is
+    // `partition_leader_epoch(4) magic(1) crc(4) attributes..records`, so the covered range starts at offset 9
+    // and the 4-byte crc field sits at `after[5..9]` — stamp the real CRC there, else the batch is CORRUPT.
+    let crc = datarail_kafka::produce::crc32c(&after[9..]);
+    after[5..9].copy_from_slice(&crc.to_be_bytes());
     let mut full = Writer::new();
     full.int64(0); // base offset
     full.int32(i32::try_from(after.len()).unwrap());
