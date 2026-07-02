@@ -13,4 +13,10 @@ workspace = true
 # std-only by design: a connector yields/accepts raw byte-records; the terminal enforces the content contract
 # and seals in between, so connectors stay datarail-agnostic and dependency-light (leveza). Real backends
 # (postgres-cdc, s3-parquet, …) are adapters behind these traits that pull their own driver + need live infra.
+#
+# The one exception is `sha2`: SCRAM-SHA-256 (RFC 7677) client auth needs a SHA-256 primitive, and hand-rolling
+# SHA-256 (unlike the small MD5 below) is not worth the audit surface. `sha2` 0.10 is already in the workspace
+# lockfile (via ed25519-dalek), so this adds no NEW transitive dependency. HMAC-SHA-256 and PBKDF2 are still
+# hand-rolled here on top of the bare compression function.
 [dependencies]
+sha2 = "0.10"
