@@ -190,7 +190,6 @@ The sharp edges, before you find them:
 - **Postgres driver: no TLS to the database, no SCRAM-SHA-256-PLUS (channel binding).** Plain
   **SCRAM-SHA-256 landed 2026-07-02** (RFC 7677 vectors tested; non-ASCII passwords rejected rather than
   mis-prepped) alongside trust/cleartext/MD5 — a default PostgreSQL 14+ now authenticates.
-- **`acks=0` is still answered** (a real broker stays silent). Minor, tracked.
 - **Self-audited, not third-party audited.** "Fuzz" in this repo means deterministic property tests, not
   coverage-guided fuzzing; "chaos" means in-process fault injection, not a distributed harness. The crypto uses
   vetted crates (dalek, aes-gcm-siv, snow, spake2, blake3) but the construction has not had external review.
