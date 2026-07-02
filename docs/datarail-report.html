@@ -59,8 +59,9 @@
 
   <div class="kicker">HuGR · Datarail</div>
   <h1>Not faster than Kafka.<br><span style="color:var(--moat)">~70× leaner — at equal durability.</span></h1>
-  <p class="sub">A zero-knowledge, serverless sealed data rail in Rust — and what a long, honest benchmark
-  campaign against Kafka &amp; Pulsar <em>actually</em> proved.</p>
+  <p class="sub">A provider-blind, serverless sealed data rail in Rust — and what a long, honest benchmark
+  campaign against Kafka &amp; Pulsar <em>actually</em> proved. (OMB shim campaign, June 2026; for the broker
+  product's independently measured numbers see <code>docs/BENCH-INDEPENDENT-2026-07-01.md</code>.)</p>
   <div class="rail"></div>
   <p class="muted">Honest status report — 2026-06-24, <em>after a 5-way adversarial audit of our own benchmark</em>
   (see <code>ADVERSARIAL-AUDIT.md</code>). The audit caught real over-claims — an earlier draft said "124×" and
@@ -187,7 +188,8 @@
       <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Tamper is rejected, exhaustively.</strong>
         Every single byte of a sealed cofre is flipped in a test — every flip rejected. Forged / wrong-key seals
         rejected against the route-pinned key.</div></li>
-      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Exactly-once through chaos.</strong>
+      <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Effectively-once through in-process fault
+        injection</strong> (rail mode; broker mode is at-least-once across restarts).
         1000 randomized runs of drop / reorder / duplicate / kill-respawn → <em>0 loss, 0 duplicates</em>. Over a
         real TCP socket partitioned mid-stream: reconnect, re-drive, dedup → still 0/0.</div></li>
       <li><span class="badge b-proven">PROVEN</span><div class="t"><strong>Graceful backpressure, not collapse.</strong>

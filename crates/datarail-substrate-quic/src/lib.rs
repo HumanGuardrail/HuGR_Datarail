@@ -14,6 +14,35 @@
 //! harness passes unchanged (`INV-SUBSTRATE-POLYMORPHIC`). The substrate holds **no keys** and does **no
 //! crypto on the cofre** (`INV-DUMB-PIPE`). quinn uses the `ring` backend; this crate quarantines the heavy
 //! QUIC dependency tree out of the std-only rail core (Charter *leveza*).
+//!
+//! ## Security: DEV-ONLY transport identity
+//!
+//! **This substrate must not be used where transport-layer authentication matters.**
+//!
+//! - **Public, committed cert/key.** `src/dev_cert.der` and `src/dev_key.der` are baked in via
+//!   `include_bytes!` and are the *only* server identity this substrate presents. Both files are committed
+//!   to the public repository, so the private key is not secret in any meaningful sense.
+//!
+//! - **Client accepts any server certificate.** `AcceptAnyServerCert` skips all certificate validation.
+//!   There is no hostname check, no chain verification, and no revocation check.
+//!
+//! - **Active MITM can terminate the QUIC/TLS hop.** Because the server key is public and the client
+//!   performs no certificate verification, an active on-path attacker can impersonate the server, terminate
+//!   the TLS 1.3 handshake, and observe all QUIC transport metadata — route/stream IDs, sequence numbers,
+//!   frame timing, and connection teardown patterns. The attacker can also drop or replay individual QUIC
+//!   frames at will.
+//!
+//! - **Payload confidentiality and integrity still hold end-to-end.** Cofres are AEAD-sealed (ephemeral
+//!   X25519 per-cofre key-wrap → AEAD) and Ed25519-signed before they reach this substrate
+//!   (`INV-OPAQUE-CARGO`). An attacker who terminates
+//!   the transport layer sees only opaque ciphertext and cannot forge or silently modify cofre payloads.
+//!   This is the DERP blind-relay property (SPEC 07): the transport is deliberately untrusted.
+//!
+//! - **Production use requires real certs and real verification.** Deployments that need transport-layer
+//!   peer authentication must replace the embedded cert/key pair with certificates issued by a trusted CA
+//!   and must replace `AcceptAnyServerCert` with a verifier that validates the certificate chain and server
+//!   identity. Until that is done, this substrate provides QUIC framing and flow control only — it provides
+//!   no transport-layer security guarantees whatsoever.
 
 #![forbid(unsafe_code)]
 

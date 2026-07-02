@@ -51,8 +51,9 @@ shipped. The moat is the **intersection** (provider-blind × serverless × point
 single attribute.
 
 > One-liner: **"You don't pick datarail because it out-throughputs Kafka. You pick it when the pipe — even your
-> own broker, even a cloud bucket — is not allowed to see the data. No broker can do that without becoming a
-> different product."**
+> own broker, even a cloud bucket — is not allowed to see the data. A classic broker can't do that end-to-end
+> without becoming a different product — decrypt-in-the-middle *is* the broker model; datarail's own
+> `kafka-broker` mode makes the same trade honestly (blind storage, trusted keyholder process)."**
 
 **Now partly MEASURED, not just published:** the OpenMessaging Benchmark (industry standard) runs in CI against datarail + Kafka + Pulsar on identical HW — see [`OMB-RESULTS.md`](OMB-RESULTS.md). On a 32-core runner at fixed 20k msg/s both datarail and Kafka show single-digit-ms p99 (datarail 5 ms sealed, Kafka 2 ms plaintext) — a tie on latency, datarail doing it sealed. (The ~25× gap seen on a 2-core box was resource contention, not fundamental — corrected honestly.) Max-throughput rate-discovery on the 32-core box is the headline still landing; on bulk throughput the brokers' batched-log design may lead.
 

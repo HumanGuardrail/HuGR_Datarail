@@ -14,8 +14,11 @@
 > **ack-before-durable** hole (the broker acked the producer the instant it enqueued, before the sink landed the
 > record → a crash lost acked records, and an idempotent producer never resends an acked batch — the same D-1
 > lesson regressed). FIXED: **ack-after-durable** — the serve loop waits for the integration layer's
-> durable-landing result before acking; a sink failure becomes a **retriable error code** (KAFKA_STORAGE_ERROR),
-> never a false NONE ack, and the daemon **keeps serving** (one failure must not tear down ingest). The fix
+> durable-landing result before acking; a *transient* sink failure becomes a **retriable error code**
+> (KAFKA_STORAGE_ERROR, 56) and a *permanent* rejection (a content-contract violation) a **non-retriable
+> INVALID_RECORD (87)** — never a false NONE ack — and the daemon **keeps serving** (one failure must not tear
+> down ingest). (Before the 2026-07-01 fix, 56-for-everything sent librdkafka into an infinite retry of a
+> permanently-rejected batch.) The fix
 > required two follow-ons, both done: (a) **per-batch snapshot** of fresh records (not a global cursor) so a
 > failed batch never mis-attributes its records to a later batch now that the loop continues on error; (b) a
 > **unique in-process record_key per received batch** so the offload once-gate never short-circuits a retry — the

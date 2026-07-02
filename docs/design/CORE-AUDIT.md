@@ -199,7 +199,7 @@ A sixth brutal auditor attacked the `kafka-broker` consume path (`consume` codec
 - **Forged cofre injected into the store** — `open_records` runs `datarail_cofre::verify` against the pinned
   source vk first (parse-before-verify): a forged lacre fails.
 - **Malformed Fetch/ListOffsets → panic/over-alloc** — every count is bounded by `remaining()`; the `Reader` is
-  fully bounds-checked; varints length-capped. No panic / over-read / over-alloc (the fuzz suite agrees).
+  fully bounds-checked; varints length-capped. No panic / over-read / over-alloc (the deterministic property-test suite — `datarail-fuzz` — agrees).
 - **Bad CRC** — `crc32c(b"123456789") == 0xe3069283` (canonical Castagnoli) and the CRC covers exactly
   `attributes..records` per spec → a real consumer accepts the batch.
 - **Plaintext recoverable from storage** — `encode` = etiqueta ‖ AEAD-`carga` ‖ lacre; plaintext lives only inside
@@ -304,7 +304,7 @@ the lead against source before acting:
   none are `Copy`). Was the tracked moat-hygiene gap. Other still-**TRACKED** items: producer-retry dedup in `replicated-topic` (future replication tier); `FileOnce` not
   wired into the terminal (the Postgres-resident watermark is the product's EOS authority, not the terminal's
   in-RAM `Once`); CRC on the WAL cursor + surface `Drop` flush errors; `StaticKeypair::secret` length-mismatch →
-  `Err`; explicit element caps on `manifest::ChunkReceiver` / netblob `OP_LIST` (both already bounded); fuzz the
+  `Err`; explicit element caps on `manifest::ChunkReceiver` / netblob `OP_LIST` (both already bounded); property-test the
   remaining parsers (`parse_metadata_topics`, `reliable_udp::decode_frame_at`, cofre `decode`).
 
 ## Kafka-OFFSETS audit (2026-06-27) — brutal adversarial pass on durable consumer offsets (increment 3)

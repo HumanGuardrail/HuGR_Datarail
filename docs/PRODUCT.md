@@ -5,9 +5,12 @@
 
 ## One line
 
-Datarail is the **serverless, zero-knowledge data rail**: it moves data from a defined source to a
+Datarail is the **serverless, sealed data rail**: it moves data from a defined source to a
 defined destination — across containers, hosts, clouds, or organizations — inside a **sealed vault the
-infrastructure can never open**, delivering it **exactly once, intact, and with cryptographic proof**.
+pipe and the disk never see open** (zero-knowledge in rail mode; in broker mode the broker process is the
+keyholder and only the *storage* is blind), delivered **intact, with cryptographic proof — exactly-once
+where the sink supports it (Postgres append-ordered / idempotent Kafka), at-least-once elsewhere, never
+silently lost**.
 
 ## The thesis
 
@@ -24,8 +27,8 @@ Moving data looks solved and isn't, at its core. Every incumbent is strong on on
 - **ETL (Fivetran/Airbyte)** — connector breadth, but managed platforms that *see your data* and bill by
   the surprise.
 
-The white space none of them occupy: **provider-blind + exactly-once-with-proof + serverless +
-featherweight, on a sealed route.** That intersection is the moat — not any single piece.
+The white space none of them occupy: **provider-blind + proof-carrying delivery (exactly-once on the
+Postgres / idempotent-Kafka paths) + serverless + featherweight, on a sealed route.** That intersection is the moat — not any single piece.
 
 ## The doctrine
 

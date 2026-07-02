@@ -17,7 +17,8 @@ biggest risks up front:
 
 1. **Provider-blind / zero-knowledge by default** — the rail never sees plaintext; cofres are sealed E2E.
    This is what lets the pipe be dumb, cheap, and untrusted (doctrine: *smart sealed endpoints, dumb cheap
-   pipes*).
+   pipes*). *(2026-07-01 amendment: this holds for rail mode; the later `kafka-broker` mode is provider-blind
+   **storage** — its process holds the keys and is a trusted keyholder, not zero-knowledge.)*
 2. **Fixed A→B routes (no overlay/discovery)** — deletes the hardest subsystem (dynamic
    discovery/routing/DHT) and the would-be `INV-LOCATION-TRANSPARENT`. Content-addressing is retained as
    *identity*, dropped as *routing*. Fan-out = N fixed routes.

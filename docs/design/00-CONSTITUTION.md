@@ -57,7 +57,7 @@ Performance is **designed-in, measured, and gated** — never hand-tuned on a hu
 - **L3 — Measure before you cut:** never optimize what you haven't profiled; the measurement picks the
   lever, never a hunch.
 - **L4 — Performance is architecture-first:** the biggest wins live in the shape (zero-copy of ciphertext,
-  no broker hop, scale-to-zero, hardware-accelerated AEAD).
+  no mandatory broker hop on the rail path, scale-to-zero, hardware-accelerated AEAD).
 - **L5 — Hot paths are allocation-aware:** zero/pooled allocation where it counts, gated by alloc-count asserts.
 
 **Craft laws**

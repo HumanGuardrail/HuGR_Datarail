@@ -5,6 +5,12 @@
 
 ---
 
+> *A Working Backwards artifact: the launch announcement written **before the code**, kept as the north star.
+> Aspirational by design — several claims below describe the destination, not the current state (the shipped
+> v1 includes a `kafka-broker` mode, which IS a broker and a keyholder; "exactly once" holds on the
+> Postgres / idempotent-Kafka paths). For present-tense truth, see the README's Status and Known-limitations
+> sections and `docs/design/LASTRO-MATRIX.md`.*
+
 ## FOR IMMEDIATE RELEASE
 
 ### Datarail makes data move between any two points — sealed so tightly the infrastructure can never read it, delivered exactly once, and proven.
