@@ -1007,9 +1007,17 @@ fn cmd_kafka_ingest(rest: &[String]) -> Result<String, CliError> {
             let key = format!("kafka-{topic}-{partition}-n{batch_no}");
             pipe.ship_batch_plain(&values, key.as_bytes(), &mut sink).map(|_| ())
         };
-        // Signal the result back: Ok ⇒ the broker acks NONE; Err ⇒ a retriable error code (producer retries).
-        // The daemon KEEPS SERVING on a sink error — one failure must not tear down ingest for all (audit E).
-        let _ = done.send(result.map_err(|e| e.to_string()));
+        // Signal the result back: Ok ⇒ the broker acks NONE; Err ⇒ an error code (producer retries, or — for a
+        // permanent rejection — stops). The daemon KEEPS SERVING on a sink error — one failure must not tear down
+        // ingest for all (audit E). Classify the error by KIND so the serve loop maps it to the right wire code:
+        // a CONTRACT VIOLATION is a PERMANENT rejection (`InvalidData` → non-retriable 87 — the record can never
+        // board); anything else is a transient store/sink failure (`Other` → retriable 56).
+        let _ = done.send(result.map_err(|e| match e {
+            CliError::Terminal(TerminalError::ContractViolation) => {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+            }
+            _ => std::io::Error::other(e.to_string()),
+        }));
         batch_no += 1;
     }
     Ok(pipe.report())
@@ -1027,6 +1035,10 @@ struct KafkaBrokerStore {
 struct BrokerInner {
     src: SourceTerminal,
     dst: DestTerminal,
+    /// The onboarding content contract, kept for BUFFER-time enforcement on the transactional path: a violating
+    /// record must fail its own ProduceResponse as non-retriable INVALID_RECORD (Kafka semantics), never surface
+    /// at `EndTxn` — where the only honest answer is a retriable code and the client would retry forever.
+    onboarding: datarail_terminal::ContentContract,
     /// One durable sealed log per `(topic, partition)`, opened/recovered lazily on first access from `data_dir`.
     logs: std::collections::HashMap<(String, i32), kafka_store::SealedPartitionLog>,
     /// Root directory holding each partition's durable log (one subdir per `(topic, partition)`).
@@ -1100,7 +1112,16 @@ impl BrokerInner {
         for (i, rec) in records.iter().enumerate() {
             let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
             let refs = [rec.as_slice()];
-            let cofre = self.src.board(&refs, rkey.as_bytes()).map_err(|e| std::io::Error::other(e.to_string()))?;
+            // A CONTRACT VIOLATION is a PERMANENT rejection (the record can never board — AC-9), so it must reach
+            // the wire as a non-retriable error. Map it to `InvalidData` (→ INVALID_RECORD 87); everything else
+            // (seal/entropy) is treated as a transient store failure → `Other` (→ KAFKA_STORAGE_ERROR 56,
+            // retriable). The extreme `BatchTooLarge` framing edge (>u32) also lands on 56 today — tracked for a
+            // MESSAGE_TOO_LARGE (10) mapping, since it too is permanent for the offending batch.
+            // `board` returns the typed `TerminalError`, so we match the variant directly (no string matching).
+            let cofre = self.src.board(&refs, rkey.as_bytes()).map_err(|e| match e {
+                TerminalError::ContractViolation => std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+                _ => std::io::Error::other(e.to_string()),
+            })?;
             sealed.push(datarail_cofre::encode(&cofre));
         }
         self.partition_log(topic, partition)?.append_durable(&sealed)
@@ -1111,7 +1132,8 @@ impl KafkaBrokerStore {
     fn from_spec(spec: &RailSpec, data_dir: PathBuf) -> Self {
         let cfg = spec.terminal_config();
         let source_vk = verifying_key(&spec.keys.source_seed);
-        let src = SourceTerminal::new(cfg.clone(), spec.onboarding_contract(), spec.keys.source_seed);
+        let onboarding = spec.onboarding_contract();
+        let src = SourceTerminal::new(cfg.clone(), onboarding.clone(), spec.keys.source_seed);
         let dst = DestTerminal::new(
             cfg,
             spec.offloading_contract(),
@@ -1123,6 +1145,7 @@ impl KafkaBrokerStore {
             inner: std::sync::Mutex::new(BrokerInner {
                 src,
                 dst,
+                onboarding,
                 logs: std::collections::HashMap::new(),
                 data_dir,
                 offsets: None,
@@ -1148,6 +1171,16 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
     ) -> std::io::Result<i64> {
         let mut g = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let inner = &mut *g;
+        // Enforce the content contract at BUFFER time: a violating record is a PERMANENT rejection and must fail
+        // its own ProduceResponse as non-retriable INVALID_RECORD (87) — Kafka semantics. Deferring the check to
+        // the `EndTxn` flush (where `board` would catch it) would surface it as a retriable 56 on EndTxn and the
+        // client would retry the commit forever — the same loop the 2026-07-01 fix closed on the plain path.
+        if !records.iter().all(|r| inner.onboarding.validate(r)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "record violates the onboarding content contract (never boards)",
+            ));
+        }
         // Provisional base = the durable log end + records already buffered for this (producer, epoch, topic,
         // partition). Correct as long as this partition has a single concurrent producer during the txn.
         let durable = inner.partition_log(topic, partition)?.len();
@@ -1938,6 +1971,30 @@ mod tests {
             vec![b"evt:fresh".to_vec()],
             "the stale-epoch zombie must not be committed"
         );
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn buffer_txn_rejects_a_contract_violation_as_invalid_data_at_buffer_time() {
+        // Txn-path regression for the 2026-07-01 INVALID_RECORD fix: a violating record must fail its OWN
+        // ProduceResponse (ErrorKind::InvalidData → wire 87, non-retriable), never surface at EndTxn as a
+        // retriable 56 — which would send librdkafka into an infinite retry of the commit.
+        use datarail_kafka::serve::KafkaBroker as _;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-txn-contract-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
+        let err = store.buffer_txn(9, 0, "events", 0, &[b"no-prefix".to_vec()]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "a contract violation must be InvalidData (maps to non-retriable INVALID_RECORD 87)"
+        );
+        // A conforming record still buffers and commits normally.
+        store.buffer_txn(9, 0, "events", 0, &[b"evt:ok".to_vec()]).unwrap();
+        store.commit_txn(9, 0, &[("events".to_owned(), 0)]).unwrap();
+        assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), vec![b"evt:ok".to_vec()]);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

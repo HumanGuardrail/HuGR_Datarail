@@ -75,9 +75,11 @@ impl ConnWrap for PlainConn {
 /// A produced batch handed to the integration layer for **durable** landing. The producer is **not acked until
 /// `done` reports the landing result** (ack-after-durable — audit A: a broker that acks before the record is
 /// durable loses acked records on a crash, and an idempotent producer never resends an acked batch). `done`
-/// carries `Ok(())` on a durable land or `Err(msg)` on a sink failure (the producer then gets a retriable error
-/// code, never a false ack). The `EosCoord` (when present) carries the idempotent producer's stable sequence
-/// range — the basis for exactly-once ingest (`KAFKA-EOS-DESIGN.md`); `None` ⇒ at-least-once.
+/// carries `Ok(())` on a durable land or `Err(e)` on a failure; the error's [`io::ErrorKind`] classifies the
+/// failure so the serve loop can pick the RIGHT wire code (`InvalidData` ⇒ permanent rejection / non-retriable
+/// 87; anything else ⇒ retriable 56) — never a false ack. The `EosCoord` (when present) carries the idempotent
+/// producer's stable sequence range — the basis for exactly-once ingest (`KAFKA-EOS-DESIGN.md`); `None` ⇒
+/// at-least-once.
 pub struct ProducedBatch {
     /// Topic the batch was produced to.
     pub topic: String,
@@ -88,7 +90,9 @@ pub struct ProducedBatch {
     /// The idempotent-producer EOS coordinate, if present.
     pub eos: Option<EosCoord>,
     /// The integration layer signals the durable-landing result here; the serve loop acks only after it arrives.
-    pub done: Sender<Result<(), String>>,
+    /// The error KIND distinguishes a permanent rejection (`InvalidData`) from a transient failure (everything
+    /// else) so the produce response carries a non-retriable vs retriable code accordingly.
+    pub done: Sender<io::Result<()>>,
 }
 
 /// Max bytes in a single framed request — a hostile peer cannot make us allocate a giant buffer.
@@ -221,13 +225,32 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
                             eos: p.eos,
                             done,
                         });
-                        // 56 = KAFKA_STORAGE_ERROR (retriable): the integration layer is gone or the land failed,
-                        // so the producer retries rather than treating the records as durably stored.
+                        // Pick the per-partition error code from the durable-landing result:
+                        //   0  = NONE (durably landed).
+                        //   56 = KAFKA_STORAGE_ERROR (RETRIABLE): the integration layer is gone or the land
+                        //        failed transiently, so the producer retries rather than treating the records as
+                        //        durably stored — never a false NONE ack.
+                        //   87 = INVALID_RECORD (NON-RETRIABLE): a PERMANENT rejection (e.g. a content-contract
+                        //        violation surfaced as `InvalidData`). It must NOT be retried — otherwise
+                        //        librdkafka re-sends the identical, still-rejected batch every ~100ms forever.
                         let code = match sent {
-                            Err(_) => 56,
+                            Err(_) => {
+                                eprintln!(
+                                    "kafka: ingest land unreachable (retriable) topic={} partition={}",
+                                    t.name, p.partition
+                                );
+                                56
+                            }
                             Ok(()) => match done_rx.recv() {
                                 Ok(Ok(())) => 0,
-                                Ok(Err(_)) | Err(_) => 56,
+                                Ok(Err(e)) => produce_error_code(&t.name, p.partition, &e),
+                                Err(e) => {
+                                    eprintln!(
+                                        "kafka: ingest land result lost (retriable) topic={} partition={} error={e}",
+                                        t.name, p.partition
+                                    );
+                                    56
+                                }
                             },
                         };
                         codes.insert((t.name.clone(), p.partition), code);
@@ -647,6 +670,9 @@ fn dispatch_txn_api<B: KafkaBroker>(
                 // return a RETRIABLE code and do NOT finish the txn — the producer retries EndTxn; the flush
                 // re-runs (already-flushed buffers are gone → harmless) until it fully succeeds (audit: a swallowed
                 // mid-flush error was acked as a successful atomic commit, silently losing committed records).
+                // (A permanent contract violation can NOT surface here: it is rejected at BUFFER time with
+                // non-retriable INVALID_RECORD 87 on its own ProduceResponse — see `KafkaBrokerStore::buffer_txn` —
+                // so by construction a commit-time failure is transient and 56 is the honest answer.)
                 if broker.commit_txn(pid, epoch, &out.partitions).is_err() {
                     56
                 } else {
@@ -700,7 +726,7 @@ fn produce_results<B: KafkaBroker>(
                 if code == 0 {
                     match broker.buffer_txn(eos.producer_id, eos.producer_epoch, &t.name, p.partition, &p.values) {
                         Ok(base) => (base, 0i16),
-                        Err(_) => (-1, 56),
+                        Err(e) => (-1, produce_error_code(&t.name, p.partition, &e)),
                     }
                 } else {
                     (-1, code)
@@ -708,13 +734,31 @@ fn produce_results<B: KafkaBroker>(
             } else {
                 match broker.produce(&t.name, p.partition, &p.values) {
                     Ok(base) => (base, 0i16),
-                    Err(_) => (-1, 56), // KAFKA_STORAGE_ERROR (retriable) — never a false ack
+                    Err(e) => (-1, produce_error_code(&t.name, p.partition, &e)),
                 }
             };
             results.insert((t.name.clone(), p.partition), outcome);
         }
     }
     results
+}
+
+/// Map a produce/buffer failure for `(topic, partition)` to its Kafka error code, and LOG the real error to
+/// stderr (broker-side visibility — otherwise the detail is swallowed and a stuck producer looks silent).
+///
+/// - `InvalidData` ⇒ **87 = INVALID_RECORD (non-retriable)**: a PERMANENT rejection (e.g. a content-contract
+///   violation — the record can never land). It MUST NOT be retried; a retriable code would make librdkafka
+///   re-send the identical, still-rejected batch every ~100ms forever (a silent hot loop).
+/// - anything else ⇒ **56 = KAFKA_STORAGE_ERROR (retriable)**: a transient store/seal failure, so the producer
+///   retries rather than treating the records as durably stored — never a false NONE ack (audit A).
+fn produce_error_code(topic: &str, partition: i32, e: &io::Error) -> i16 {
+    if e.kind() == io::ErrorKind::InvalidData {
+        eprintln!("kafka: produce rejected (non-retriable) topic={topic} partition={partition} error={e}");
+        87
+    } else {
+        eprintln!("kafka: produce failed (retriable) topic={topic} partition={partition} error={e}");
+        56
+    }
 }
 
 /// Resolve a parsed `Fetch` request against the broker: un-seal each partition's records at the edge into a v2
@@ -776,4 +820,64 @@ fn offset_fetch_results<B: KafkaBroker>(
         out.push(OffsetFetchTopicResult { name: t.name.clone(), partitions: parts });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::{produce_results, KafkaBroker};
+    use crate::produce::{ProducedPartition, ProducedTopic};
+    use crate::txn::TxnCoordinator;
+
+    /// A minimal `KafkaBroker` whose `produce` always fails with a caller-chosen `io::Error`. Everything else is
+    /// the trait default; only the produce error path is under test (the `(base, code)` mapping in `produce_results`).
+    struct FailingBroker {
+        kind: io::ErrorKind,
+    }
+
+    impl KafkaBroker for FailingBroker {
+        fn produce(&self, _topic: &str, _partition: i32, _records: &[Vec<u8>]) -> io::Result<i64> {
+            Err(io::Error::new(self.kind, "forced produce failure for test"))
+        }
+        fn fetch(&self, _topic: &str, _partition: i32, _offset: i64, _max_bytes: i32) -> io::Result<Vec<Vec<u8>>> {
+            Ok(Vec::new())
+        }
+        fn bounds(&self, _topic: &str, _partition: i32) -> (i64, i64) {
+            (0, 0)
+        }
+    }
+
+    /// A single non-transactional produced topic (one partition, one record) — the plain `produce` arm.
+    fn one_partition_batch() -> Vec<ProducedTopic> {
+        vec![ProducedTopic {
+            name: "events".to_owned(),
+            partitions: vec![ProducedPartition { partition: 0, values: vec![b"evt:x".to_vec()], eos: None }],
+        }]
+    }
+
+    /// A CONTRACT VIOLATION (surfaced as `InvalidData`) is a PERMANENT rejection → non-retriable INVALID_RECORD
+    /// (87). Regression: a retriable code here makes librdkafka re-send the still-rejected batch forever.
+    #[test]
+    fn produce_invalid_data_maps_to_non_retriable_87() {
+        let broker = FailingBroker { kind: io::ErrorKind::InvalidData };
+        let txn = TxnCoordinator::new(1000);
+        let results = produce_results(&broker, &txn, &one_partition_batch());
+        let (base, code) = results[&("events".to_owned(), 0)];
+        assert_eq!(code, 87, "InvalidData must map to INVALID_RECORD (87, non-retriable)");
+        assert_eq!(base, -1, "a rejected batch reports no base offset");
+    }
+
+    /// A transient store/seal failure (any non-`InvalidData` kind) → retriable KAFKA_STORAGE_ERROR (56): the
+    /// producer retries rather than treating the records as durably stored (never a false ack). Locks in the
+    /// retriable path so a future refactor cannot silently promote a transient failure to a permanent reject.
+    #[test]
+    fn produce_other_error_stays_retriable_56() {
+        let broker = FailingBroker { kind: io::ErrorKind::Other };
+        let txn = TxnCoordinator::new(1000);
+        let results = produce_results(&broker, &txn, &one_partition_batch());
+        let (base, code) = results[&("events".to_owned(), 0)];
+        assert_eq!(code, 56, "a non-InvalidData error stays KAFKA_STORAGE_ERROR (56, retriable)");
+        assert_eq!(base, -1, "a failed batch reports no base offset");
+    }
 }
