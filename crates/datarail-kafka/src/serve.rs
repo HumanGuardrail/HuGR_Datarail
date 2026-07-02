@@ -913,7 +913,7 @@ mod tests {
         }]
     }
 
-    /// A CONTRACT VIOLATION (surfaced as `InvalidData`) is a PERMANENT rejection → non-retriable INVALID_RECORD
+    /// A CONTRACT VIOLATION (surfaced as `InvalidData`) is a PERMANENT rejection → non-retriable `INVALID_RECORD`
     /// (87). Regression: a retriable code here makes librdkafka re-send the still-rejected batch forever.
     #[test]
     fn produce_invalid_data_maps_to_non_retriable_87() {
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(base, -1, "a rejected batch reports no base offset");
     }
 
-    /// A transient store/seal failure (any non-`InvalidData` kind) → retriable KAFKA_STORAGE_ERROR (56): the
+    /// A transient store/seal failure (any non-`InvalidData` kind) → retriable `KAFKA_STORAGE_ERROR` (56): the
     /// producer retries rather than treating the records as durably stored (never a false ack). Locks in the
     /// retriable path so a future refactor cannot silently promote a transient failure to a permanent reject.
     #[test]
