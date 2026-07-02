@@ -1290,13 +1290,29 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
         let inner = &mut *g;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         let sealed = inner.partition_log(topic, partition)?.read_sealed_from(start, i64::from(max_bytes))?;
-        // Un-seal at the edge: decode + open with the dest key. A record we wrote always opens; a corrupt entry is
-        // skipped defensively. (open is read-only → re-fetching the same offset is idempotent.)
+        // Un-seal at the edge (open is read-only → re-fetching the same offset is idempotent). A record we
+        // wrote always opens; an entry that does NOT open is store corruption and must be LOUD, never skipped:
+        // silently dropping it would renumber every subsequent record the consumer sees (audit finding). We
+        // halt the batch at the corruption point (offsets of the returned prefix stay correct) and, when the
+        // very first requested record is unreadable, fail the fetch as `InvalidData` → CORRUPT_MESSAGE (2).
         let mut out = Vec::new();
-        for bytes in &sealed {
-            if let Ok(cofre) = datarail_cofre::decode(bytes) {
-                if let Some(records) = inner.dst.open(&cofre) {
-                    out.extend(records);
+        for (i, bytes) in sealed.iter().enumerate() {
+            let opened = datarail_cofre::decode(bytes).ok().and_then(|cofre| inner.dst.open(&cofre));
+            match opened {
+                Some(records) => out.extend(records),
+                None => {
+                    let bad = offset.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
+                    eprintln!(
+                        "kafka: fetch hit an unreadable sealed record topic={topic} partition={partition} \
+                         offset={bad} — halting the batch at the corruption point (offsets never renumber)"
+                    );
+                    if i == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unreadable sealed record at offset {bad} (store corruption)"),
+                        ));
+                    }
+                    break;
                 }
             }
         }
@@ -2060,6 +2076,34 @@ mod tests {
         store.buffer_txn(9, 0, "events", 0, &[b"evt:ok".to_vec()]).unwrap();
         store.commit_txn(9, 0, &[("events".to_owned(), 0)]).unwrap();
         assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), vec![b"evt:ok".to_vec()]);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn fetch_halts_loud_at_a_corrupt_record_and_never_renumbers() {
+        // Audit finding: a record that fails decode/open must NEVER be silently skipped (that would shift
+        // every later offset the consumer sees). The batch halts at the corruption point; fetching AT the
+        // corrupt offset fails as InvalidData (→ CORRUPT_MESSAGE 2 on the wire).
+        use datarail_kafka::serve::KafkaBroker as _;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-corrupt-fetch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
+        store.produce("events", 0, &[b"evt:first".to_vec()]).unwrap();
+        {
+            // Inject a VALID log frame whose payload is NOT a decodable cofre (store-level corruption).
+            let mut g = store.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.partition_log("events", 0).unwrap().append_durable(&[b"not-a-cofre".to_vec()]).unwrap();
+        }
+        store.produce("events", 0, &[b"evt:third".to_vec()]).unwrap();
+        // The prefix before the corruption returns with correct offsets; nothing is renumbered.
+        assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), vec![b"evt:first".to_vec()]);
+        // Fetching AT the corrupt offset is a loud InvalidData error, not a silent skip.
+        let err = store.fetch("events", 0, 1, 1_000_000).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // The record AFTER the corruption is still addressable at its ORIGINAL offset.
+        assert_eq!(store.fetch("events", 0, 2, 1_000_000).unwrap(), vec![b"evt:third".to_vec()]);
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 

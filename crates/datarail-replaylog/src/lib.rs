@@ -96,6 +96,13 @@ fn seg_start(path: &Path) -> Option<u64> {
     path.file_name()?.to_str()?.strip_suffix(".seg")?.parse().ok()
 }
 
+/// fsync the directory itself so a newly-created entry (a segment file) survives a power loss — an fsync of
+/// the file persists its *bytes*, not its *directory entry* (same technique as `datarail-offsets::fsync_dir`).
+/// Without this, a record acked right after a rotation could vanish with its whole segment on power loss.
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
 /// All segment start-offsets in `dir`, sorted ascending.
 fn segment_starts(dir: &Path) -> Result<Vec<u64>, ReplayError> {
     let mut starts = Vec::new();
@@ -125,6 +132,12 @@ impl ReplayLog {
         let valid_len = scan_valid_len(&path)?;
         let active = OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&path)?;
         active.set_len(valid_len)?; // drop any torn tail
+        // Persist the directory entries we may have just created (the log dir + the first segment): without a
+        // dir fsync, a power loss could erase the dentries of a log whose records were already acked durable.
+        fsync_dir(&dir)?;
+        if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fsync_dir(parent)?;
+        }
         let mut active = active;
         active.seek(SeekFrom::Start(valid_len))?;
         Ok(Self {
@@ -185,6 +198,10 @@ impl ReplayLog {
             .write(true)
             .truncate(false)
             .open(self.dir.join(seg_name(self.active_start)))?;
+        // Persist the new segment's directory entry NOW, before any record lands in it: the caller's
+        // fsync-before-ack (`sync`) only covers the file's bytes — without this dir fsync, a power loss after
+        // an ack could erase the freshly-rotated segment together with every record acked into it.
+        fsync_dir(&self.dir)?;
         Ok(())
     }
 

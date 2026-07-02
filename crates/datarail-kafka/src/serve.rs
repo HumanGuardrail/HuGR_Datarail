@@ -34,7 +34,7 @@ use crate::handlers::{
     api_versions_response, init_producer_id_response, metadata_response, parse_metadata_topics,
     API_INIT_PRODUCER_ID, API_METADATA, API_PRODUCE, API_VERSIONS,
 };
-use crate::produce::{build_record_batch, parse_produce, produce_response, EosCoord};
+use crate::produce::{build_record_batch, parse_produce, produce_response, EosCoord, ProducedRequest};
 
 /// A connection stream the serve loop reads length-framed requests from and writes responses to. Implemented for
 /// `TcpStream` (plaintext) and — via the CLI's `tls` feature — a rustls TLS stream, so `datarail-kafka` stays
@@ -199,15 +199,18 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
             reader.skip_tagged_fields()?;
         }
 
-        let response = match api_key {
-            API_VERSIONS => api_versions_response(api_version, correlation_id),
+        // `None` ⇒ write NO response frame for this request. Today only an acks=0 produce is silent (Kafka
+        // fire-and-forget): the records still land durably, but a response would desynchronize the client's
+        // correlation-id stream. Every other request yields `Some(bytes)`.
+        let response: Option<Vec<u8>> = match api_key {
+            API_VERSIONS => Some(api_versions_response(api_version, correlation_id)),
             API_METADATA => {
                 let topics = parse_metadata_topics(&mut reader)?;
                 // Ingest merges all partitions into one sink, so a single partition is advertised here.
-                metadata_response(api_version, correlation_id, &shared.host, shared.port, &topics, 1)
+                Some(metadata_response(api_version, correlation_id, &shared.host, shared.port, &topics, 1))
             }
             API_PRODUCE => {
-                let topics = parse_produce(&mut reader, api_version)?;
+                let ProducedRequest { acks, topics } = parse_produce(&mut reader, api_version)?;
                 // ACK-AFTER-DURABLE (audit A): land every partition batch through the integration layer and wait
                 // for its durable-landing result BEFORE building the ack. A landing failure becomes a retriable
                 // error code for that partition — never a false NONE ack that would lose the records on a crash.
@@ -259,7 +262,9 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
                 // Recover from a poisoned lock (the protected state is plain data) so one panicked
                 // connection can't brick produce for the broker's lifetime (audit K5).
                 let mut offsets = shared.offsets.lock().unwrap_or_else(PoisonError::into_inner);
-                produce_response(api_version, correlation_id, &topics, &mut |name, part, count| {
+                // Advance the reported base offsets exactly as an acked produce would (so a later acked request
+                // sees contiguous offsets) — but for acks=0 the built frame is DISCARDED, never written.
+                let built = produce_response(api_version, correlation_id, &topics, &mut |name, part, count| {
                     let key = (name.to_owned(), part);
                     let base = *offsets.get(&key).unwrap_or(&0);
                     let code = codes.get(&key).copied().unwrap_or(0); // read before the insert moves `key`
@@ -272,21 +277,32 @@ fn handle_connection<S: Read + Write>(mut stream: S, shared: &Shared) -> io::Res
                         offsets.insert(key, base.saturating_add(i64::try_from(count).unwrap_or(i64::MAX)));
                     }
                     (base, code)
-                })
+                });
+                // acks=0 ⇒ fire-and-forget: the records landed above, but we send NO response frame (a response
+                // would shift the client's correlation-id stream by one). acks=1/-1 ⇒ answer normally.
+                if acks == 0 {
+                    None
+                } else {
+                    Some(built)
+                }
             }
             API_INIT_PRODUCER_ID => {
                 // Hand out a fresh producer_id so the client can enable idempotence; the request body
                 // (transactional_id / timeout) needs no parsing — each producer just needs a distinct id.
                 let pid = shared.next_producer_id.fetch_add(1, Ordering::Relaxed);
-                init_producer_id_response(correlation_id, pid)
+                Some(init_producer_id_response(correlation_id, pid))
             }
             other => {
                 return Err(io::Error::other(format!("unsupported Kafka api_key {other}")));
             }
         };
 
-        stream.write_all(&Writer::frame(&response))?;
-        stream.flush()?;
+        // Suppress the write entirely for a silent request (acks=0 produce); the read loop keeps serving the
+        // next framed request on the same connection.
+        if let Some(bytes) = response {
+            stream.write_all(&Writer::frame(&bytes))?;
+            stream.flush()?;
+        }
     }
     Ok(())
 }
@@ -459,6 +475,10 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
         if !authenticated && api_key != API_VERSIONS {
             return Ok(());
         }
+        // Set by the acks=0 produce arm to suppress the response write: Kafka fire-and-forget produce gets NO
+        // response frame (a response would desynchronize the client's correlation-id stream). Everything else
+        // answers normally; the connection keeps serving the next request either way.
+        let mut suppress_response = false;
         let response = match api_key {
             API_VERSIONS => api_versions_response(api_version, correlation_id),
             API_METADATA => {
@@ -480,8 +500,12 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
                 }
             }
             API_PRODUCE => {
-                let topics = parse_produce(&mut reader, api_version)?;
+                let ProducedRequest { acks, topics } = parse_produce(&mut reader, api_version)?;
+                // Land (seal+store or buffer) every partition regardless of acks — the records must be durable.
                 let results = produce_results(broker, txn, &topics);
+                // acks=0 ⇒ fire-and-forget: still build the frame (so offset/state logic is identical) but mark
+                // it suppressed so the write below is skipped entirely.
+                suppress_response = acks == 0;
                 produce_response(api_version, correlation_id, &topics, &mut |name, part, _count| {
                     results.get(&(name.to_owned(), part)).copied().unwrap_or((0, 0))
                 })
@@ -532,8 +556,11 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
                 }
             }
         };
-        stream.write_all(&Writer::frame(&response))?;
-        stream.flush()?;
+        // Skip the write for a silent (acks=0) produce; the loop reads the next framed request as normal.
+        if !suppress_response {
+            stream.write_all(&Writer::frame(&response))?;
+            stream.flush()?;
+        }
     }
     Ok(())
 }
@@ -721,6 +748,12 @@ fn produce_results<B: KafkaBroker>(
     let mut results: HashMap<(String, i32), (i64, i16)> = HashMap::new();
     for t in topics {
         for p in &t.partitions {
+            // A batch rejected at PARSE time (today: CORRUPT_MESSAGE 2 on a v2 CRC mismatch) is NEVER landed —
+            // skip the store entirely so no record from a corrupt batch is persisted. `produce_response` reports
+            // the parse code directly (it reads `part.error_code` before consulting these results).
+            if p.error_code.is_some() {
+                continue;
+            }
             let outcome = if let Some(eos) = p.eos.filter(|e| e.transactional) {
                 let code = txn.produce_check(eos.producer_id, eos.producer_epoch, &t.name, p.partition);
                 if code == 0 {
@@ -772,7 +805,16 @@ fn fetch_results<B: KafkaBroker>(broker: &B, topics: &[crate::consume::FetchTopi
             let (error_code, records) = match broker.fetch(&t.name, p.partition, p.fetch_offset, p.max_bytes) {
                 Ok(values) if values.is_empty() => (0, Vec::new()),
                 Ok(values) => (0, build_record_batch(p.fetch_offset, &values)),
-                Err(_) => (1, Vec::new()), // 1 = OFFSET_OUT_OF_RANGE
+                // InvalidData = the store's record at this offset is unreadable (corruption) → CORRUPT_MESSAGE
+                // (2), so the consumer surfaces it instead of silently spinning; anything else keeps the
+                // OFFSET_OUT_OF_RANGE (1) mapping.
+                Err(e) => {
+                    eprintln!(
+                        "kafka: fetch failed topic={} partition={} offset={} error={e}",
+                        t.name, p.partition, p.fetch_offset
+                    );
+                    (if e.kind() == io::ErrorKind::InvalidData { 2 } else { 1 }, Vec::new())
+                }
             };
             parts.push(FetchPartitionResult { partition: p.partition, error_code, high_watermark: latest, records });
         }
@@ -852,7 +894,12 @@ mod tests {
     fn one_partition_batch() -> Vec<ProducedTopic> {
         vec![ProducedTopic {
             name: "events".to_owned(),
-            partitions: vec![ProducedPartition { partition: 0, values: vec![b"evt:x".to_vec()], eos: None }],
+            partitions: vec![ProducedPartition {
+                partition: 0,
+                values: vec![b"evt:x".to_vec()],
+                eos: None,
+                error_code: None,
+            }],
         }]
     }
 
