@@ -528,7 +528,7 @@ mod scram {
     /// a server asking for `i < 1` is malformed.
     const MIN_ITERATIONS: u32 = 1;
     /// Upper bound on the iteration count — the server dictates `i`, and PBKDF2 does `i` HMAC rounds, so an
-    /// absurd `i` is a cheap DoS the server could inflict on the client. Cap it well above any real config.
+    /// absurd `i` is a cheap `DoS` the server could inflict on the client. Cap it well above any real config.
     const MAX_ITERATIONS: u32 = 1_000_000;
 
     /// Drive the full `SCRAM-SHA-256` exchange. `mechanisms` is the NUL-separated mechanism list from the
@@ -636,7 +636,7 @@ mod scram {
     }
 
     /// Read a backend `'R'` message and require it to be an `Authentication*` of the given SASL `code`
-    /// (11 = SASLContinue, 12 = SASLFinal), returning the SASL payload (body after the 4-byte code). An
+    /// (11 = `SASLContinue`, 12 = `SASLFinal`), returning the SASL payload (body after the 4-byte code). An
     /// `ErrorResponse` ('E') becomes the backend error; anything else is a protocol violation.
     fn read_sasl_message(stream: &mut impl Read, code: i32) -> io::Result<Vec<u8>> {
         let (tag, body) = read_msg(stream)?;
@@ -833,17 +833,22 @@ mod scram {
             }
             // Left-align the accumulated bits for a short final chunk.
             acc <<= 6 * (4 - chunk.len());
+            // `acc` holds up to 24 data bits left-aligned in bits 0..24; the
+            // big-endian bytes [1], [2], [3] are the decoded output bytes (byte
+            // [0] is always the empty high octet). Destructuring avoids the
+            // `as u8` truncation cast.
+            let [_, b_hi, b_mid, b_lo] = acc.to_be_bytes();
             match chunk.len() {
                 4 => {
-                    out.push((acc >> 16) as u8);
-                    out.push((acc >> 8) as u8);
-                    out.push(acc as u8);
+                    out.push(b_hi);
+                    out.push(b_mid);
+                    out.push(b_lo);
                 }
                 3 => {
-                    out.push((acc >> 16) as u8);
-                    out.push((acc >> 8) as u8);
+                    out.push(b_hi);
+                    out.push(b_mid);
                 }
-                2 => out.push((acc >> 16) as u8),
+                2 => out.push(b_hi),
                 _ => return None,
             }
         }
