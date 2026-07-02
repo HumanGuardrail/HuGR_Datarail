@@ -48,10 +48,13 @@ method and raw results in [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-IN
 - **Memory: 3.3 MB RSS idle, 9 MB peak** through a 50,000-message produce+consume cycle. The binary is 2 MB.
 - **Integrity: 50,000 produced → 50,000 consumed, zero loss**, and the data directory grepped clean of
   plaintext — the provider-blind property reproduced by that auditor, outside the author's own harness.
-- **Throughput: ~6 MB/s (~6,000 msg/s) per partition — and it does not scale out yet.** The per-record seal
-  runs inside a global mutex, so two producers on two partitions aggregate to 4.4 MB/s: *negative* scaling,
-  ~1 core ceiling. The seal is embarrassingly parallel; moving it outside the lock is the known,
-  highest-leverage fix, and it is planned, not done.
+- **Throughput: ~6 MB/s (~6,000 msg/s) per partition as originally measured — first fix landed 2026-07-02.**
+  The per-record seal ran inside a global mutex (two producers on two partitions aggregated to 4.4 MB/s:
+  *negative* scaling, ~1 core ceiling). The per-batch seal is now parallelized (a reserved seq range + an
+  immutable `board_at`): a same-minute interleaved A/B on the same 4 vCPU host measured **~2.5×** (serial
+  1.3 → parallel 3.3 MB/s in a degraded-host window; that shared sandbox's absolute numbers drift ~4× across
+  hours, so trust the ratio, not the absolutes — method in the bench addendum). The global broker lock still
+  serializes batches; per-partition locking is the next lever.
 
 The older headline figures in the design docs (`~72×` Kafka's RAM, throughput "tie") were measured on
 `datarail-omb-shim` — a point-to-point mover, not this broker — at a ~51 MB/s operating point, self-run, n=3
@@ -136,8 +139,9 @@ raw demo secrets by design; real deployments should reference keys, not inline t
 The sharp edges, before you find them:
 
 - **Single-node.** No replication or failover of any kind; this is the project's largest open front.
-- **Throughput ceiling by design flaw:** the seal runs inside a global mutex — negative multi-producer scaling
-  (measured, see above) until the seal is parallelized.
+- **Throughput ceiling, partially addressed:** the per-batch seal is now parallel (~2.5× measured, same-minute
+  A/B), but the global broker lock still serializes batches — true multi-producer scaling needs per-partition
+  locking (planned).
 - **Transactions are not crash-atomic across partitions:** the txn coordinator is in-memory; a crash mid-commit
   can land a partial multi-partition transaction. Documented in
   [`docs/design/KAFKA-TXN-DESIGN.md`](docs/design/KAFKA-TXN-DESIGN.md); a durable txn log is future work.

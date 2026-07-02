@@ -59,7 +59,30 @@ another non-retriable error. Location: `datarail-kafka/src/serve.rs` (`produce_r
    take the real broker to tens of MB/s per core — but that is a projection, not a measurement. Today, the
    honest product number is **~6 MB/s per partition on this hardware class**.
 
-## Reproduction
+## Addendum 2026-07-02 — the parallel seal, A/B'd
+
+The "highest-return optimization" above was implemented the next day: the broker reserves the batch's seq
+range under its lock (`SourceTerminal::reserve_seqs`), then seals across cores through an immutable
+`board_at(&self, …, seq)` — same rkeys, same order, fresh per-cofre keys from the per-thread CSPRNG. The
+per-draw `/dev/urandom` **open** was also replaced with a per-thread persistent fd (the AUDIT-05 property is
+untouched: freshness comes from the kernel pool at read time, so a restored snapshot/clone still diverges).
+
+**Method note (important):** between the two sessions this sandbox degraded ~4.5× — the *same serial code
+path* that measured 6.0 MB/s on 2026-07-01 measured 1.27–1.40 MB/s on 2026-07-02 (steal=0; shared host).
+Cross-session absolute numbers are therefore not comparable; the honest measurement is a **same-minute
+interleaved A/B** of two binaries from the same commit (parallel threshold 16 vs `usize::MAX`):
+
+| Run (interleaved, same box, same minutes) | Throughput |
+|---|---|
+| serial #1 | 1.27 MB/s |
+| **parallel** | **3.31 MB/s** |
+| serial #2 | 1.40 MB/s |
+
+**≈2.5× from the parallel seal** (3 workers = N−1 on 4 vCPU; adjacent parallel runs ranged 2.6–4.1).
+Two producers on two partitions: 2.8 MB/s aggregate — the *catastrophic* negative scaling is gone, but the
+global lock still serializes batches, so real multi-producer scaling awaits per-partition locking.
+Integrity re-verified: 10,000 + 10,000 records, both partitions, zero loss; a 100-record order-roundtrip
+regression test locks the parallel path's semantics. RSS peak ~9.5 MB (unchanged).
 
 ```sh
 cargo build --release -p datarail-cli

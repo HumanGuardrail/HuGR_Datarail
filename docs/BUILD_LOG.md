@@ -991,6 +991,16 @@ EXECUTE (Kage-Bunshin) → Prove (fairness gate) → Deliver. **Each stage froze
   authentication by cert chain (no cert→identity ACL — tracked). **The Kafka hop now supports TLS + SASL/PLAIN +
   mTLS, all proven against the real client.**
 
+- 2026-07-02 — **Parallel seal landed** (the 2026-07-01 independent bench's ceiling): `reserve_seqs` + an
+  immutable `board_at(&self, …, seq)` on the SourceTerminal — the broker reserves the batch's seq range under
+  its lock, then seals across cores (order + rkeys identical; 24 cli tests incl. a 100-record order-roundtrip
+  regression). Per-thread persistent `/dev/urandom` fd replaces open-per-draw (AUDIT-05 property intact:
+  freshness comes from the kernel pool at read time; a restored clone still diverges). Same-minute interleaved
+  A/B on the 4 vCPU sandbox: serial 1.27/1.40 → parallel 3.31 MB/s (**~2.5×**); 2-producer aggregate 2.8 (the
+  catastrophic collapse is gone; the global lock still serializes batches — per-partition locking is the next
+  lever). Honesty note: the sandbox degraded ~4.5× between sessions (same serial path: 6.0 then, 1.3 now;
+  steal=0) — ratios are the finding, absolutes are environment-bound (BENCH-INDEPENDENT addendum).
+
 ## §6 — STOP-THE-LINE / owner-ratification log
 
 - 2026-06-21 — **Owner: ratify these 3 audit-driven reconciliations to the DRAFT trio (`DECOMPOSITION.md`) at MF-0.**

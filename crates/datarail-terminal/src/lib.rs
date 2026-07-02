@@ -59,16 +59,35 @@ fn aead_aad(e: &Etiqueta) -> Vec<u8> {
     aad
 }
 
-/// Read 32 bytes of OS entropy (`/dev/urandom`, zero-dep). Used ONLY to **seed** the per-thread CSPRNG once and
-/// to reseed it periodically — NOT once per cofre. The old design opened `/dev/urandom` twice per `board`, which
-/// serialized concurrent boarders on the kernel entropy path (a measured throughput bottleneck under load,
-/// AUDIT-04); the per-thread CSPRNG below removes that contention entirely.
+/// Read 32 bytes of OS entropy (`/dev/urandom`, zero-dep) through a **per-thread persistent fd**.
+///
+/// The DRBG below mixes fresh OS bytes into every draw (AUDIT-05 clone/snapshot immunity), so this runs twice
+/// per cofre — and the previous implementation `open()`ed `/dev/urandom` on every call, which put an
+/// open/read/close (dentry + fd-table churn) on the hot seal path and measurably *contended* once the seal was
+/// parallelized across cores (2026-07-01 bench). Keeping one open fd per thread removes the open/close while
+/// preserving the security property exactly: each `read` still returns fresh kernel CSPRNG output, and a
+/// restored VM-snapshot / CRIU clone reading through a restored fd still gets DIFFERENT bytes per clone — the
+/// freshness comes from the kernel pool at read time, not from the fd. On a read error the fd is dropped so
+/// the next call reopens rather than wedging the thread on a dead handle.
 fn os_seed_32() -> Result<[u8; 32], TerminalError> {
     use std::io::Read as _;
-    let mut file = std::fs::File::open("/dev/urandom").map_err(|_| TerminalError::Entropy)?;
-    let mut buf = [0u8; 32];
-    file.read_exact(&mut buf).map_err(|_| TerminalError::Entropy)?;
-    Ok(buf)
+    thread_local! {
+        static URANDOM: core::cell::RefCell<Option<std::fs::File>> = const { core::cell::RefCell::new(None) };
+    }
+    URANDOM.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(std::fs::File::open("/dev/urandom").map_err(|_| TerminalError::Entropy)?);
+        }
+        let mut buf = [0u8; 32];
+        let ok = slot.as_mut().is_some_and(|file| file.read_exact(&mut buf).is_ok());
+        if ok {
+            Ok(buf)
+        } else {
+            *slot = None; // reopen on the next call instead of wedging on a dead fd
+            Err(TerminalError::Entropy)
+        }
+    })
 }
 
 /// Draws between fresh OS reseeds (prediction resistance / recovery from a state compromise).
@@ -697,6 +716,34 @@ impl SourceTerminal {
     /// - [`TerminalError::BatchTooLarge`] if the batch exceeds the `u32` framing limits.
     /// - [`TerminalError::Seal`] if the AEAD seal fails (e.g. a bad key length).
     pub fn board(&mut self, records: &[&[u8]], record_key: &[u8]) -> Result<Cofre, TerminalError> {
+        let cofre = self.board_at(records, record_key, self.seq)?;
+        self.seq += 1;
+        Ok(cofre)
+    }
+
+    /// Reserve `n` consecutive sequence numbers and return the first — for callers that seal a batch of
+    /// cofres **in parallel** with explicit per-cofre seqs ([`board_at`](Self::board_at)). The reservation is
+    /// what keeps parallel sealing seq-unique: the counter is bumped once, up front, under whatever lock the
+    /// caller already holds, and each worker stamps `start + i` (order-preserving, no duplicates). Saturates
+    /// at `u64::MAX` rather than wrapping.
+    #[must_use]
+    pub fn reserve_seqs(&mut self, n: u64) -> u64 {
+        let start = self.seq;
+        self.seq = self.seq.saturating_add(n);
+        start
+    }
+
+    /// [`board`](Self::board) with an explicit, caller-assigned sequence number and **no internal state
+    /// change** (`&self`): the parallel-seal building block. Callers MUST assign each cofre a distinct `seq`
+    /// (use [`reserve_seqs`](Self::reserve_seqs)) — the per-cofre data key is freshly drawn per call from the
+    /// per-thread CSPRNG, so cryptographic safety never depends on `seq`, but a duplicated seq would confuse
+    /// downstream effectively-once accounting.
+    ///
+    /// # Errors
+    /// - [`TerminalError::ContractViolation`] if any record fails the onboarding contract (never boards).
+    /// - [`TerminalError::BatchTooLarge`] if the batch exceeds the `u32` framing limits.
+    /// - [`TerminalError::Seal`] if the AEAD seal fails (e.g. a bad key length).
+    pub fn board_at(&self, records: &[&[u8]], record_key: &[u8], seq: u64) -> Result<Cofre, TerminalError> {
         // (1) Enforce the content contract on EVERY record — a single failure means the batch never boards.
         if !records.iter().all(|r| self.contract.validate(r)) {
             return Err(TerminalError::ContractViolation);
@@ -734,7 +781,7 @@ impl SourceTerminal {
         let etiqueta = Etiqueta {
             route_id: self.config.route_id,
             stream_id: self.config.stream_id,
-            seq: self.seq,
+            seq,
             cofre_id: [0u8; 32],
             idempotency_key,
             contract_fp: self.contract.fingerprint,
@@ -748,9 +795,9 @@ impl SourceTerminal {
         let carga = aead_seal(self.config.aead_alg, &data_key, &nonce, &aead_aad(&etiqueta), &inner)?;
         data_key.zeroize(); // the per-cofre data key is consumed; wipe it (AUDIT-02 F4).
 
-        // (6) Seal (Ed25519 over etiqueta ⊗ carga) and advance the per-stream sequence.
+        // (6) Seal (Ed25519 over etiqueta ⊗ carga). (The per-stream sequence is advanced by the caller —
+        // `board` bumps by one; a parallel sealer reserves its whole range up front via `reserve_seqs`.)
         let cofre = datarail_cofre::seal(etiqueta, carga, &self.source_seed);
-        self.seq += 1;
         Ok(cofre)
     }
 

@@ -1108,24 +1108,89 @@ impl BrokerInner {
     /// [`std::io::Error`] on a seal or store failure.
     fn produce_into(&mut self, topic: &str, partition: i32, records: &[Vec<u8>]) -> std::io::Result<i64> {
         let base = self.partition_log(topic, partition)?.len();
-        let mut sealed = Vec::with_capacity(records.len());
-        for (i, rec) in records.iter().enumerate() {
-            let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
-            let refs = [rec.as_slice()];
-            // A CONTRACT VIOLATION is a PERMANENT rejection (the record can never board — AC-9), so it must reach
-            // the wire as a non-retriable error. Map it to `InvalidData` (→ INVALID_RECORD 87); everything else
-            // (seal/entropy) is treated as a transient store failure → `Other` (→ KAFKA_STORAGE_ERROR 56,
-            // retriable). The extreme `BatchTooLarge` framing edge (>u32) also lands on 56 today — tracked for a
-            // MESSAGE_TOO_LARGE (10) mapping, since it too is permanent for the offending batch.
-            // `board` returns the typed `TerminalError`, so we match the variant directly (no string matching).
-            let cofre = self.src.board(&refs, rkey.as_bytes()).map_err(|e| match e {
-                TerminalError::ContractViolation => std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
-                _ => std::io::Error::other(e.to_string()),
-            })?;
-            sealed.push(datarail_cofre::encode(&cofre));
+        // Contract check up front, serially (it is cheap): a CONTRACT VIOLATION is a PERMANENT rejection
+        // (the record can never board — AC-9) and must reach the wire as non-retriable INVALID_RECORD (87).
+        if !records.iter().all(|r| self.onboarding.validate(r)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "record violates the onboarding content contract (never boards)",
+            ));
         }
+        // Reserve the whole batch's seq range up front (we hold the broker Mutex), then seal WITHOUT mutating
+        // the terminal — which is what lets the seal fan out across cores (2026-07-01 bench: the per-record
+        // seal inside this lock was the broker's throughput ceiling, with NEGATIVE multi-producer scaling).
+        let start_seq = self.src.reserve_seqs(u64::try_from(records.len()).unwrap_or(u64::MAX));
+        let sealed = seal_batch(&self.src, topic, partition, base, start_seq, records)?;
         self.partition_log(topic, partition)?.append_durable(&sealed)
     }
+}
+
+/// Seal a produce batch into encoded cofres — in parallel across cores when the batch is large enough.
+///
+/// Order-preserving and semantics-preserving vs the old serial loop: record `i` gets the same
+/// `rkey = kbroker-{topic}-{partition}-{base+i}` and the seq `start_seq + i` (unique — the caller reserved the
+/// range via [`SourceTerminal::reserve_seqs`] while holding the broker lock). Each `board_at` draws its fresh
+/// per-cofre X25519 ephemeral + data key from the per-thread CSPRNG, so parallelism never shares key material.
+///
+/// # Errors
+/// `InvalidData` for a contract violation (→ INVALID_RECORD 87, non-retriable — pre-checked by the caller, but
+/// mapped here too); any other seal failure as `Other` (→ KAFKA_STORAGE_ERROR 56, retriable). The extreme
+/// `BatchTooLarge` framing edge (>u32) also lands on 56 today — tracked for a MESSAGE_TOO_LARGE (10) mapping.
+fn seal_batch(
+    src: &SourceTerminal,
+    topic: &str,
+    partition: i32,
+    base: usize,
+    start_seq: u64,
+    records: &[Vec<u8>],
+) -> std::io::Result<Vec<Vec<u8>>> {
+    /// Below this batch size the thread fan-out costs more than it buys; seal serially.
+    const PARALLEL_THRESHOLD: usize = 16;
+    let seal_one = |i: usize, rec: &[u8]| -> std::io::Result<Vec<u8>> {
+        let rkey = format!("kbroker-{topic}-{partition}-{}", base + i);
+        let refs = [rec];
+        let seq = start_seq.saturating_add(u64::try_from(i).unwrap_or(u64::MAX));
+        let cofre = src.board_at(&refs, rkey.as_bytes(), seq).map_err(|e| match e {
+            TerminalError::ContractViolation => std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()),
+            _ => std::io::Error::other(e.to_string()),
+        })?;
+        Ok(datarail_cofre::encode(&cofre))
+    };
+    if records.len() < PARALLEL_THRESHOLD {
+        return records.iter().enumerate().map(|(i, r)| seal_one(i, r)).collect();
+    }
+    // Leave one core for the broker's IO thread + the client on the same box: N-1 seal workers measured
+    // faster end-to-end than N on a small host (the join barrier waits for the slowest, starved worker).
+    let workers = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .saturating_sub(1)
+        .max(1)
+        .min(records.len());
+    let chunk_len = records.len().div_ceil(workers);
+    let seal_one = &seal_one;
+    let mut parts: Vec<std::io::Result<Vec<Vec<u8>>>> = Vec::with_capacity(workers);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = records
+            .chunks(chunk_len)
+            .enumerate()
+            .map(|(w, part)| {
+                s.spawn(move || {
+                    part.iter()
+                        .enumerate()
+                        .map(|(j, r)| seal_one(w * chunk_len + j, r))
+                        .collect::<std::io::Result<Vec<Vec<u8>>>>()
+                })
+            })
+            .collect();
+        for h in handles {
+            parts.push(h.join().unwrap_or_else(|_| Err(std::io::Error::other("seal worker panicked"))));
+        }
+    });
+    let mut sealed = Vec::with_capacity(records.len());
+    for part in parts {
+        sealed.extend(part?);
+    }
+    Ok(sealed)
 }
 
 impl KafkaBrokerStore {
@@ -1995,6 +2060,26 @@ mod tests {
         store.buffer_txn(9, 0, "events", 0, &[b"evt:ok".to_vec()]).unwrap();
         store.commit_txn(9, 0, &[("events".to_owned(), 0)]).unwrap();
         assert_eq!(store.fetch("events", 0, 0, 1_000_000).unwrap(), vec![b"evt:ok".to_vec()]);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn parallel_seal_preserves_order_and_roundtrip_above_threshold() {
+        // The parallel-seal path (batch >= threshold fans out across cores with a reserved seq range) must be
+        // semantically identical to the serial loop: same rkeys, same order, every record fetchable.
+        use datarail_kafka::serve::KafkaBroker as _;
+        let spec = RailSpec::parse(&sample()).unwrap();
+        let mut data_dir = std::env::temp_dir();
+        data_dir.push(format!("datarail-parallel-seal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let store = super::KafkaBrokerStore::from_spec(&spec, data_dir.clone());
+        let recs: Vec<Vec<u8>> = (0..100).map(|i| format!("evt:r{i:03}").into_bytes()).collect();
+        assert_eq!(store.produce("events", 0, &recs).unwrap(), 0);
+        assert_eq!(
+            store.fetch("events", 0, 0, 10_000_000).unwrap(),
+            recs,
+            "parallel seal must preserve record order end-to-end"
+        );
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
