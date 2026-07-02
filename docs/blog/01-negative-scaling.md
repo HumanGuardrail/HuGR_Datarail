@@ -125,9 +125,11 @@ A regression test locks in the order semantics of the parallel path.
 
 ## What is still honest to say
 
-The catastrophic negative scaling from two producers is gone. The two-producer aggregate went
-from 4.4 MB/s (worse than one producer) to 2.8 MB/s aggregate — less than ideal, but no longer
-sub-serial.
+The catastrophic negative scaling from two producers is gone. On the degraded host the two-producer
+aggregate measured 2.8 MB/s — above that session's single-producer serial number, so no longer sub-serial.
+(Don't compare it to the 4.4 MB/s from the first session: that was the *fast* host, and cross-session
+absolutes aren't comparable — the very trap this post is about. What holds across sessions is the shape:
+two producers now beat one, where before they lost to it.)
 
 It is not gone because the architecture is fixed. It is gone because the per-record seal no
 longer runs inside the batch-level lock. The batch-level lock itself is still there. Two producers

@@ -1,8 +1,8 @@
 # KAFKA-COMPAT — the Kafka wire-protocol ingest bridge (scope, limits, security posture)
 
 > **The pitch:** point an existing, **unmodified** Kafka producer at datarail; every record it sends is sealed
-> into a provider-blind cofre and landed via any datarail `Sink`. *Your Kafka producers, now provider-blind +
-> serverless, no code change.* This doc is the HONEST scope: exactly what is implemented, what is not, and the
+> into a provider-blind cofre and landed via any datarail `Sink`. *Your Kafka producers, now provider-blind,
+> no code change.* This doc is the HONEST scope: exactly what is implemented, what is not, and the
 > precise security boundary — so no one over-claims.
 
 ## What is implemented (`datarail-kafka`, zero-dependency)
@@ -149,6 +149,8 @@ A conformance run against the above clients is tracked but not yet scheduled.
 
 ## Why this is still a big deal even produce-only + seal-on-ingest
 The expensive, untrusted, always-on part of a Kafka deployment is the **broker cluster + its storage**. datarail
-replaces exactly that with a serverless, provider-blind, ~70×-leaner rail — while the producer keeps its existing
+replaces exactly that with a single-node, provider-blind rail (single-digit-MB RSS — 3.3 MB idle / 9 MB peak,
+independently measured; the older `~70×` figure is a *shim* comparison, a different object — see the README
+"Measured" note) — while the producer keeps its existing
 Kafka client. The first hop being trusted-network is the same assumption most in-datacenter Kafka deployments
 already make (PLAINTEXT or mTLS between app and broker); datarail adds provider-blindness for everything after.

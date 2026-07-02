@@ -1,6 +1,6 @@
 ---
 title: "I ran adversarial audits against my own benchmarks, and every impressive number fell"
-dek: "On RAM claims that walked from 124x to 40x to 72x, a throughput win that turned out to be a tie, a FAILED gate that had to be re-scoped, and a live bug found by an independent auditor the self-audit missed entirely."
+dek: "On a RAM headline that fell from 124x to ~40x loaded once the comparison was made fair, then settled at ~72x against a genuinely equal-durability baseline; a throughput win that turned out to be a tie; a FAILED gate that had to be re-scoped; and a live bug found by an independent auditor the self-audit missed entirely."
 date: 2026-07-02
 ---
 
@@ -137,7 +137,7 @@ a core.
 
 The LASTRO-MATRIX's standing rule captures the lesson: a claim is only BACKED if a committed
 test or harness reproduces it from a real run, n > 1 or exhaustive. Everything else is labeled
-down. BACKED, DIRECTIONAL, SINGLE-SAMPLE, NO-REPRO, STALE, OVERCLAIMED — the label costs
+down. BACKED, SINGLE-SAMPLE, NO-REPRO, STALE, OVERCLAIMED — the label costs
 nothing; the missing label costs credibility.
 
 A benchmark you did not try to break is marketing. The corrections stayed in the record.

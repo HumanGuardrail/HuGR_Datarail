@@ -11,7 +11,8 @@ Every record is sealed into a per-record vault (X25519 key-wrap, AEAD, signed); 
 offline-verifiable Merkle receipt; an unmodified Kafka client can produce to it and read back.
 
 *Domain vocabulary is Portuguese by design: a __cofre__ is the sealed per-record vault, its __etiqueta__ the
-authenticated envelope/header, the __lacre__ its signature seal.*
+authenticated envelope/header, the __lacre__ its signature seal, the __carga__ the sealed payload (ciphertext);
+__lastro__ ("ballast") is the committed, reproducible evidence backing a claim (see `LASTRO-MATRIX.md`).*
 
 ## Status — read this first
 
@@ -86,7 +87,7 @@ method and raw results in [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-IN
   The per-record seal ran inside a global mutex (two producers on two partitions aggregated to 4.4 MB/s:
   *negative* scaling, ~1 core ceiling). The per-batch seal is now parallelized (a reserved seq range + an
   immutable `board_at`): a same-minute interleaved A/B on the same 4 vCPU host measured **~2.5×** (serial
-  1.3 → parallel 3.3 MB/s in a degraded-host window; that shared sandbox's absolute numbers drift ~4× across
+  1.3 → parallel 3.3 MB/s in a degraded-host window; that shared sandbox's absolute numbers drift ~4.5× across
   hours, so trust the ratio, not the absolutes — method in the bench addendum). The global broker lock still
   serializes batches; per-partition locking is the next lever.
 
@@ -133,7 +134,7 @@ datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
 #   kcat -C -b <host>:9092 -t demo -o beginning -e
 # Durable (fsync-before-ack): produce → restart the broker → fetch returns the records; committed consumer
 # offsets survive restart; on-disk cofres are ciphertext. (Restart survival is verified two ways: store
-# reopen AND a SIGKILL harness — tests/kill9_crash.rs kills the broker mid-produce across 4 rounds and
+# reopen AND a SIGKILL harness — crates/datarail-cli/tests/kill9_crash.rs kills the broker mid-produce across 4 rounds and
 # asserts every acked record at its exact offset. True power-loss — the page cache does not survive — is
 # still future work.) Optional hop security, each CI-gated vs real
 # librdkafka: --tls / --tls-client-ca (mTLS) / --sasl-user (SASL/PLAIN; pair with --tls for SASL_SSL),
@@ -227,12 +228,12 @@ The sharp edges, before you find them:
 
 ## How this was built
 
-Solo, in 8 days, ~30K LOC across 34 crates (clippy `deny(all + pedantic)`, `forbid(unsafe)` workspace-wide;
-one waiver crate — shmem — with two audited `unsafe` sites) — using an AI-fleet execution model with adversarial self-audit loops: every headline
-claim was handed to skeptics instructed to break it, and the corrections stayed in the record. That process is
-as much the point of this repository as the artifact is; the audit trail
-([`ADVERSARIAL-AUDIT.md`](docs/design/ADVERSARIAL-AUDIT.md), [`LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md))
-is why this README can afford to be specific.
+Solo, in 8 days: ~30K LOC across 34 crates, clippy `deny(all + pedantic)` and `forbid(unsafe)` workspace-wide
+(one waiver crate — shmem — with two audited `unsafe` sites). It was built with an AI-fleet execution model and
+adversarial self-audit loops: every headline claim was handed to skeptics instructed to break it, and the
+corrections stayed in the record. That process is as much the point of this repository as the artifact is; the
+audit trail ([`ADVERSARIAL-AUDIT.md`](docs/design/ADVERSARIAL-AUDIT.md),
+[`LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md)) is why this README can afford to be specific.
 
 ## License
 

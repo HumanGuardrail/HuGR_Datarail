@@ -17,3 +17,4 @@ datarail-kafka-data/
 # agent-local settings
 .claude/
 docs/PLANO-PORTFOLIO.md
+push_to_github.py
