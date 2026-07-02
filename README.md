@@ -6,13 +6,13 @@
 [![mtls](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-mtls.yml/badge.svg)](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-mtls.yml)
 [![compression](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-compression.yml/badge.svg)](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-compression.yml)
 
-**An end-to-end-sealed data rail, and a Kafka-wire-compatible broker whose storage never sees plaintext.**
+**An end-to-end-sealed data rail (part of the HuGR project), and a Kafka-wire-compatible broker whose storage never sees plaintext.**
 Every record is sealed into a per-record vault (X25519 key-wrap, AEAD, signed); delivery carries an
 offline-verifiable Merkle receipt; an unmodified Kafka client can produce to it and read back.
 
 *Domain vocabulary is Portuguese by design: a __cofre__ is the sealed per-record vault, its __etiqueta__ the
 authenticated envelope/header, the __lacre__ its signature seal, the __carga__ the sealed payload (ciphertext);
-__lastro__ ("ballast") is the committed, reproducible evidence backing a claim (see `LASTRO-MATRIX.md`).*
+__lastro__ ("ballast") is the committed, reproducible evidence backing a claim (see [LASTRO-MATRIX.md](docs/design/LASTRO-MATRIX.md)).*
 
 ## Status — read this first
 
@@ -74,8 +74,8 @@ graph LR
 
 ## Measured
 
-Numbers from a benchmark of the **real `datarail kafka-broker` binary**, run by a **separate AI auditor
-(Claude), not the author**, with a real client
+Numbers from a benchmark of the **real `datarail kafka-broker` binary**, run by an **adversarial AI-run audit
+(Claude), author-commissioned**, with a real client
 (kafkacat 1.6.0 / librdkafka 1.8.0; 4 vCPU i7-9750H class, AES-NI, no VAES; 1 KiB records; fsync-before-ack defaults) —
 method and raw results in [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-INDEPENDENT-2026-07-01.md):
 
@@ -86,7 +86,7 @@ method and raw results in [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-IN
 - **Throughput: ~6 MB/s (~6,000 msg/s) per partition as originally measured — first fix landed 2026-07-02.**
   The per-record seal ran inside a global mutex (two producers on two partitions aggregated to 4.4 MB/s:
   *negative* scaling, ~1 core ceiling). The per-batch seal is now parallelized (a reserved seq range + an
-  immutable `board_at`): a same-minute interleaved A/B on the same 4 vCPU host measured **~2.5×** (serial
+  immutable `board_at`): a same-minute interleaved A/B on the same 4 vCPU host measured a **directional ~2.5×** (serial
   1.3 → parallel 3.3 MB/s in a degraded-host window; that shared sandbox's absolute numbers drift ~4.5× across
   hours, so trust the ratio, not the absolutes — method in the bench addendum). The global broker lock still
   serializes batches; per-partition locking is the next lever.
@@ -125,6 +125,8 @@ violating record is refused at boarding and answered over the Kafka wire with a 
 librdkafka would retry forever — found by the independent audit, fixed the same day, regression-tested.)
 
 **Kafka drop-in** — an unmodified producer writes, an unmodified consumer reads back, the disk stays sealed:
+
+Build first: `cargo build --release` (Rust ≥1.90) → binary at `target/release/datarail`.
 
 ```sh
 datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
@@ -220,7 +222,7 @@ The sharp edges, before you find them:
 | [`docs/design/LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md) | Every load-bearing number → committed repro → rigor label |
 | [`docs/design/ADVERSARIAL-AUDIT.md`](docs/design/ADVERSARIAL-AUDIT.md) | Adversarial audit of our own benchmarks — corrections on the record |
 | [`docs/design/KAFKA-COMPAT.md`](docs/design/KAFKA-COMPAT.md) | Kafka compat — scope, limits, security boundary |
-| [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-INDEPENDENT-2026-07-01.md) | Independent benchmark of the real broker (the "Measured" numbers) |
+| [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-INDEPENDENT-2026-07-01.md) | Adversarial benchmark of the real broker (the "Measured" numbers) |
 | [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) | Goal lock, decisions, running log |
 | [`docs/roadmap/ISSUES.md`](docs/roadmap/ISSUES.md) | Open work as issues — leverage-ordered, with a "done so far" trail |
 | [`docs/blog/`](docs/blog/) | Engineering write-ups: negative scaling, auditing my own benchmarks, the Merkle receipt |
