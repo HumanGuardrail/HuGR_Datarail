@@ -1,140 +1,156 @@
 # Datarail
 
-**The serverless, zero-knowledge data rail.** When you have a package to deliver from one point to
-another, an ephemeral rail spawns, carries it in a **sealed vault** over the cheapest pipe available,
-confirms delivery with a cryptographic receipt, and disappears — **exactly once, with proof, and the
-infrastructure never sees what it carried.**
+[![ci](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/ci.yml/badge.svg)](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/ci.yml)
+[![librdkafka](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-librdkafka.yml/badge.svg)](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-librdkafka.yml)
+[![tls](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-tls.yml/badge.svg)](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-tls.yml)
+[![mtls](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-mtls.yml/badge.svg)](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-mtls.yml)
+[![compression](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-compression.yml/badge.svg)](https://github.com/HumanGuardrail/HuGR_Datarail/actions/workflows/kafka-broker-compression.yml)
 
-> Service-mesh reach + Kafka durability + Signal-grade end-to-end sealing — with **no broker, no
-> sidecar, and zero trust in the infrastructure.** The seal is what lets the pipe be dumb, cheap, and
-> untrusted (even an S3 bucket or a peer): nobody in the middle can open the vault.
+**An end-to-end-sealed data rail, and a Kafka-wire-compatible broker whose storage never sees plaintext.**
+Every record is sealed into a per-record vault (X25519 key-wrap, AEAD, signed); delivery carries an
+offline-verifiable Merkle receipt; an unmodified Kafka client can produce to it and read back.
 
-## Status
+*Domain vocabulary is Portuguese by design: a __cofre__ is the sealed per-record vault, its __etiqueta__ the
+authenticated envelope/header, the __lacre__ its signature seal.*
 
-**Engine + v1 product built, proven, and audited** (per THE HUGR METHOD: architecture-first →
-design-before-code → freeze rituals → fleet execution). **34 crates** · clippy
-`deny(all+pedantic)` · `forbid(unsafe)` workspace-wide (one audited shared-memory waiver in the shmem
-substrate). Honest evidence matrix — every load-bearing number → committed repro → rigor → verdict:
-[`docs/design/LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md); DoD ledger:
-[`docs/design/DOD-01.md`](docs/design/DOD-01.md).
+## Status — read this first
 
-What runs today: sealed cofres with per-cofre X25519 key-wrap + sealed-sender, an offline-verifiable
-Merkle delivery proof, effectively-once delivery, smart terminals (content-contract + dead-letter), the
-three SPEC-named substrates (**shmem · QUIC · object-store/S3**, plus TCP/UDS) behind one conformance
-harness, FASP delay-based congestion control, BLAKE3-`bao` chunk-resume, a stateless DoS cookie, the
-`Noise_KK` + SPAKE2 identity layer, the **v1 product flow — an HTTP API → sealed rail → Postgres**
-(zero-dependency, hand-rolled Postgres driver), **Kafka wire-protocol ingest** (an unmodified Kafka producer →
-sealed rail → any sink, no code change), **exactly-once delivery into Postgres across crashes** — for an
-append-ordered source (`datarail run --source-file`/replay → `--sink-postgres`, `EXACTLY-ONCE-DESIGN.md`) AND for
-an **idempotent Kafka producer** (kafka-ingest keys dedup on the producer's own `(producer_id, partition,
-sequence)`, `KAFKA-EOS-DESIGN.md`); both land records + the dedup watermark in one atomic Postgres txn so a retry
-/ replay never double-lands. HTTP (a non-stable GET) and a non-idempotent producer are honestly at-least-once.
-A **bidirectional, consumer-group-capable Kafka drop-in** (`datarail kafka-broker`): unmodified producers write and
-unmodified `subscribe()` consumers read back, with **durable provider-blind storage** (sealed on disk, un-sealed
-only at the fetch edge, survives restart), **durable consumer offsets**, **automatic group rebalance**, and
-**multi-partition** (`KAFKA-FETCH/GROUPS/REBALANCE-DESIGN.md`). And the `datarail` CLI moving real data source→sink.
+**This is a single-node prototype.** No replication, no failover, no cross-node coordination — a
+designed-ahead replication/erasure tier exists as tested library code (see the crate table), but nothing
+distributed is wired into the shipped binary. Everything below is what one process does on one box, stated at the rigor it
+was actually verified at. Where a claim is weaker than it sounds, the weaker version is the true one.
 
-**Measured headlines — same-ruler, committed CI harnesses, NOT asserted** (see the matrix):
-**~72× less RAM** than Kafka at **equal fsync durability** (n=3); **~2 ms cold-start** vs Kafka's **~5 s**
-(n=30 controlled CI) → scale-to-zero; raw throughput is an **honest TIE** (datarail's *sealed* engine ≈
-Kafka's *plaintext*). The moat is **efficiency + structural** (provider-blind, serverless, exactly-once
-with proof), not raw speed — and every claim carries its real confidence label, because a long adversarial
-audit of our own benchmarks corrected every over-claim that appeared.
+It has **two modes with two different trust models**, and they should never be conflated:
 
-## The doctrine
+- **Rail mode** (`datarail send / recv / run`): the endpoints hold the keys and seal; every pipe and store in
+  between — TCP, QUIC, shared memory, S3 — sees only ciphertext. This is the zero-knowledge claim, and it is
+  the mode where it holds.
+- **Broker mode** (`datarail kafka-broker` / `kafka-ingest`): the broker process holds all the keys, seals on
+  produce and un-seals on fetch. The on-disk log is ciphertext-only — **provider-blind storage** — but whoever
+  controls the broker process can read everything. It is encryption-at-rest done properly, not zero-knowledge.
+
+## Doctrine
 
 > **Smart sealed endpoints. Dumb cheap pipes.**
 
-All intelligence and all secrets live in a featherweight terminal at the container's edge. The rail is the
-dumbest, cheapest substrate available. Because every vault is sealed end-to-end, the pipe can be untrusted
-— including ours — and a breach yields useless ciphertext.
+All intelligence and all secrets live in a small terminal at the edge; the rail underneath can be the cheapest,
+dumbest substrate available, because a breach of the pipe yields ciphertext. In broker mode the same sealing
+buys you a disk that never holds plaintext — the running broker remains a trusted keyholder.
+
+## Measured
+
+Numbers from a benchmark of the **real `datarail kafka-broker` binary**, run by a **separate AI auditor
+(Claude), not the author**, with a real client
+(kafkacat 1.6.0 / librdkafka 1.8.0; 4 vCPU i7-9750H class, AES-NI, no VAES; 1 KiB records; fsync-before-ack defaults) —
+method and raw results in [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-INDEPENDENT-2026-07-01.md):
+
+- **Cold start: 3.0 ms median** (p90 3.7 ms, n=30) from exec to accepting connections.
+- **Memory: 3.3 MB RSS idle, 9 MB peak** through a 50,000-message produce+consume cycle. The binary is 2 MB.
+- **Integrity: 50,000 produced → 50,000 consumed, zero loss**, and the data directory grepped clean of
+  plaintext — the provider-blind property reproduced by that auditor, outside the author's own harness.
+- **Throughput: ~6 MB/s (~6,000 msg/s) per partition — and it does not scale out yet.** The per-record seal
+  runs inside a global mutex, so two producers on two partitions aggregate to 4.4 MB/s: *negative* scaling,
+  ~1 core ceiling. The seal is embarrassingly parallel; moving it outside the lock is the known,
+  highest-leverage fix, and it is planned, not done.
+
+The older headline figures in the design docs (`~72×` Kafka's RAM, throughput "tie") were measured on
+`datarail-omb-shim` — a point-to-point mover, not this broker — at a ~51 MB/s operating point, self-run, n=3
+manual dispatches. A documented adversarial self-audit already narrowed those claims once
+([`docs/design/ADVERSARIAL-AUDIT.md`](docs/design/ADVERSARIAL-AUDIT.md)); where shim numbers and product
+numbers disagree, believe the product numbers above.
+
+## What runs today
+
+Sealed cofres with per-cofre X25519 key-wrap and sealed-sender; an offline-verifiable Merkle delivery proof;
+effectively-once delivery **within a process run** (the cross-restart dedup index exists but is not wired into
+the broker, which is at-least-once across restarts); content-contract terminals with dead-lettering; three
+substrates behind one conformance harness (**shmem · QUIC · object-store/S3**, plus TCP/UDS); FASP delay-based
+congestion control with a WAN/netem harness; BLAKE3-`bao` chunk resume; a stateless DoS cookie; and a
+`Noise_KK` + SPAKE2 identity/pairing layer.
+
+Product-side: **HTTP → sealed rail → Postgres** on a zero-dependency, hand-rolled Postgres driver;
+**exactly-once into Postgres** for append-ordered sources and for idempotent Kafka producers (dedup keyed on
+the producer's own `(producer_id, partition, sequence)`, landed atomically with the records — CI-gated against
+real Postgres 16); and the **bidirectional Kafka drop-in**: unmodified producers and `subscribe()`
+consumer-groups, durable offsets, automatic rebalance, multi-partition, TLS / mTLS / SASL-PLAIN / compressed
+batches — each CI-gated against real librdkafka. Those CI runs are functional smokes, not a conformance suite.
 
 ## Try it
 
-**The v1 product — an HTTP API → Postgres, sealed end-to-end, zero-dependency** (even the Postgres driver
-is hand-rolled and provider-blind — the pipe and the database host never see plaintext):
+The example [`examples/rail.toml`](examples/rail.toml) enforces an onboarding **content contract**:
+`required_prefix = "evt:"`, `max_record_len = 4096`. Payloads below start with `evt:` for that reason. A
+violating record is refused at boarding and answered over the Kafka wire with a **non-retriable
+`INVALID_RECORD` (87)**, logged broker-side. (Until 2026-07-01 it was answered with a retriable code and
+librdkafka would retry forever — found by the independent audit, fixed the same day, regression-tested.)
 
-```sh
-# seal newline-delimited records from any HTTP endpoint into a Postgres table (at-least-once):
-datarail run examples/rail.toml \
-    --source-http https://api.example.com/events \
-    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
-# boarded → sealed cofre over the rail → COPY-landed as rows. An HTTP GET is not an append-ordered/replayable
-# stream, so this path is AT-LEAST-ONCE (no silent loss; a re-run may duplicate). For EXACTLY-ONCE, use an
-# append-ordered source (a file / replay), which lands records + a dedup watermark in one atomic Postgres txn:
-datarail run examples/rail.toml --source-file events.ndjson \
-    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
-# Re-run it (even after appending new lines) → nothing double-lands. Verified end-to-end against real Postgres 16:
-# run twice → 3 rows; append one line + re-run → 4 rows, not 7. (--at-least-once opts out.)
-```
-
-**Drop-in for Kafka producers** — point an existing producer at datarail, unchanged; it seals every record:
-
-```sh
-datarail kafka-ingest examples/rail.toml --advertised <reachable-host> \
-    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data"
-# an UNMODIFIED Kafka producer (kcat/librdkafka/...) → datarail seals → Postgres. Verified e2e in CI.
-# EXACTLY-ONCE for an IDEMPOTENT producer (enable.idempotence=true): datarail honors InitProducerId and keys
-# dedup on the producer's own (producer_id, partition, sequence), stored transactionally in Postgres — a
-# producer retry / ingest restart never double-lands. A non-idempotent producer is at-least-once (Kafka parity).
-```
-
-**Bidirectional drop-in** — an unmodified producer writes AND an unmodified consumer reads back, with datarail's
-storage holding only **sealed** records (un-sealed only at the fetch edge — a Kafka broker whose storage is
-provider-blind):
+**Kafka drop-in** — an unmodified producer writes, an unmodified consumer reads back, the disk stays sealed:
 
 ```sh
 datarail kafka-broker examples/rail.toml --advertised <reachable-host> \
     --data-dir ./datarail-kafka-data --partitions 3
-# ...and optionally TLS-encrypt the hop (build with `--features tls`):
-#   datarail kafka-broker examples/rail.toml --advertised localhost --tls --tls-cert cert.pem --tls-key key.pem
-# (a real librdkafka client with security.protocol=SSL produces+consumes over TLSv1.3 — proven in CI.)
-# A full consumer-group-capable Kafka drop-in: Produce + Fetch + ListOffsets, durable consumer offsets
-# (OffsetCommit/OffsetFetch/FindCoordinator), automatic group rebalance (JoinGroup/SyncGroup/Heartbeat) for
-# subscribe() consumers, and multi-partition (each an independent durable log). Storage is DURABLE
-# (fsync-before-ack) and provider-blind: verified e2e — produce 3 → KILL the broker → restart → fetch back the
-# original plaintext, while the on-disk cofres are ciphertext; a committed offset survives a broker restart; two
-# consumers auto-share one generation. PROVEN against the REAL Kafka client (kcat/librdkafka in CI,
-# `kafka-broker-librdkafka.yml`): a real producer + a real simple consumer + a real subscribe() CONSUMER GROUP
-# round-trip, with the on-disk store asserted ciphertext-only — not just our own wire tests. Plus a TRANSACTIONAL
-# producer (buffer-until-commit: atomic multi-partition
-# commit + offsets-in-txn, abort hides records, stale-epoch zombies fenced — audited, `KAFKA-TXN-DESIGN.md`; scope:
-# one producer per partition/txn). Hop (1) is optionally TLS-encrypted (`--tls`, `--features tls`; server-side
-# termination, proven vs real librdkafka over TLS). COMPRESSED producers work too (`--features compression`:
-# gzip/lz4/zstd/snappy, decompressed broker-side + sealed — proven vs real librdkafka in CI). And SASL/PLAIN auth
-# (`--sasl-user`/`--sasl-pass`; a client must authenticate before producing — proven vs real librdkafka; pair with
-# `--tls` for SASL_SSL) AND mutual TLS (`--tls-client-ca`; the broker requires a CA-signed client cert) — both
-# proven vs real librdkafka in CI. (Single-node; SCRAM + cert→ACL tracked.)
+# produce/consume with any Kafka client, e.g.:
+#   printf 'evt:hello\n' | kcat -P -b <host>:9092 -t demo
+#   kcat -C -b <host>:9092 -t demo -o beginning -e
+# Durable (fsync-before-ack): produce → restart the broker → fetch returns the records; committed consumer
+# offsets survive restart; on-disk cofres are ciphertext. (Restart survival is test-verified via store
+# reopen; a hard kill -9 / power-loss harness is future work.) Optional hop security, each CI-gated vs real
+# librdkafka: --tls / --tls-client-ca (mTLS) / --sasl-user (SASL/PLAIN; pair with --tls for SASL_SSL),
+# compressed producer batches behind --features compression. Transactional producers work in a
+# buffer-until-commit model (scope and crash caveats: docs/design/KAFKA-TXN-DESIGN.md and Known limitations).
 ```
 
-Lower-level rehearsals (files, two-process TCP, identity pairing):
+**Kafka ingest → Postgres** — same drop-in surface, landing in a database instead of a log:
 
 ```sh
-# (toolchain note: run cargo from the stable toolchain on PATH if the rustup proxy is unavailable)
-cargo run -p datarail-cli -- validate examples/rail.toml          # check a route spec
-cargo run -p datarail-cli -- keygen                               # mint an Ed25519 signing identity
-printf 'evt:a\nevt:b\nevt:c\n' > /tmp/in.txt
-cargo run -p datarail-cli -- run examples/rail.toml \
-    --source-file /tmp/in.txt --sink-file /tmp/out.txt --watch    # board → sealed rail → offload, live
-cargo run -p datarail-cli -- replay examples/rail.toml 1..3 --source-file /tmp/in.txt
-cargo run -p datarail-cli -- pair                                 # F2/F3 identity layer, local rehearsal
-# real two-process F3 pairing over a short code (two terminals): --listen on one, --connect on the other:
-datarail pair --listen 127.0.0.1:7000 --code 0x<shared-16-byte-code>
-datarail pair --connect 127.0.0.1:7000 --code 0x<shared-16-byte-code>
-
-# genuine TWO-PROCESS transfer over a real TCP socket (run in two terminals / hosts):
-datarail recv examples/rail.toml --listen 127.0.0.1:9000 --sink-file /tmp/out.txt --count 1   # destination
-datarail send examples/rail.toml --connect 127.0.0.1:9000 evt:hello evt:world                 # source
-
-# ...and optionally wrap that hop in a Noise_KK channel (mutual auth + on-wire metadata encryption, F2):
-datarail keygen --noise                                                # mint each endpoint's static keypair
-datarail recv examples/rail.toml --noise-secret 0x<B-sec> --peer-public 0x<A-pub> --sink-file /tmp/out.txt
-datarail send examples/rail.toml --connect <addr> --noise-secret 0x<A-sec> --peer-public 0x<B-pub> evt:hi
+datarail kafka-ingest examples/rail.toml --advertised <reachable-host> \
+    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data"
+# EXACTLY-ONCE for an idempotent producer (enable.idempotence=true): dedup watermark lands in the same
+# Postgres transaction as the records, so producer retries and ingest restarts never double-land.
+# A non-idempotent producer is at-least-once (Kafka parity).
 ```
 
-A route is one declarative `rail.toml` (source + onboarding rules + destination + offloading rules +
-`substrate` + keys-ref). See [`examples/rail.toml`](examples/rail.toml). The `substrate` field selects the
-real transport: `auto`/`loopback` · `tcp` · `shmem` · `s3` · `quic` (the last behind `--features quic`).
+**Native rail** (no Kafka anywhere) — file/HTTP sources, file/Postgres sinks, real two-process TCP, optional
+Noise channel:
+
+```sh
+cargo run -p datarail-cli -- validate examples/rail.toml
+printf 'evt:a\nevt:b\nevt:c\n' > /tmp/in.txt
+cargo run -p datarail-cli -- run examples/rail.toml --source-file /tmp/in.txt --sink-file /tmp/out.txt
+# exactly-once into Postgres from an append-ordered source (re-runs never double-land; --at-least-once opts out):
+datarail run examples/rail.toml --source-file events.ndjson \
+    --sink-postgres "host=db,user=rail,db=events,table=raw,column=data,password=secret"
+# two processes over a real socket:
+datarail recv examples/rail.toml --listen 127.0.0.1:9000 --sink-file /tmp/out.txt --count 1
+datarail send examples/rail.toml --connect 127.0.0.1:9000 evt:hello evt:world
+# wrap the hop in Noise_KK (mutual auth + on-wire metadata encryption); pair identities over a short code:
+datarail keygen --noise
+datarail pair --listen 127.0.0.1:7000 --code 0x<shared-16-byte-code>   # (and --connect on the other side)
+```
+
+A route is one declarative `rail.toml`: source, onboarding contract, destination, offloading contract,
+`substrate` (`auto`/`loopback` · `tcp` · `shmem` · `s3` · `quic` behind `--features quic`), keys. The example file carries
+raw demo secrets by design; real deployments should reference keys, not inline them.
+
+## Known limitations
+
+The sharp edges, before you find them:
+
+- **Single-node.** No replication or failover of any kind; this is the project's largest open front.
+- **Throughput ceiling by design flaw:** the seal runs inside a global mutex — negative multi-producer scaling
+  (measured, see above) until the seal is parallelized.
+- **Transactions are not crash-atomic across partitions:** the txn coordinator is in-memory; a crash mid-commit
+  can land a partial multi-partition transaction. Documented in
+  [`docs/design/KAFKA-TXN-DESIGN.md`](docs/design/KAFKA-TXN-DESIGN.md); a durable txn log is future work.
+- **Broker restarts are at-least-once** for non-idempotent producers (the general dedup index is not wired in).
+- **QUIC substrate ships dev-only embedded certs and the client accepts any server cert** — an active MITM on
+  that hop can read envelope (*etiqueta*) metadata — route/stream ids, sequence, timing — never payloads.
+  Dev/test only; documented in the crate.
+- **The hand-rolled Postgres driver speaks trust/cleartext/MD5 only** — it will not authenticate against a
+  default PostgreSQL 14+ (SCRAM). Tracked.
+- **`acks=0` is still answered** (a real broker stays silent). Minor, tracked.
+- **Self-audited, not third-party audited.** "Fuzz" in this repo means deterministic property tests, not
+  coverage-guided fuzzing; "chaos" means in-process fault injection, not a distributed harness. The crypto uses
+  vetted crates (dalek, aes-gcm-siv, snow, spake2, blake3) but the construction has not had external review.
 
 ## Crates
 
@@ -143,18 +159,35 @@ real transport: `auto`/`loopback` · `tcp` · `shmem` · `s3` · `quic` (the las
 | Core seam | `datarail-core` (types/traits) · `datarail-crypto` · `datarail-cofre` (wire + seal/verify) |
 | Proof & once | `datarail-manifest` (Merkle proof + `bao` chunk-resume) · `datarail-once` (effectively-once) |
 | Rail | `datarail-rail` (substrate trait + loopback/resumable/UDS/TCP + WAN harness + FASP CC + DoS cookie) · `datarail-substrate-{shmem,quic,objectstore}` |
-| Terminals & identity | `datarail-terminal` (contract/seal/dead-letter/sealed-sender) · `datarail-identity` (Noise_KK + SPAKE2) · `datarail-connectors` |
+| Terminals & identity | `datarail-terminal` (contract/seal/dead-letter/sealed-sender) · `datarail-identity` (Noise_KK + SPAKE2) |
 | Surface & proof | `datarail-spec` (`rail.toml`) · `datarail-cli` (`datarail`) · `datarail-acceptance` · `datarail-bench` |
-| Connectors & compat | `datarail-connectors` (HTTP · Postgres · webhook · file) · `datarail-kafka` (Kafka wire-protocol ingest) |
+| Connectors & compat | `datarail-connectors` (HTTP · Postgres · webhook · file) · `datarail-kafka` (Kafka wire protocol + broker serve loop) |
+| Designed-ahead (tested library code, **not wired into the shipped CLI**) | `datarail-broker` · `datarail-topic` · `datarail-replicated-topic` · `datarail-replication` · `datarail-erasure` · `datarail-tieredlog` · `datarail-blobstore` · `datarail-netblob` · `datarail-keyrouter` |
+| Harnesses | `datarail-system` · `datarail-stress` · `datarail-fuzz` · `datarail-omb-shim` · `datarail-metrics` |
 
 ## Map
 
 | Doc | What |
 |---|---|
-| [`docs/PRODUCT.md`](docs/PRODUCT.md) | What it is and why it exists (the moat) |
-| [`docs/WORKING_BACKWARDS.md`](docs/WORKING_BACKWARDS.md) | The launch announcement, written first |
+| [`docs/PRODUCT.md`](docs/PRODUCT.md) | What it is and why it exists |
 | [`docs/DECOMPOSITION.md`](docs/DECOMPOSITION.md) | Capabilities, acceptance criteria, invariants, milestones |
-| [`docs/design/00-CONSTITUTION.md`](docs/design/00-CONSTITUTION.md) | The machine shape (CAST) + the named invariants + the Craft Charter |
-| [`docs/design/DOD-01.md`](docs/design/DOD-01.md) | Definition-of-Done ledger — honest PROVEN/DIRECTIONAL/PENDING per AC/gate/invariant |
-| [`docs/design/KAFKA-COMPAT.md`](docs/design/KAFKA-COMPAT.md) | Kafka wire-protocol ingest — honest scope, limits, and the security boundary |
-| [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) | Single source of truth — goal lock, decisions, running log |
+| [`docs/design/00-CONSTITUTION.md`](docs/design/00-CONSTITUTION.md) | The machine shape + named invariants |
+| [`docs/design/DOD-01.md`](docs/design/DOD-01.md) | Definition-of-Done ledger — PROVEN / DIRECTIONAL / PENDING per gate |
+| [`docs/design/LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md) | Every load-bearing number → committed repro → rigor label |
+| [`docs/design/ADVERSARIAL-AUDIT.md`](docs/design/ADVERSARIAL-AUDIT.md) | Adversarial audit of our own benchmarks — corrections on the record |
+| [`docs/design/KAFKA-COMPAT.md`](docs/design/KAFKA-COMPAT.md) | Kafka compat — scope, limits, security boundary |
+| [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-INDEPENDENT-2026-07-01.md) | Independent benchmark of the real broker (the "Measured" numbers) |
+| [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) | Goal lock, decisions, running log |
+
+## How this was built
+
+Solo, in 8 days, ~30K LOC across 34 crates (clippy `deny(all + pedantic)`, `forbid(unsafe)` workspace-wide;
+one waiver crate — shmem — with two audited `unsafe` sites) — using an AI-fleet execution model with adversarial self-audit loops: every headline
+claim was handed to skeptics instructed to break it, and the corrections stayed in the record. That process is
+as much the point of this repository as the artifact is; the audit trail
+([`ADVERSARIAL-AUDIT.md`](docs/design/ADVERSARIAL-AUDIT.md), [`LASTRO-MATRIX.md`](docs/design/LASTRO-MATRIX.md))
+is why this README can afford to be specific.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
