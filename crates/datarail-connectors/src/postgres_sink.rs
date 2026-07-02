@@ -888,7 +888,11 @@ mod scram {
 
         /// Lowercase hex helper for asserting against the RFC's hex-quoted intermediate values.
         fn hex(bytes: &[u8]) -> String {
-            bytes.iter().map(|b| format!("{b:02x}")).collect()
+            use std::fmt::Write as _;
+            bytes.iter().fold(String::new(), |mut s, b| {
+                let _ = write!(s, "{b:02x}");
+                s
+            })
         }
 
         #[test]
@@ -1036,7 +1040,7 @@ mod scram {
             let client_first = b"n,,n=,r=abc";
             let got = sasl_initial_response(client_first);
             let mut want = b"SCRAM-SHA-256\0".to_vec();
-            want.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+            want.extend_from_slice(&i32::try_from(client_first.len()).unwrap().to_be_bytes());
             want.extend_from_slice(client_first);
             assert_eq!(got, want);
         }
