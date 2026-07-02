@@ -114,7 +114,8 @@ batches — each CI-gated against real librdkafka. Those CI runs are functional 
 
 ## Try it
 
-Or just run the 60-second proof: `./scripts/demo.sh` (builds, starts the broker, round-trips a real client if kcat is present, and greps the disk to show it's ciphertext).
+Or just run the 60-second proof: `./scripts/demo.sh` (builds, starts the broker, round-trips a real client if kcat is present, and greps the disk to show it's ciphertext). A recording of that run is in
+[`docs/blog/demo.cast`](docs/blog/demo.cast) (asciinema: `asciinema play docs/blog/demo.cast`).
 
 The example [`examples/rail.toml`](examples/rail.toml) enforces an onboarding **content contract**:
 `required_prefix = "evt:"`, `max_record_len = 4096`. Payloads below start with `evt:` for that reason. A
@@ -220,6 +221,8 @@ The sharp edges, before you find them:
 | [`docs/design/KAFKA-COMPAT.md`](docs/design/KAFKA-COMPAT.md) | Kafka compat — scope, limits, security boundary |
 | [`docs/BENCH-INDEPENDENT-2026-07-01.md`](docs/BENCH-INDEPENDENT-2026-07-01.md) | Independent benchmark of the real broker (the "Measured" numbers) |
 | [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) | Goal lock, decisions, running log |
+| [`docs/roadmap/ISSUES.md`](docs/roadmap/ISSUES.md) | Open work as issues — leverage-ordered, with a "done so far" trail |
+| [`docs/blog/`](docs/blog/) | Engineering write-ups: negative scaling, auditing my own benchmarks, the Merkle receipt |
 | [`SECURITY.md`](SECURITY.md) | Threat model, crypto inventory, reporting |
 
 ## How this was built
