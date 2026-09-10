@@ -528,7 +528,7 @@ mod scram {
     /// a server asking for `i < 1` is malformed.
     const MIN_ITERATIONS: u32 = 1;
     /// Upper bound on the iteration count — the server dictates `i`, and PBKDF2 does `i` HMAC rounds, so an
-    /// absurd `i` is a cheap DoS the server could inflict on the client. Cap it well above any real config.
+    /// absurd `i` is a cheap `DoS` the server could inflict on the client. Cap it well above any real config.
     const MAX_ITERATIONS: u32 = 1_000_000;
 
     /// Drive the full `SCRAM-SHA-256` exchange. `mechanisms` is the NUL-separated mechanism list from the
@@ -636,7 +636,7 @@ mod scram {
     }
 
     /// Read a backend `'R'` message and require it to be an `Authentication*` of the given SASL `code`
-    /// (11 = SASLContinue, 12 = SASLFinal), returning the SASL payload (body after the 4-byte code). An
+    /// (11 = `SASLContinue`, 12 = `SASLFinal`), returning the SASL payload (body after the 4-byte code). An
     /// `ErrorResponse` ('E') becomes the backend error; anything else is a protocol violation.
     fn read_sasl_message(stream: &mut impl Read, code: i32) -> io::Result<Vec<u8>> {
         let (tag, body) = read_msg(stream)?;
@@ -835,15 +835,15 @@ mod scram {
             acc <<= 6 * (4 - chunk.len());
             match chunk.len() {
                 4 => {
-                    out.push((acc >> 16) as u8);
-                    out.push((acc >> 8) as u8);
-                    out.push(acc as u8);
+                    out.push(u8::try_from((acc >> 16) & 0xFF).unwrap());
+                    out.push(u8::try_from((acc >> 8) & 0xFF).unwrap());
+                    out.push(u8::try_from(acc & 0xFF).unwrap());
                 }
                 3 => {
-                    out.push((acc >> 16) as u8);
-                    out.push((acc >> 8) as u8);
+                    out.push(u8::try_from((acc >> 16) & 0xFF).unwrap());
+                    out.push(u8::try_from((acc >> 8) & 0xFF).unwrap());
                 }
-                2 => out.push((acc >> 16) as u8),
+                2 => out.push(u8::try_from((acc >> 16) & 0xFF).unwrap()),
                 _ => return None,
             }
         }
@@ -868,6 +868,7 @@ mod scram {
             base64_decode, base64_encode, constant_time_eq, hmac_sha256, parse_server_final,
             parse_server_first, pbkdf2_hmac_sha256, require_plain_scram, sasl_initial_response, sha256,
         };
+        use std::fmt::Write;
 
         // RFC 7677 §3 worked example: user="user", password="pencil", client nonce "rOprNGfwEbeRWgbNEkqO",
         // server-appended nonce so full nonce "rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0",
@@ -883,7 +884,11 @@ mod scram {
 
         /// Lowercase hex helper for asserting against the RFC's hex-quoted intermediate values.
         fn hex(bytes: &[u8]) -> String {
-            bytes.iter().map(|b| format!("{b:02x}")).collect()
+            let mut s = String::with_capacity(bytes.len() * 2);
+            for &b in bytes {
+                write!(&mut s, "{b:02x}").unwrap();
+            }
+            s
         }
 
         #[test]
@@ -1031,7 +1036,7 @@ mod scram {
             let client_first = b"n,,n=,r=abc";
             let got = sasl_initial_response(client_first);
             let mut want = b"SCRAM-SHA-256\0".to_vec();
-            want.extend_from_slice(&(client_first.len() as i32).to_be_bytes());
+            want.extend_from_slice(&i32::try_from(client_first.len()).unwrap().to_be_bytes());
             want.extend_from_slice(client_first);
             assert_eq!(got, want);
         }
@@ -1178,10 +1183,10 @@ fn md5(input: &[u8]) -> [u8; 16] {
     let mut h2: u32 = 0x98ba_dcfe;
     let mut h3: u32 = 0x1032_5476;
 
-    for chunk in msg.chunks_exact(64) {
+    for chunk in msg.as_chunks::<64>().0 {
         let mut words = [0u32; 16];
-        for (word, bytes) in words.iter_mut().zip(chunk.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]));
+        for (word, bytes) in words.iter_mut().zip(chunk.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*bytes);
         }
 
         let mut aa = h0;
@@ -1220,7 +1225,7 @@ fn md5(input: &[u8]) -> [u8; 16] {
     }
 
     let mut out = [0u8; 16];
-    for (dst, val) in out.chunks_exact_mut(4).zip([h0, h1, h2, h3]) {
+    for (dst, val) in out.as_chunks_mut::<4>().0.iter_mut().zip([h0, h1, h2, h3]) {
         dst.copy_from_slice(&val.to_le_bytes());
     }
     out

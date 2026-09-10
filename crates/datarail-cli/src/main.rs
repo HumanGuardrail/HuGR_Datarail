@@ -1036,7 +1036,7 @@ struct BrokerInner {
     src: SourceTerminal,
     dst: DestTerminal,
     /// The onboarding content contract, kept for BUFFER-time enforcement on the transactional path: a violating
-    /// record must fail its own ProduceResponse as non-retriable INVALID_RECORD (Kafka semantics), never surface
+    /// record must fail its own `ProduceResponse` as non-retriable `INVALID_RECORD` (Kafka semantics), never surface
     /// at `EndTxn` — where the only honest answer is a retriable code and the client would retry forever.
     onboarding: datarail_terminal::ContentContract,
     /// One durable sealed log per `(topic, partition)`, opened/recovered lazily on first access from `data_dir`.
@@ -1133,9 +1133,9 @@ impl BrokerInner {
 /// per-cofre X25519 ephemeral + data key from the per-thread CSPRNG, so parallelism never shares key material.
 ///
 /// # Errors
-/// `InvalidData` for a contract violation (→ INVALID_RECORD 87, non-retriable — pre-checked by the caller, but
-/// mapped here too); any other seal failure as `Other` (→ KAFKA_STORAGE_ERROR 56, retriable). The extreme
-/// `BatchTooLarge` framing edge (>u32) also lands on 56 today — tracked for a MESSAGE_TOO_LARGE (10) mapping.
+/// `InvalidData` for a contract violation (→ `INVALID_RECORD` 87, non-retriable — pre-checked by the caller, but
+/// mapped here too); any other seal failure as `Other` (→ `KAFKA_STORAGE_ERROR` 56, retriable). The extreme
+/// `BatchTooLarge` framing edge (>u32) also lands on 56 today — tracked for a `MESSAGE_TOO_LARGE` (10) mapping.
 fn seal_batch(
     src: &SourceTerminal,
     topic: &str,
@@ -1298,22 +1298,21 @@ impl datarail_kafka::serve::KafkaBroker for KafkaBrokerStore {
         let mut out = Vec::new();
         for (i, bytes) in sealed.iter().enumerate() {
             let opened = datarail_cofre::decode(bytes).ok().and_then(|cofre| inner.dst.open(&cofre));
-            match opened {
-                Some(records) => out.extend(records),
-                None => {
-                    let bad = offset.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
-                    eprintln!(
-                        "kafka: fetch hit an unreadable sealed record topic={topic} partition={partition} \
-                         offset={bad} — halting the batch at the corruption point (offsets never renumber)"
-                    );
-                    if i == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("unreadable sealed record at offset {bad} (store corruption)"),
-                        ));
-                    }
-                    break;
+            if let Some(records) = opened {
+                out.extend(records);
+            } else {
+                let bad = offset.saturating_add(i64::try_from(i).unwrap_or(i64::MAX));
+                eprintln!(
+                    "kafka: fetch hit an unreadable sealed record topic={topic} partition={partition} \
+                     offset={bad} — halting the batch at the corruption point (offsets never renumber)"
+                );
+                if i == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unreadable sealed record at offset {bad} (store corruption)"),
+                    ));
                 }
+                break;
             }
         }
         Ok(out)

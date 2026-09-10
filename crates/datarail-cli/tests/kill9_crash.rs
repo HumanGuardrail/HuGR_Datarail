@@ -82,7 +82,7 @@ fn produce_req(correlation_id: i32, topic: &str, values: &[&[u8]]) -> Vec<u8> {
     Writer::frame(&w.into_bytes())
 }
 
-/// Parse a Produce v7 response payload → (base_offset, error_code) of its single topic/partition.
+/// Parse a Produce v7 response payload → (`base_offset`, `error_code`) of its single topic/partition.
 fn produce_ack(resp: &[u8]) -> (i64, i16) {
     let mut r = Reader::new(resp);
     let _corr = r.int32().unwrap();
@@ -183,6 +183,9 @@ fn spawn_broker(rail: &std::path::Path, data_dir: &std::path::Path) -> (Daemon, 
     (daemon, stream)
 }
 
+const ROUNDS: usize = 4;
+const BATCHES_PER_ROUND: usize = 3;
+
 #[test]
 fn every_acked_record_survives_repeated_kill_minus_9() {
     let rail = std::env::temp_dir().join(format!("kill9-{}.toml", std::process::id()));
@@ -202,15 +205,14 @@ fn every_acked_record_survives_repeated_kill_minus_9() {
          tenant_secret = \"0x5555555555555555555555555555555555555555555555555555555555555555\"\n",
     )
     .unwrap();
-    let data_dir = std::env::temp_dir().join(format!("kill9-data-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&data_dir);
 
     // Ledger of the harness's contract: every value the broker ACKED, at its acked offset.
     let mut acked: Vec<(i64, Vec<u8>)> = Vec::new();
     let mut corr = 0i32;
 
-    const ROUNDS: usize = 4;
-    const BATCHES_PER_ROUND: usize = 3;
+    let data_dir = std::env::temp_dir().join(format!("kill9-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+
     for round in 0..ROUNDS {
         let (mut daemon, mut stream) = spawn_broker(&rail, &data_dir);
 

@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-acceptance"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -308,7 +308,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-bench"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -319,11 +319,11 @@ dependencies = [
 
 [[package]]
 name = "datarail-blobstore"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "datarail-broker"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-offsets",
  "datarail-topic",
@@ -331,7 +331,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-connectors",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-cofre"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
@@ -362,15 +362,18 @@ dependencies = [
 
 [[package]]
 name = "datarail-connectors"
-version = "0.0.0"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "datarail-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "datarail-crypto"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -384,11 +387,11 @@ dependencies = [
 
 [[package]]
 name = "datarail-erasure"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "datarail-fuzz"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-blobstore",
  "datarail-broker",
@@ -401,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-identity"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -414,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-kafka"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "lz4_flex",
@@ -424,11 +427,11 @@ dependencies = [
 
 [[package]]
 name = "datarail-keyrouter"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "datarail-manifest"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
@@ -436,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-metrics"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
@@ -446,18 +449,18 @@ dependencies = [
 
 [[package]]
 name = "datarail-netblob"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-blobstore",
 ]
 
 [[package]]
 name = "datarail-offsets"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "datarail-omb-shim"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
@@ -471,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-once"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
@@ -480,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-rail"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -489,11 +492,11 @@ dependencies = [
 
 [[package]]
 name = "datarail-replaylog"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "datarail-replicated-topic"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-blobstore",
  "datarail-replication",
@@ -502,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-replication"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-blobstore",
  "datarail-erasure",
@@ -510,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-spec"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-core",
  "datarail-crypto",
@@ -519,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-stress"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -532,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-substrate-objectstore"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -541,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-substrate-quic"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -553,7 +556,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-substrate-shmem"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -563,7 +566,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-substrate-wal"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -572,7 +575,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-system"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-blobstore",
  "datarail-broker",
@@ -586,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "datarail-terminal"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-cofre",
  "datarail-core",
@@ -598,14 +601,14 @@ dependencies = [
 
 [[package]]
 name = "datarail-tieredlog"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-blobstore",
 ]
 
 [[package]]
 name = "datarail-topic"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "datarail-keyrouter",
  "datarail-replaylog",

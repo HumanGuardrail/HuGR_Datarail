@@ -445,7 +445,6 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
     txn: &TxnCoordinator,
     creds: Option<&SaslCreds>,
 ) -> io::Result<()> {
-    // SASL off (no configured credential) → authenticated from the start = today's behavior, byte-identical.
     let mut authenticated = creds.is_none();
     while let Some(frame) = read_frame(&mut stream)? {
         let mut reader = Reader::new(&frame);
@@ -456,7 +455,6 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
         if request_is_flexible(api_key, api_version) {
             reader.skip_tagged_fields()?;
         }
-        // SASL handshake/auth APIs are handled here (and update `authenticated`); a failed auth closes the conn.
         match handle_sasl(api_key, api_version, correlation_id, &mut reader, creds, &mut authenticated)? {
             SaslOutcome::Reply(r) => {
                 stream.write_all(&Writer::frame(&r))?;
@@ -470,99 +468,106 @@ fn handle_broker_connection<S: Read + Write, B: KafkaBroker>(
             }
             SaslOutcome::Pass => {}
         }
-        // Pre-auth gating: until authenticated, only ApiVersions (and the SASL APIs, handled above) are served;
-        // any other API closes the connection (a SASL client always authenticates before producing).
         if !authenticated && api_key != API_VERSIONS {
             return Ok(());
         }
-        // Set by the acks=0 produce arm to suppress the response write: Kafka fire-and-forget produce gets NO
-        // response frame (a response would desynchronize the client's correlation-id stream). Everything else
-        // answers normally; the connection keeps serving the next request either way.
-        let mut suppress_response = false;
-        let response = match api_key {
-            API_VERSIONS => api_versions_response(api_version, correlation_id),
-            API_METADATA => {
-                let topics = parse_metadata_topics(&mut reader)?;
-                metadata_response(api_version, correlation_id, ctx.host, ctx.port, &topics, ctx.partitions)
-            }
-            API_INIT_PRODUCER_ID => {
-                // A transactional_id in the body → the txn coordinator (epoch-fenced); else a bare idempotent id.
-                if let Some(tid) = parse_init_producer_id(&mut reader)? {
-                    let (pid, epoch) = txn.init_producer_id(&tid);
-                    // The epoch bump aborted any in-flight txn at the coordinator; the producer_id is REUSED, so
-                    // also drop any buffers left from the prior incarnation (audit: re-init orphaned the store
-                    // buffers → an old-epoch record could be committed by the new txn).
-                    broker.abort_txn(pid, epoch, &[]);
-                    txn_init_producer_id_response(correlation_id, pid, epoch)
-                } else {
-                    let pid = ctx.next_producer_id.fetch_add(1, Ordering::Relaxed);
-                    init_producer_id_response(correlation_id, pid)
-                }
-            }
-            API_PRODUCE => {
-                let ProducedRequest { acks, topics } = parse_produce(&mut reader, api_version)?;
-                // Land (seal+store or buffer) every partition regardless of acks — the records must be durable.
-                let results = produce_results(broker, txn, &topics);
-                // acks=0 ⇒ fire-and-forget: still build the frame (so offset/state logic is identical) but mark
-                // it suppressed so the write below is skipped entirely.
-                suppress_response = acks == 0;
-                produce_response(api_version, correlation_id, &topics, &mut |name, part, _count| {
-                    results.get(&(name.to_owned(), part)).copied().unwrap_or((0, 0))
-                })
-            }
-            API_FETCH => {
-                let topics = parse_fetch(&mut reader, api_version)?;
-                let out = fetch_results(broker, &topics);
-                fetch_response(api_version, correlation_id, &out)
-            }
-            API_LIST_OFFSETS => {
-                let topics = parse_list_offsets(&mut reader, api_version)?;
-                let mut out = Vec::with_capacity(topics.len());
-                for t in &topics {
-                    let mut parts = Vec::with_capacity(t.partitions.len());
-                    for p in &t.partitions {
-                        let (earliest, latest) = broker.bounds(&t.name, p.partition);
-                        let offset = if p.timestamp == -2 { earliest } else { latest };
-                        parts.push(ListOffsetResult { partition: p.partition, offset });
-                    }
-                    out.push(ListOffsetTopicResult { name: t.name.clone(), partitions: parts });
-                }
-                list_offsets_response(api_version, correlation_id, &out)
-            }
-            API_FIND_COORDINATOR => {
-                let _group = parse_find_coordinator(&mut reader, api_version)?;
-                // Single-node: THIS broker is the coordinator (node 0, the advertised host/port).
-                find_coordinator_response(api_version, correlation_id, 0, ctx.host, ctx.port)
-            }
-            API_OFFSET_COMMIT => {
-                let req = parse_offset_commit(&mut reader, api_version)?;
-                let out = offset_commit_results(broker, &req);
-                offset_commit_response(correlation_id, &out)
-            }
-            API_OFFSET_FETCH => {
-                let req = parse_offset_fetch(&mut reader, api_version)?;
-                let out = offset_fetch_results(broker, &req);
-                offset_fetch_response(api_version, correlation_id, &out)
-            }
-            other => {
-                if let Some(resp) = dispatch_group_api(other, api_version, correlation_id, &mut reader, coordinator)? {
-                    resp
-                } else if let Some(resp) =
-                    dispatch_txn_api(other, api_version, correlation_id, &mut reader, txn, broker)?
-                {
-                    resp
-                } else {
-                    return Err(io::Error::other(format!("unsupported Kafka api_key {other}")));
-                }
-            }
-        };
-        // Skip the write for a silent (acks=0) produce; the loop reads the next framed request as normal.
-        if !suppress_response {
+        let bctx = BrokerReqCtx { broker, ctx, coordinator, txn };
+        let (response, suppress) = handle_broker_request(
+            api_key, api_version, correlation_id, &mut reader, &bctx,
+        )?;
+        if !suppress {
             stream.write_all(&Writer::frame(&response))?;
             stream.flush()?;
         }
     }
     Ok(())
+}
+
+/// Handle a single broker request (post-SASL), returning the response bytes and whether to suppress the write
+/// (true only for acks=0 produce).
+struct BrokerReqCtx<'a, B: KafkaBroker> {
+    broker: &'a B,
+    ctx: &'a BrokerCtx<'a>,
+    coordinator: &'a GroupCoordinator,
+    txn: &'a TxnCoordinator,
+}
+
+fn handle_broker_request<B: KafkaBroker>(
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+    reader: &mut Reader<'_>,
+    bctx: &BrokerReqCtx<'_, B>,
+) -> io::Result<(Vec<u8>, bool)> {
+    let mut suppress_response = false;
+    let response = match api_key {
+        API_VERSIONS => api_versions_response(api_version, correlation_id),
+        API_METADATA => {
+            let topics = parse_metadata_topics(reader)?;
+            metadata_response(api_version, correlation_id, bctx.ctx.host, bctx.ctx.port, &topics, bctx.ctx.partitions)
+        }
+        API_INIT_PRODUCER_ID => {
+            if let Some(tid) = parse_init_producer_id(reader)? {
+                let (pid, epoch) = bctx.txn.init_producer_id(&tid);
+                bctx.broker.abort_txn(pid, epoch, &[]);
+                txn_init_producer_id_response(correlation_id, pid, epoch)
+            } else {
+                let pid = bctx.ctx.next_producer_id.fetch_add(1, Ordering::Relaxed);
+                init_producer_id_response(correlation_id, pid)
+            }
+        }
+        API_PRODUCE => {
+            let ProducedRequest { acks, topics } = parse_produce(reader, api_version)?;
+            let results = produce_results(bctx.broker, bctx.txn, &topics);
+            suppress_response = acks == 0;
+            produce_response(api_version, correlation_id, &topics, &mut |name, part, _count| {
+                results.get(&(name.to_owned(), part)).copied().unwrap_or((0, 0))
+            })
+        }
+        API_FETCH => {
+            let topics = parse_fetch(reader, api_version)?;
+            let out = fetch_results(bctx.broker, &topics);
+            fetch_response(api_version, correlation_id, &out)
+        }
+        API_LIST_OFFSETS => {
+            let topics = parse_list_offsets(reader, api_version)?;
+            let mut out = Vec::with_capacity(topics.len());
+            for t in &topics {
+                let mut parts = Vec::with_capacity(t.partitions.len());
+                for p in &t.partitions {
+                    let (earliest, latest) = bctx.broker.bounds(&t.name, p.partition);
+                    let offset = if p.timestamp == -2 { earliest } else { latest };
+                    parts.push(ListOffsetResult { partition: p.partition, offset });
+                }
+                out.push(ListOffsetTopicResult { name: t.name.clone(), partitions: parts });
+            }
+            list_offsets_response(api_version, correlation_id, &out)
+        }
+        API_FIND_COORDINATOR => {
+            let _group = parse_find_coordinator(reader, api_version)?;
+            find_coordinator_response(api_version, correlation_id, 0, bctx.ctx.host, bctx.ctx.port)
+        }
+        API_OFFSET_COMMIT => {
+            let req = parse_offset_commit(reader, api_version)?;
+            let out = offset_commit_results(bctx.broker, &req);
+            offset_commit_response(correlation_id, &out)
+        }
+        API_OFFSET_FETCH => {
+            let req = parse_offset_fetch(reader, api_version)?;
+            let out = offset_fetch_results(bctx.broker, &req);
+            offset_fetch_response(api_version, correlation_id, &out)
+        }
+        other => {
+            if let Some(resp) = dispatch_group_api(other, api_version, correlation_id, reader, bctx.coordinator)? {
+                resp
+            } else if let Some(resp) = dispatch_txn_api(other, api_version, correlation_id, reader, bctx.txn, bctx.broker)? {
+                resp
+            } else {
+                return Err(io::Error::other(format!("unsupported Kafka api_key {other}")));
+            }
+        }
+    };
+    Ok((response, suppress_response))
 }
 
 /// What the SASL pre-stage decided for a request: send a reply and keep going, send a reply then close (failed
@@ -779,10 +784,10 @@ fn produce_results<B: KafkaBroker>(
 /// Map a produce/buffer failure for `(topic, partition)` to its Kafka error code, and LOG the real error to
 /// stderr (broker-side visibility — otherwise the detail is swallowed and a stuck producer looks silent).
 ///
-/// - `InvalidData` ⇒ **87 = INVALID_RECORD (non-retriable)**: a PERMANENT rejection (e.g. a content-contract
+/// - `InvalidData` ⇒ **87 = `INVALID_RECORD` (non-retriable)**: a PERMANENT rejection (e.g. a content-contract
 ///   violation — the record can never land). It MUST NOT be retried; a retriable code would make librdkafka
 ///   re-send the identical, still-rejected batch every ~100ms forever (a silent hot loop).
-/// - anything else ⇒ **56 = KAFKA_STORAGE_ERROR (retriable)**: a transient store/seal failure, so the producer
+/// - anything else ⇒ **56 = `KAFKA_STORAGE_ERROR` (retriable)**: a transient store/seal failure, so the producer
 ///   retries rather than treating the records as durably stored — never a false NONE ack (audit A).
 fn produce_error_code(topic: &str, partition: i32, e: &io::Error) -> i16 {
     if e.kind() == io::ErrorKind::InvalidData {
@@ -903,7 +908,7 @@ mod tests {
         }]
     }
 
-    /// A CONTRACT VIOLATION (surfaced as `InvalidData`) is a PERMANENT rejection → non-retriable INVALID_RECORD
+    /// A CONTRACT VIOLATION (surfaced as `InvalidData`) is a PERMANENT rejection → non-retriable `INVALID_RECORD`
     /// (87). Regression: a retriable code here makes librdkafka re-send the still-rejected batch forever.
     #[test]
     fn produce_invalid_data_maps_to_non_retriable_87() {
@@ -915,7 +920,7 @@ mod tests {
         assert_eq!(base, -1, "a rejected batch reports no base offset");
     }
 
-    /// A transient store/seal failure (any non-`InvalidData` kind) → retriable KAFKA_STORAGE_ERROR (56): the
+    /// A transient store/seal failure (any non-`InvalidData` kind) → retriable `KAFKA_STORAGE_ERROR` (56): the
     /// producer retries rather than treating the records as durably stored (never a false ack). Locks in the
     /// retriable path so a future refactor cannot silently promote a transient failure to a permanent reject.
     #[test]
